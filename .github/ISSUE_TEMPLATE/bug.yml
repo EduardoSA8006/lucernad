@@ -1,0 +1,33 @@
+name: Bug
+description: Algo não funciona como deveria.
+labels: [bug]
+body:
+  - type: textarea
+    id: problema
+    attributes:
+      label: O que aconteceu
+      description: O que você fez, o que esperava e o que viu.
+    validations:
+      required: true
+  - type: textarea
+    id: passos
+    attributes:
+      label: Como reproduzir
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: A saída do programa perto do problema.
+      render: text
+  - type: input
+    id: versoes
+    attributes:
+      label: Versões
+      description: Commit ou versão do programa e a distribuição que você usa.
+    validations:
+      required: true
