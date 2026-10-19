@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/logo.svg" alt="Lucerna" height="120"></p>
+
 # lucernad
 
 Daemon em Rust com a lógica do shell Lucerna (espectro de áudio, sistema, área de transferência, energia e mais); o shell fica só com a interface.
