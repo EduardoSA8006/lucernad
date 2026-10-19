@@ -1,6 +1,6 @@
 # Proposta do lucernad
 
-O `lucernad` é o daemon em Rust com a lógica do shell Lucerna. O shell fica só com a interface. Este documento vem da seção "Separação da lógica" das Pendências do [`lucerna`](https://github.com/EduardoSA8006/lucerna) e do [ecossistema](https://github.com/EduardoSA8006/lucerna-sdk/blob/main/docs/ecossistema.md).
+O `lucernad` é o daemon em Rust com a lógica do shell Lucerna. O shell fica só com a interface. Este documento vem da seção "Separação da lógica" das Pendências do [`lucerna-shell`](https://github.com/lucerna-desktop/lucerna-shell) e do [ecossistema](https://github.com/lucerna-desktop/lucerna-sdk/blob/main/docs/ecossistema.md).
 
 ## Princípio da migração
 
