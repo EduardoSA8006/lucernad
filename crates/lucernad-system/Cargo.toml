@@ -15,7 +15,9 @@ publish.workspace = true
 testing = []
 
 [dependencies]
+rustix.workspace = true
 serde.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 # Os testes deste crate usam o módulo `testing`.

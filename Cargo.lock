@@ -121,9 +121,11 @@ version = "0.1.0"
 dependencies = [
  "lucerna-ipc",
  "lucernad-system",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
