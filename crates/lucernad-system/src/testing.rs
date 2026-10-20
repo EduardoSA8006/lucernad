@@ -3,10 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::disks::{Statfs, Usage};
+use crate::nvidia::{Nvidia, NvidiaReading};
 
 /// O caminho de `rel` dentro do `testdata/` deste crate.
 pub fn testdata(rel: &str) -> PathBuf {
@@ -79,5 +81,29 @@ impl Statfs for FixedStatfs {
             .get(path)
             .copied()
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    }
+}
+
+/// Uma NVML falsa: conta as chamadas e devolve sempre `reading`.
+#[derive(Clone, Debug, Default)]
+pub struct CountingNvidia {
+    pub calls: Arc<AtomicUsize>,
+    pub reading: Option<NvidiaReading>,
+}
+
+impl Nvidia for CountingNvidia {
+    fn read(&mut self, _pci: &str) -> Option<NvidiaReading> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.reading
+    }
+}
+
+/// Uma NVML que entra em pânico ao ser chamada.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PanicNvidia;
+
+impl Nvidia for PanicNvidia {
+    fn read(&mut self, pci: &str) -> Option<NvidiaReading> {
+        panic!("PanicNvidia: a NVML foi chamada para {pci}")
     }
 }

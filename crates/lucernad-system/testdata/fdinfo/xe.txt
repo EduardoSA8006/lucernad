@@ -1,0 +1,7 @@
+pos:	0
+flags:	02100002
+drm-driver:	xe
+drm-client-id:	9
+drm-pdev:	0000:03:00.0
+drm-cycles-rcs:	10
+drm-total-cycles-rcs:	40

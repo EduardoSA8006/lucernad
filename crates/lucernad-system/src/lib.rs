@@ -13,9 +13,12 @@ use tokio::sync::oneshot;
 
 pub mod cpu;
 pub mod disks;
+pub mod fdinfo;
+pub mod gpu;
 pub mod info;
 pub mod memory;
 pub mod net;
+pub mod nvidia;
 pub mod temp;
 
 #[cfg(feature = "testing")]
