@@ -59,7 +59,7 @@ pub(crate) enum Detached<T> {
     Done(T),
     /// Não voltou no prazo; a thread segue solta até terminar.
     TimedOut,
-    /// Entrou em pânico (ou a thread não pôde ser criada), com a carga dele.
+    /// Entrou em pânico, com a carga dele.
     Panicked(
         #[cfg_attr(
             not(test),
@@ -70,6 +70,23 @@ pub(crate) enum Detached<T> {
         )]
         Box<dyn Any + Send>,
     ),
+    /// A thread não pôde ser criada; `f` não rodou.
+    SpawnFailed(std::io::Error),
+}
+
+/// Um trabalho entregue a uma thread solta.
+pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// Como o [`detached`] cria a thread (trocável nos testes, para simular a
+/// falha).
+pub(crate) type Spawn = fn(Job) -> std::io::Result<()>;
+
+/// Cria a thread solta de verdade.
+pub(crate) fn spawn_thread(job: Job) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("lucernad-detached".into())
+        .spawn(job)
+        .map(drop)
 }
 
 /// Roda `f` numa `std::thread` solta e espera a resposta até `timeout`.
@@ -78,18 +95,32 @@ pub(crate) enum Detached<T> {
 /// NVML): a thread não é do runtime, então uma chamada presa não segura os
 /// outros trabalhos nem a saída do processo, como o `spawn_blocking`
 /// seguraria. O resultado chega por um `oneshot`; o pânico de `f` é pego.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "a NVML passa a usar na Tarefa 5; os discos usam o detached_with"
+    )
+)]
 pub(crate) async fn detached<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
     timeout: Duration,
 ) -> Detached<T> {
+    detached_with(spawn_thread, f, timeout).await
+}
+
+/// O [`detached`], com a criação da thread dada por `spawn`.
+pub(crate) async fn detached_with<T: Send + 'static>(
+    spawn: Spawn,
+    f: impl FnOnce() -> T + Send + 'static,
+    timeout: Duration,
+) -> Detached<T> {
     let (tx, rx) = oneshot::channel();
-    let spawned = std::thread::Builder::new()
-        .name("lucernad-detached".into())
-        .spawn(move || {
-            let _ = tx.send(catch_unwind(AssertUnwindSafe(f)));
-        });
-    if let Err(e) = spawned {
-        return Detached::Panicked(Box::new(e));
+    let job: Job = Box::new(move || {
+        let _ = tx.send(catch_unwind(AssertUnwindSafe(f)));
+    });
+    if let Err(e) = spawn(job) {
+        return Detached::SpawnFailed(e);
     }
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(Ok(value))) => Detached::Done(value),
@@ -113,6 +144,15 @@ mod tests {
         match detached(|| -> () { panic!("de propósito") }, short).await {
             Detached::Panicked(p) => assert_eq!(p.downcast_ref::<&str>(), Some(&"de propósito")),
             _ => panic!("o pânico não foi pego"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_is_its_own_outcome() {
+        let fail: Spawn = |_job| Err(std::io::Error::other("sem threads"));
+        match detached_with(fail, || 7, Duration::from_millis(100)).await {
+            Detached::SpawnFailed(e) => assert_eq!(e.to_string(), "sem threads"),
+            _ => panic!("a falha ao criar a thread não foi notada"),
         }
     }
 }

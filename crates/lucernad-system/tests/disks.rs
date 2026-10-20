@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use lucernad_system::Roots;
 use lucernad_system::disks::{
-    BlockTree, Disk, DiskReader, Kind, Mount, Node, RealStatfs, Statfs, Usage, aggregate,
-    is_candidate, parse_mountinfo, read_disks,
+    BlockTree, Disk, DiskReader, Kind, MAX_PENDING, Mount, Node, RealStatfs, Statfs, Usage,
+    aggregate, is_candidate, parse_mountinfo, read_disks,
 };
 use lucernad_system::testing::{FixedStatfs, testdata};
 
@@ -252,4 +252,58 @@ async fn failed_statvfs_skips_that_source() {
 fn real_statvfs_of_root() {
     let u = RealStatfs.usage(Path::new("/")).unwrap();
     assert!(u.size > 0 && u.used <= u.size);
+}
+
+fn ext4(source: &str, target: &str) -> Mount {
+    Mount {
+        source: source.into(),
+        target: target.into(),
+        fstype: "ext4".into(),
+    }
+}
+
+#[tokio::test]
+async fn pending_is_per_source_and_target() {
+    let fs = Arc::new(FixedStatfs::machine().slow("/var"));
+    let r = DiskReader::new(fs.clone(), Duration::from_millis(100));
+    assert!(r.usages(&[ext4("/dev/sdb1", "/var")]).await.is_empty());
+    r.usages(&[ext4("/dev/sdb1", "/var")]).await;
+    r.usages(&[ext4("/dev/sdc1", "/var")]).await;
+    assert_eq!(
+        fs.calls()
+            .iter()
+            .filter(|p| p.as_path() == Path::new("/var"))
+            .count(),
+        2,
+        "a mesma origem no mesmo alvo não é pedida de novo; outra origem é"
+    );
+}
+
+#[tokio::test]
+async fn pending_has_a_global_cap() {
+    let stuck: Vec<String> = (0..=MAX_PENDING).map(|i| format!("/s{i}")).collect();
+    let fs = Arc::new(
+        stuck
+            .iter()
+            .fold(FixedStatfs::machine(), |fs, p| fs.slow(p)),
+    );
+    let r = DiskReader::new(fs.clone(), Duration::from_millis(100));
+    let mounts: Vec<Mount> = stuck
+        .iter()
+        .enumerate()
+        .map(|(i, p)| ext4(&format!("/dev/sd{i}"), p))
+        .collect();
+    assert_eq!(MAX_PENDING, 16);
+    assert!(r.usages(&mounts[..MAX_PENDING]).await.is_empty());
+    let t0 = std::time::Instant::now();
+    assert!(r.usages(&mounts[MAX_PENDING..]).await.is_empty());
+    assert!(
+        t0.elapsed() < Duration::from_millis(50),
+        "acima do teto conta como prazo estourado, sem esperar"
+    );
+    assert_eq!(
+        fs.calls().len(),
+        MAX_PENDING,
+        "acima do teto nenhuma thread nova"
+    );
 }

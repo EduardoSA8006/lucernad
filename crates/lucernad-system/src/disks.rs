@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
-use crate::{Detached, Roots, detached};
+use crate::{Detached, Roots, Spawn, detached_with, spawn_thread};
 
 /// Uma linha do `mountinfo`: a origem, o ponto de montagem e o tipo.
 #[derive(Clone, Debug, PartialEq)]
@@ -319,27 +319,39 @@ impl Statfs for RealStatfs {
     }
 }
 
+/// Quantas chamadas do `statvfs` podem estar presas ao mesmo tempo. Acima
+/// disso, uma montagem nova conta como prazo estourado, sem thread nova.
+pub const MAX_PENDING: usize = 16;
+
+/// Uma chamada do `statvfs`: a origem e o alvo em que ela é pedida.
+type Key = (String, PathBuf);
+
 /// Lê o uso das montagens sem deixar uma montagem travada segurar a leitura.
 ///
-/// Cada `statvfs` roda numa thread solta, com prazo; um alvo cuja chamada
-/// anterior ainda não voltou não é pedido de novo, para não acumular threads
-/// presas na mesma montagem.
+/// Cada `statvfs` roda numa thread solta, com prazo; uma montagem (origem e
+/// alvo) cuja chamada anterior ainda não voltou não é pedida de novo, e no
+/// máximo [`MAX_PENDING`] ficam presas ao mesmo tempo, para não acumular
+/// threads.
 pub struct DiskReader {
     statfs: Arc<dyn Statfs>,
     timeout: Duration,
-    /// Os alvos com uma chamada em andamento; a thread tira o seu ao terminar.
-    pending: Arc<Mutex<HashSet<PathBuf>>>,
+    spawn: Spawn,
+    /// As chamadas em andamento; a thread tira a sua ao terminar.
+    pending: Arc<Mutex<HashSet<Key>>>,
+    /// As montagens travadas já avisadas no log, até responderem de novo.
+    warned: Mutex<HashSet<Key>>,
 }
 
-/// Tira o alvo de `pending` ao sair (inclusive num pânico do `statvfs`).
+/// Tira a chamada de `pending` ao sair (inclusive num pânico do `statvfs`
+/// ou quando a thread não chega a ser criada).
 struct PendingGuard {
-    pending: Arc<Mutex<HashSet<PathBuf>>>,
-    path: PathBuf,
+    pending: Arc<Mutex<HashSet<Key>>>,
+    key: Key,
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        lock(&self.pending).remove(&self.path);
+        lock(&self.pending).remove(&self.key);
     }
 }
 
@@ -353,15 +365,18 @@ impl DiskReader {
         DiskReader {
             statfs,
             timeout,
+            spawn: spawn_thread,
             pending: Arc::default(),
+            warned: Mutex::default(),
         }
     }
 
     /// O uso de cada origem candidata ([`is_candidate`]), pela origem.
     ///
     /// Um `statvfs` por origem, no primeiro alvo dela, todos ao mesmo tempo,
-    /// cada um com o prazo. A origem que dá erro, estoura o prazo ou ainda
-    /// tem a chamada anterior em andamento fica fora do mapa.
+    /// cada um com o prazo. A origem que dá erro, estoura o prazo, ainda tem
+    /// a chamada anterior em andamento ou passa do teto de pendentes fica
+    /// fora do mapa. Uma montagem travada é avisada uma vez no log.
     pub async fn usages(&self, mounts: &[Mount]) -> HashMap<String, Usage> {
         let mut sources = HashSet::new();
         let mut calls = JoinSet::new();
@@ -369,32 +384,76 @@ impl DiskReader {
             if !sources.insert(m.source.as_str()) {
                 continue;
             }
-            let path = PathBuf::from(&m.target);
-            if !lock(&self.pending).insert(path.clone()) {
-                continue;
+            let key: Key = (m.source.clone(), PathBuf::from(&m.target));
+            {
+                let mut pending = lock(&self.pending);
+                if pending.contains(&key) {
+                    continue;
+                }
+                if pending.len() >= MAX_PENDING {
+                    drop(pending);
+                    self.warn(
+                        &key,
+                        &format!("não foi pedido: já há {MAX_PENDING} montagens sem responder"),
+                    );
+                    continue;
+                }
+                pending.insert(key.clone());
             }
             let guard = PendingGuard {
                 pending: self.pending.clone(),
-                path: path.clone(),
+                key: key.clone(),
             };
             let statfs = self.statfs.clone();
-            let source = m.source.clone();
-            let timeout = self.timeout;
+            let (spawn, timeout) = (self.spawn, self.timeout);
             calls.spawn(async move {
+                let path = key.1.clone();
                 let call = move || {
                     let _guard = guard;
                     statfs.usage(&path)
                 };
-                (source, detached(call, timeout).await)
+                (key, detached_with(spawn, call, timeout).await)
             });
         }
         let mut out = HashMap::new();
         while let Some(joined) = calls.join_next().await {
-            if let Ok((source, Detached::Done(Ok(usage)))) = joined {
-                out.insert(source, usage);
+            let Ok((key, outcome)) = joined else {
+                continue;
+            };
+            match outcome {
+                Detached::Done(result) => {
+                    lock(&self.warned).remove(&key);
+                    if let Ok(usage) = result {
+                        out.insert(key.0, usage);
+                    }
+                }
+                Detached::Panicked(_) => {
+                    lock(&self.warned).remove(&key);
+                }
+                Detached::TimedOut => {
+                    let msg = format!("não respondeu em {:?}", self.timeout);
+                    self.warn(&key, &msg);
+                }
+                Detached::SpawnFailed(e) => {
+                    self.warn(
+                        &key,
+                        &format!("não foi pedido: a thread não pôde ser criada ({e})"),
+                    );
+                }
             }
         }
         out
+    }
+
+    /// Avisa no log, uma vez por montagem, que ela ficou fora dos discos.
+    fn warn(&self, key: &Key, why: &str) {
+        if lock(&self.warned).insert(key.clone()) {
+            eprintln!(
+                "lucernad: o statvfs de {} ({}) {why}; ela fica fora dos discos até responder",
+                key.1.display(),
+                key.0
+            );
+        }
     }
 }
 
@@ -406,4 +465,32 @@ pub async fn read_disks(roots: &Roots, reader: &DiskReader) -> Vec<Disk> {
     let tree = BlockTree::read(roots);
     let usages = reader.usages(&mounts).await;
     aggregate(&mounts, &tree, &usages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::FixedStatfs;
+
+    #[tokio::test]
+    async fn spawn_failure_counts_as_timed_out() {
+        let mut r = DiskReader::new(Arc::new(FixedStatfs::machine()), Duration::from_millis(100));
+        r.spawn = |_job| Err(io::Error::other("sem threads"));
+        let mounts = [Mount {
+            source: "/dev/sda2".into(),
+            target: "/boot".into(),
+            fstype: "ext4".into(),
+        }];
+        assert!(r.usages(&mounts).await.is_empty(), "a origem fica fora");
+        assert!(
+            lock(&r.pending).is_empty(),
+            "o alvo não fica preso como pendente"
+        );
+        r.spawn = crate::spawn_thread;
+        assert_eq!(
+            r.usages(&mounts).await.len(),
+            1,
+            "e é pedida de novo depois"
+        );
+    }
 }
