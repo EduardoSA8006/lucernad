@@ -91,19 +91,10 @@ fn physical_disk_of_each_source() {
         Some("nvme0n1"),
         "origem dm-N"
     );
-    assert_eq!(
-        t.disk_of("/dev/dm-7").as_deref(),
-        Some("dm-7"),
-        "fora da árvore: o próprio nome"
-    );
-    assert_eq!(t.disk_of("/dev/root").as_deref(), Some("root"));
+    assert_eq!(t.disk_of("/dev/dm-7"), None, "fora da árvore: nenhum");
     assert_eq!(t.disk_of("/dev/loop0"), None, "loop é Other, sem pai");
     let empty = BlockTree::from_nodes([], []);
-    assert_eq!(
-        empty.disk_of("/dev/nvme0n1p2").as_deref(),
-        Some("nvme0n1p2"),
-        "sem árvore: a própria partição"
-    );
+    assert_eq!(empty.disk_of("/dev/nvme0n1p2"), None, "sem árvore: nenhum");
 }
 
 #[test]

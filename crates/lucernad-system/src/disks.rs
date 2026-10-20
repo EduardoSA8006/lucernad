@@ -258,14 +258,13 @@ impl BlockTree {
 
     /// O disco físico de uma origem (`/dev/nvme0n1p2` → `nvme0n1`), subindo
     /// pelos pais (LUKS, LVM, RAID) até um [`Kind::Disk`], em até 8 passos.
-    /// Fora da árvore no primeiro passo, o próprio nome (`/dev/root` numa VM);
-    /// fora dela depois, ou sem pai antes de um disco, nenhum.
+    /// Fora da árvore (a origem ou um pai), ou sem pai antes de um disco,
+    /// nenhum: o `/dev/root` chega aqui já resolvido pelo maj:min
+    /// ([`BlockTree::resolve`]).
     pub fn disk_of(&self, source: &str) -> Option<String> {
         let mut dev = self.kernel_name(source);
-        for step in 0..MAX_STEPS {
-            let Some(node) = self.nodes.get(&dev) else {
-                return (step == 0).then_some(dev);
-            };
+        for _ in 0..MAX_STEPS {
+            let node = self.nodes.get(&dev)?;
             if node.kind == Kind::Disk {
                 return Some(dev);
             }

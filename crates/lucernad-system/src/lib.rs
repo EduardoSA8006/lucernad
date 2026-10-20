@@ -204,12 +204,7 @@ impl System {
             if let Err(e) = run.await
                 && e.is_panic()
             {
-                let p = e.into_panic();
-                let msg = p
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| p.downcast_ref::<String>().cloned())
-                    .unwrap_or_default();
+                let msg = panic_message(&*e.into_panic());
                 eprintln!("lucernad: o módulo de sistema parou: {msg:?}");
                 status.publish(json!({"available": false, "error": PANIC_ERROR}));
             }
@@ -283,6 +278,14 @@ async fn run(mut sampler: Sampler, t: SystemTopics, mut interval: watch::Receive
             }
         }
     }
+}
+
+/// O texto de um pânico (`&str` ou `String`); vazio com outra carga.
+pub(crate) fn panic_message(p: &(dyn Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
 }
 
 /// O conteúdo do arquivo, ou `None` se ele não puder ser lido.

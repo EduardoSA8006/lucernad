@@ -4,16 +4,20 @@ use std::collections::BTreeMap;
 
 use crate::{Roots, read};
 
-/// Se a interface conta nos totais: tem um dispositivo por trás
+/// Se o nome é de uma interface que pode contar: não é a `lo` e serve de
+/// nome de pasta (não vazio, sem `/`, nem `.` ou `..`).
+fn countable(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && name != "lo"
+}
+
+/// Se a interface é física: tem um dispositivo por trás
 /// (`<sysfs>/class/net/<if>/device`) e não é a `lo`.
 ///
 /// Túneis e interfaces virtuais (VPN como o `CloudflareWARP`, `wg*`, `tun*`,
 /// `docker*`, `veth*`, `br-*`) não têm `device`; contá-los somaria o mesmo
 /// tráfego duas vezes (o túnel e a placa por onde ele passa).
 pub fn is_physical(roots: &Roots, name: &str) -> bool {
-    let plain = !name.is_empty() && name != "." && name != ".." && !name.contains('/');
-    plain
-        && name != "lo"
+    countable(name)
         && roots
             .sysfs
             .join("class/net")
@@ -68,11 +72,19 @@ pub fn sum(ifaces: &BTreeMap<String, NetTotals>) -> NetTotals {
         })
 }
 
-/// As interfaces físicas ([`is_physical`]) do `<procfs>/net/dev`; vazio se
-/// ele não puder ser lido.
+/// As interfaces que contam no `<procfs>/net/dev`: as físicas
+/// ([`is_physical`]); se nenhuma tiver `device` (um container só com `veth`,
+/// um `ppp0` sozinho), todas menos a `lo`, para a rede não marcar 0. Vazio se
+/// o arquivo não puder ser lido.
 pub fn read_interfaces(roots: &Roots) -> BTreeMap<String, NetTotals> {
     let text = read(&roots.procfs.join("net/dev")).unwrap_or_default();
-    parse_interfaces(&text, |name| is_physical(roots, name))
+    let all = parse_interfaces(&text, countable);
+    let physical: BTreeMap<_, _> = all
+        .iter()
+        .filter(|(name, _)| is_physical(roots, name))
+        .map(|(n, t)| (n.clone(), *t))
+        .collect();
+    if physical.is_empty() { all } else { physical }
 }
 
 /// As taxas de download e upload (bytes/s) entre duas leituras por

@@ -57,6 +57,38 @@ fn tunnel_is_not_counted_twice() {
     assert_eq!(sum(&ifaces), NetTotals { rx: 1000, tx: 2000 });
 }
 
+/// Um `/proc/net/dev` em `roots` com as interfaces dadas (rx, tx).
+fn write_net_dev(roots: &Roots, lines: &[(&str, u64, u64)]) {
+    std::fs::create_dir_all(roots.procfs.join("net")).unwrap();
+    let mut text = String::from("h\nh\n");
+    for (name, rx, tx) in lines {
+        text += &format!("{name}: {rx} 0 0 0 0 0 0 0 {tx}\n");
+    }
+    std::fs::write(roots.procfs.join("net/dev"), text).unwrap();
+}
+
+#[test]
+fn without_any_device_all_but_lo_count() {
+    let (_t, roots) = fake_net(&[], &["eth0", "lo"]);
+    write_net_dev(&roots, &[("lo", 50, 50), ("eth0", 1000, 2000)]);
+    let ifaces = read_interfaces(&roots);
+    assert_eq!(
+        ifaces.keys().collect::<Vec<_>>(),
+        ["eth0"],
+        "container: a eth0 (veth) conta, a lo não"
+    );
+    let (_t, roots) = fake_net(&["wlan0"], &["CloudflareWARP"]);
+    write_net_dev(
+        &roots,
+        &[("wlan0", 1000, 2000), ("CloudflareWARP", 900, 1800)],
+    );
+    assert_eq!(
+        read_interfaces(&roots).keys().collect::<Vec<_>>(),
+        ["wlan0"],
+        "com alguma física, só as físicas"
+    );
+}
+
 #[test]
 fn totals_only_from_physical() {
     let t = sum(&read_interfaces(&Roots::at(&testdata("machine"))));

@@ -52,7 +52,7 @@ O shell Lucerna é só a interface; a lógica vai para código próprio em Rust.
 | CPU | uso (0–1) entre duas leituras | `/proc/stat` |
 | Temperatura | a do pacote da CPU (°C), escolhendo o sensor como hoje (`coretemp`/`k10temp`…) | `/sys/class/hwmon/*/name` e `temp*_input` |
 | Memória e swap | total e usado | `/proc/meminfo` (a mesma conta de "usado" de hoje) |
-| Rede | taxa de download e upload, totais, e o histórico das taxas (30 pontos, para o gráfico) | `/proc/net/dev`, só interfaces físicas (a regra de hoje) |
+| Rede | taxa de download e upload, totais, e o histórico das taxas (30 pontos, para o gráfico) | `/proc/net/dev`, só as interfaces com `/sys/class/net/<if>/device`, sem a `lo`; se nenhuma tiver, todas menos a `lo` |
 | Tempo ligado | segundos | `/proc/uptime` |
 | Discos | por disco físico: nome (`nvme0n1`), tamanho e usado (soma das partições montadas), se é o da raiz; o da raiz primeiro | `/proc/self/mountinfo` + `statvfs` + a árvore de `/sys/class/block` (pai da partição, `slaves/` para LUKS/LVM, `dm/name`) |
 | GPUs | por placa: fabricante, nome, estado (ativa/suspensa), uso (0–1 ou ausente), temperatura, frequência e frequência máxima | `/sys/class/drm/card*`; AMD `gpu_busy_percent`; Intel pelo fdinfo do DRM (`drm-engine-*`/`drm-cycles-*`, a conta de `drmBusy` de hoje), lendo só os fds que apontam para `/dev/dri/*`; NVIDIA pela NVML (`libnvidia-ml.so`, carregada em tempo de execução). **Nomes iguais aos de hoje** (decisão do construtor do documento, pela regra "os mesmos valores"): NVIDIA pelo `Model:` de `/proc/driver/nvidia/gpus/<pci>/information` (funciona com a placa suspensa); AMD e Intel com os nomes genéricos de hoje ("AMD Radeon", "Intel (integrada)"). Sem `pci.ids`. |

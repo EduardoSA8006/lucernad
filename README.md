@@ -65,7 +65,7 @@ Veja a pasta [`docs/`](docs/):
 
 ## Repositório
 
-A branch `main` é protegida por um ruleset igual ao do `lucerna-shell`: PR obrigatório, conversas resolvidas, só merge commit, sem deleção nem force push. Os checks obrigatórios entram quando houver CI.
+A branch `main` é protegida por um ruleset igual ao do `lucerna-shell`: PR obrigatório, conversas resolvidas, só merge commit, sem deleção nem force push. Os checks `fmt`, `clippy` e `test` são obrigatórios no ruleset.
 
 ## Licença
 
