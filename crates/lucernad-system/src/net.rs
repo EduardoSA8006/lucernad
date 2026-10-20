@@ -2,14 +2,24 @@
 
 use std::collections::BTreeMap;
 
-/// Prefixos de loopback e de interfaces virtuais (containers, bridges, VPN).
-const VIRTUAL: [&str; 10] = [
-    "lo", "docker", "veth", "br-", "virbr", "vnet", "tun", "tap", "wg", "zt",
-];
+use crate::{Roots, read};
 
-/// Se a interface conta nos totais (não é loopback nem virtual).
-pub fn is_physical(name: &str) -> bool {
-    !VIRTUAL.iter().any(|p| name.starts_with(p))
+/// Se a interface conta nos totais: tem um dispositivo por trás
+/// (`<sysfs>/class/net/<if>/device`) e não é a `lo`.
+///
+/// Túneis e interfaces virtuais (VPN como o `CloudflareWARP`, `wg*`, `tun*`,
+/// `docker*`, `veth*`, `br-*`) não têm `device`; contá-los somaria o mesmo
+/// tráfego duas vezes (o túnel e a placa por onde ele passa).
+pub fn is_physical(roots: &Roots, name: &str) -> bool {
+    let plain = !name.is_empty() && name != "." && name != ".." && !name.contains('/');
+    plain
+        && name != "lo"
+        && roots
+            .sysfs
+            .join("class/net")
+            .join(name)
+            .join("device")
+            .exists()
 }
 
 /// Bytes recebidos e enviados, somados das interfaces físicas.
@@ -19,17 +29,17 @@ pub struct NetTotals {
     pub tx: u64,
 }
 
-/// Os totais de cada interface física do `/proc/net/dev` (pula as 2 linhas
-/// de cabeçalho; `rx` é o campo 0 e `tx` o 8 depois do `:`; campo que não é
-/// número conta 0).
-pub fn parse_interfaces(text: &str) -> BTreeMap<String, NetTotals> {
+/// Os totais de cada interface do `/proc/net/dev` para a qual `keep` diz sim
+/// (pula as 2 linhas de cabeçalho; `rx` é o campo 0 e `tx` o 8 depois do
+/// `:`; campo que não é número conta 0).
+pub fn parse_interfaces(text: &str, keep: impl Fn(&str) -> bool) -> BTreeMap<String, NetTotals> {
     let mut ifaces = BTreeMap::new();
     for line in text.lines().skip(2) {
         let Some((name, data)) = line.split_once(':') else {
             continue;
         };
         let name = name.trim();
-        if !is_physical(name) {
+        if !keep(name) {
             continue;
         }
         let fields: Vec<u64> = data
@@ -48,14 +58,21 @@ pub fn parse_interfaces(text: &str) -> BTreeMap<String, NetTotals> {
     ifaces
 }
 
-/// Soma o `/proc/net/dev` das interfaces físicas ([`parse_interfaces`]).
-pub fn parse_net_dev(text: &str) -> NetTotals {
-    parse_interfaces(text)
+/// A soma dos totais das interfaces.
+pub fn sum(ifaces: &BTreeMap<String, NetTotals>) -> NetTotals {
+    ifaces
         .values()
         .fold(NetTotals::default(), |a, t| NetTotals {
             rx: a.rx.saturating_add(t.rx),
             tx: a.tx.saturating_add(t.tx),
         })
+}
+
+/// As interfaces físicas ([`is_physical`]) do `<procfs>/net/dev`; vazio se
+/// ele não puder ser lido.
+pub fn read_interfaces(roots: &Roots) -> BTreeMap<String, NetTotals> {
+    let text = read(&roots.procfs.join("net/dev")).unwrap_or_default();
+    parse_interfaces(&text, |name| is_physical(roots, name))
 }
 
 /// As taxas de download e upload (bytes/s) entre duas leituras por

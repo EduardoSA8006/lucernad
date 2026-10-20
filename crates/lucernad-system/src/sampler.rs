@@ -17,7 +17,7 @@ use crate::disks::{Disk, DiskReader, read_disks};
 use crate::fdinfo::{DrmSnapshot, drm_busy, scan};
 use crate::gpu::{Card, Gpu, Vendor, list_cards, read_gpus};
 use crate::memory::parse_meminfo;
-use crate::net::{NetTotals, parse_interfaces, push_history, rates};
+use crate::net::{NetTotals, push_history, rates, read_interfaces, sum};
 use crate::nvidia::{NoNvidia, Nvidia};
 use crate::temp::{find_sensor, read_temp};
 use crate::{Detached, Roots, detached, read};
@@ -156,9 +156,10 @@ impl Sampler {
         st.swap_used = mem.swap_used;
 
         let now = Instant::now();
-        let ifaces = parse_interfaces(&read(&procfs.join("net/dev")).unwrap_or_default());
-        st.rx_total = ifaces.values().fold(0, |a, t| a.saturating_add(t.rx));
-        st.tx_total = ifaces.values().fold(0, |a, t| a.saturating_add(t.tx));
+        let ifaces = read_interfaces(&self.roots);
+        let totals = sum(&ifaces);
+        st.rx_total = totals.rx;
+        st.tx_total = totals.tx;
         if let Some((then, prev)) = &self.net_prev {
             let (rx, tx) = rates(prev, &ifaces, now.duration_since(*then).as_secs_f64());
             st.rx_rate = rx;

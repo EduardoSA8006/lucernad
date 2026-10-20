@@ -1,22 +1,66 @@
+use std::collections::BTreeMap;
+
+use lucernad_system::Roots;
 use lucernad_system::net::{
-    NetTotals, is_physical, parse_interfaces, parse_net_dev, push_history, rate, rates,
+    NetTotals, is_physical, parse_interfaces, push_history, rate, rates, read_interfaces, sum,
 };
 use lucernad_system::testing::testdata;
 
-#[test]
-fn physical_and_virtual_interfaces() {
-    assert!(is_physical("enp3s0") && is_physical("wlan0"));
-    for name in [
-        "lo", "docker0", "veth1a2b", "br-123", "virbr0", "vnet3", "tun0", "tap0", "wg0", "zt5",
-    ] {
-        assert!(!is_physical(name), "{name}");
+/// Um sysfs falso com `class/net/<if>` para cada nome; os de `with_device`
+/// ganham a pasta `device` (como o link de verdade, que aponta para o
+/// dispositivo).
+fn fake_net(with_device: &[&str], without: &[&str]) -> (tempfile::TempDir, Roots) {
+    let t = tempfile::tempdir().unwrap();
+    let roots = Roots::at(t.path());
+    let net = roots.sysfs.join("class/net");
+    for name in with_device {
+        std::fs::create_dir_all(net.join(name).join("device")).unwrap();
     }
+    for name in without {
+        std::fs::create_dir_all(net.join(name)).unwrap();
+    }
+    (t, roots)
+}
+
+const VIRTUAL: [&str; 7] = [
+    "CloudflareWARP",
+    "wg0",
+    "tun0",
+    "docker0",
+    "veth1a2b",
+    "br-123",
+    "lo",
+];
+
+#[test]
+fn physical_means_a_device_behind() {
+    let (_t, roots) = fake_net(&["wlan0", "enp3s0", "lo"], &VIRTUAL[..6]);
+    assert!(is_physical(&roots, "wlan0") && is_physical(&roots, "enp3s0"));
+    for name in VIRTUAL {
+        assert!(!is_physical(&roots, name), "{name}");
+    }
+    assert!(!is_physical(&roots, "eth9"), "sem pasta no sysfs");
+    assert!(!is_physical(&roots, "../wlan0") && !is_physical(&roots, ""));
+}
+
+#[test]
+fn tunnel_is_not_counted_twice() {
+    let (_t, roots) = fake_net(&["wlan0"], &["CloudflareWARP", "lo"]);
+    std::fs::create_dir_all(roots.procfs.join("net")).unwrap();
+    std::fs::write(
+        roots.procfs.join("net/dev"),
+        "h\nh\n    lo: 50 0 0 0 0 0 0 0 50\n  wlan0: 1000 0 0 0 0 0 0 0 2000\nCloudflareWARP: 900 0 0 0 0 0 0 0 1800\n",
+    )
+    .unwrap();
+    let ifaces = read_interfaces(&roots);
+    assert_eq!(ifaces.keys().collect::<Vec<_>>(), ["wlan0"]);
+    assert_eq!(sum(&ifaces), NetTotals { rx: 1000, tx: 2000 });
 }
 
 #[test]
 fn totals_only_from_physical() {
-    let t = parse_net_dev(&std::fs::read_to_string(testdata("machine/proc/net/dev")).unwrap());
-    assert_eq!(t, NetTotals { rx: 1000, tx: 2000 });
+    let t = sum(&read_interfaces(&Roots::at(&testdata("machine"))));
+    assert_eq!(t, NetTotals { rx: 1000, tx: 2000 }, "só a eth0 tem device");
 }
 
 #[test]
@@ -36,7 +80,7 @@ fn rate_and_history() {
 fn malformed_net_dev_lines() {
     let text = "cabeçalho\ncabeçalho\nlinha sem dois pontos\n  eth0: 1000 x 0 0 0 0 0 0 2000\n  wlan0: abc 0 0 0 0 0 0 0 def\n";
     assert_eq!(
-        parse_net_dev(text),
+        sum(&parse_interfaces(text, |_| true)),
         NetTotals { rx: 1000, tx: 2000 },
         "linha sem `:` fica fora; campo não numérico conta 0"
     );
@@ -45,8 +89,10 @@ fn malformed_net_dev_lines() {
 #[test]
 fn interfaces_one_by_one() {
     let text = std::fs::read_to_string(testdata("machine/proc/net/dev")).unwrap();
-    let ifaces = parse_interfaces(&text);
-    assert_eq!(ifaces.len(), 1, "só as físicas");
+    let all = parse_interfaces(&text, |_| true);
+    assert_eq!(all.len(), 3);
+    let ifaces: BTreeMap<_, _> = parse_interfaces(&text, |n| n == "eth0");
+    assert_eq!(ifaces.len(), 1, "só as que o filtro aceita");
     assert_eq!(ifaces["eth0"], NetTotals { rx: 1000, tx: 2000 });
 }
 

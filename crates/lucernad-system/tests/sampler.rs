@@ -76,6 +76,7 @@ fn interface_coming_and_going_makes_no_spike() {
     copy_tree(&testdata("machine"), t.path()).unwrap();
     let roots = Roots::at(t.path());
     let dev = roots.procfs.join("net/dev");
+    std::fs::create_dir_all(roots.sysfs.join("class/net/usb0/device")).unwrap();
     let header = "Inter-|   Receive\n face |bytes\n";
     let mut s = Sampler::new(
         roots.clone(),
