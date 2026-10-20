@@ -66,7 +66,10 @@ jobs:
 
       - name: clippy
         if: matrix.job == 'clippy'
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          # O lucernad sem nenhum módulo também compila limpo.
+          cargo clippy -p lucernad --no-default-features --all-targets --locked -- -D warnings
 
       - name: test
         if: matrix.job == 'test'

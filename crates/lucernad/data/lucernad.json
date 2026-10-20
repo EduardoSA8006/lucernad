@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "app": {
+    "id": "lucernad",
+    "name": "Serviço do Lucerna",
+    "icon": "memory",
+    "socket": "lucernad.sock"
+  }
+}

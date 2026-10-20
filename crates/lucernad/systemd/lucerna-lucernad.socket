@@ -1,0 +1,10 @@
+[Unit]
+Description=Lucerna Daemon (socket)
+
+[Socket]
+ListenStream=%t/lucerna/lucernad.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target
