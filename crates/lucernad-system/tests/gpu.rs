@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::os::unix::fs::symlink;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use lucernad_system::Roots;
@@ -136,5 +138,93 @@ fn active_nvidia_comes_from_nvml() {
         (g[0].name.as_str(), g[0].usage),
         ("NVIDIA GeForce RTX 3050 Laptop GPU", None),
         "sem NVML: só o nome"
+    );
+}
+
+/// Uma placa num sysfs de mentira: `files` são caminhos relativos à pasta da
+/// placa, com o conteúdo.
+fn write_card(sys: &Path, card: &str, files: &[(&str, &str)]) {
+    for (rel, text) in files {
+        let path = sys.join("class/drm").join(card).join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+}
+
+#[test]
+fn suspended_intel_has_no_frequency() {
+    let t = tempfile::tempdir().unwrap();
+    let sys = t.path().join("sys");
+    write_card(
+        &sys,
+        "card0",
+        &[
+            ("device/vendor", "0x8086\n"),
+            ("device/uevent", "PCI_SLOT_NAME=0000:00:02.0\n"),
+            ("device/power/runtime_status", "suspended\n"),
+            ("gt_act_freq_mhz", "300\n"),
+            ("gt_RP0_freq_mhz", "1500\n"),
+        ],
+    );
+    let r = Roots {
+        sysfs: sys,
+        ..machine()
+    };
+    let usage = HashMap::from([("0000:00:02.0".to_string(), 0.4)]);
+    let g = read_gpus(&r, &list_cards(&r), &mut NoNvidia, false, &usage);
+    assert_eq!(
+        (g[0].state.as_str(), g[0].usage, g[0].freq, g[0].max_freq),
+        ("suspended", None, None, None),
+        "Intel suspensa: nem frequência nem uso"
+    );
+}
+
+#[test]
+fn i915_frequency_comes_before_xe() {
+    let t = tempfile::tempdir().unwrap();
+    let sys = t.path().join("sys");
+    write_card(
+        &sys,
+        "card0",
+        &[
+            ("device/vendor", "0x8086\n"),
+            ("device/uevent", "PCI_SLOT_NAME=0000:00:02.0\n"),
+            ("device/power/runtime_status", "active\n"),
+            ("gt_act_freq_mhz", "1450\n"),
+            ("gt_RP0_freq_mhz", "1500\n"),
+            ("device/tile0/gt0/freq0/act_freq", "900\n"),
+            ("device/tile0/gt0/freq0/rp0_freq", "2050\n"),
+        ],
+    );
+    let r = Roots {
+        sysfs: sys,
+        ..machine()
+    };
+    let g = read_gpus(&r, &list_cards(&r), &mut NoNvidia, false, &HashMap::new());
+    assert_eq!((g[0].freq, g[0].max_freq), (Some(1450), Some(1500)));
+}
+
+#[test]
+fn pci_falls_back_to_the_resolved_device() {
+    let t = tempfile::tempdir().unwrap();
+    let sys = t.path().join("sys");
+    let real = sys.join("devices/pci0000:00/0000:07:00.0");
+    std::fs::create_dir_all(real.join("power")).unwrap();
+    std::fs::write(real.join("vendor"), "0x1002\n").unwrap();
+    std::fs::write(real.join("uevent"), "DRIVER=amdgpu\n").unwrap();
+    std::fs::write(real.join("power/runtime_status"), "suspended\n").unwrap();
+    std::fs::create_dir_all(sys.join("class/drm/card0")).unwrap();
+    symlink(&real, sys.join("class/drm/card0/device")).unwrap();
+    let r = Roots {
+        sysfs: sys,
+        ..machine()
+    };
+    let c = list_cards(&r);
+    assert_eq!(
+        c.iter()
+            .map(|c| (c.card.as_str(), c.vendor, c.pci.as_str()))
+            .collect::<Vec<_>>(),
+        [("card0", Vendor::Amd, "0000:07:00.0")],
+        "sem PCI_SLOT_NAME: o nome do device resolvido"
     );
 }

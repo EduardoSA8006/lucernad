@@ -321,3 +321,37 @@ fn divided_by_class_capacity() {
     // video: 1,6 s ocupados em 2 s de janela com 2 motores = 0,8 (capacidade fora da conta de ns)
     near(drm_busy(&a, &b, GPU, INTERVAL), 0.8);
 }
+
+#[test]
+fn first_read_against_default_is_none() {
+    // O primeiro ciclo do Sampler: a anterior é a vazia (ts 0, sem clientes).
+    let first = DrmSnapshot::default();
+    let cur = snap(
+        0.5e9,
+        &[
+            ("1", GPU, "i915", &[("engine-render", 0.4e9)]),
+            (
+                "2",
+                GPU,
+                "xe",
+                &[("cycles-rcs", 10.0), ("total-cycles-rcs", 40.0)],
+            ),
+        ],
+    );
+    assert_eq!(
+        drm_busy(&first, &cur, GPU, INTERVAL),
+        None,
+        "sem cliente em comum com a vazia, mesmo dentro da janela"
+    );
+    let late = DrmSnapshot {
+        ts_ns: 60_000_000_000,
+        ..cur.clone()
+    };
+    assert_eq!(drm_busy(&first, &late, GPU, INTERVAL), None, "janela velha");
+    // A segunda leitura, contra a primeira de verdade, já dá número.
+    let next = snap(
+        0.5e9 + SEC,
+        &[("1", GPU, "i915", &[("engine-render", 0.4e9 + 0.5 * SEC)])],
+    );
+    near(drm_busy(&cur, &next, GPU, INTERVAL), 0.5);
+}

@@ -37,6 +37,9 @@ pub struct Nvml;
 
 impl Nvidia for Nvml {
     fn read(&mut self, pci: &str) -> Option<NvidiaReading> {
+        // O `init` enumera todas as placas NVIDIA. Numa máquina com duas, uma
+        // ativa e a outra suspensa, ler a ativa pode acordar a outra; num
+        // notebook (uma NVIDIA só) isso não acontece.
         let nvml = NvmlLib::init().ok()?;
         let device = nvml.device_by_pci_bus_id(pci).ok()?;
         Some(NvidiaReading {
