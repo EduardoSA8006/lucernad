@@ -1,0 +1,19 @@
+# Atualizações das dependências do Cargo e das actions do CI (fixadas por SHA
+# no ci.yml), uma vez por semana e num PR por ecossistema. Cada PR passa pelos
+# três checks (fmt, clippy, test) como qualquer outro.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
