@@ -163,6 +163,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucerna-paths"
+version = "0.1.0"
+source = "git+https://github.com/lucerna-desktop/lucerna-sdk?rev=f55ba66dc18b62fab075b20691ad9edb7ca22a1c#f55ba66dc18b62fab075b20691ad9edb7ca22a1c"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "lucerna-protocol"
 version = "0.1.0"
 source = "git+https://github.com/lucerna-desktop/lucerna-sdk?rev=f55ba66dc18b62fab075b20691ad9edb7ca22a1c#f55ba66dc18b62fab075b20691ad9edb7ca22a1c"
@@ -173,10 +181,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucerna-service"
+version = "0.1.0"
+source = "git+https://github.com/lucerna-desktop/lucerna-sdk?rev=f55ba66dc18b62fab075b20691ad9edb7ca22a1c#f55ba66dc18b62fab075b20691ad9edb7ca22a1c"
+dependencies = [
+ "lucerna-ipc",
+ "lucerna-paths",
+ "lucerna-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "lucernad-system"
 version = "0.1.0"
 dependencies = [
  "lucerna-ipc",
+ "lucerna-service",
  "lucernad-system",
  "nvml-wrapper",
  "rustix",

@@ -8,13 +8,57 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::disks::{Statfs, Usage};
-use crate::nvidia::{Nvidia, NvidiaReading};
+use crate::nvidia::{NoNvidia, Nvidia, NvidiaReading};
+use crate::{Roots, SystemConfig};
 
 /// O caminho de `rel` dentro do `testdata/` deste crate.
 pub fn testdata(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("testdata")
         .join(rel)
+}
+
+/// O módulo sobre a máquina de exemplo: amostra a cada 50 ms, o
+/// [`FixedStatfs::machine`] com prazo de 200 ms e sem NVIDIA.
+pub fn machine_config() -> SystemConfig {
+    SystemConfig {
+        roots: Roots::at(&testdata("machine")),
+        interval: Duration::from_millis(50),
+        statfs: Arc::new(FixedStatfs::machine()),
+        statfs_timeout: Duration::from_millis(200),
+        nvidia: Box::new(NoNvidia),
+    }
+}
+
+/// Copia a árvore `from` para dentro de `to` (criada se faltar); os links
+/// simbólicos são recriados como links, sem seguir.
+pub fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)?;
+        } else if kind.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// O `testdata/machine/proc` copiado para `<dir>/proc`, com um processo
+/// (pid 300) que tem o `/dev/nvidia0` aberto (`300/fd/6`). Devolve o novo
+/// `procfs`.
+pub fn proc_with_nvidia_user(dir: &Path) -> PathBuf {
+    let procfs = dir.join("proc");
+    copy_tree(&testdata("machine/proc"), &procfs).expect("copiar o procfs de exemplo");
+    let fd = procfs.join("300/fd");
+    std::fs::create_dir_all(&fd).expect("criar o 300/fd");
+    std::os::unix::fs::symlink("/dev/nvidia0", fd.join("6")).expect("criar o link da NVIDIA");
+    procfs
 }
 
 /// Um `statvfs` falso: um uso fixo por caminho, com caminhos lentos (1 s) e

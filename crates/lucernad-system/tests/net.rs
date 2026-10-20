@@ -1,4 +1,6 @@
-use lucernad_system::net::{NetTotals, is_physical, parse_net_dev, push_history, rate};
+use lucernad_system::net::{
+    NetTotals, is_physical, parse_interfaces, parse_net_dev, push_history, rate, rates,
+};
 use lucernad_system::testing::testdata;
 
 #[test]
@@ -37,5 +39,35 @@ fn malformed_net_dev_lines() {
         parse_net_dev(text),
         NetTotals { rx: 1000, tx: 2000 },
         "linha sem `:` fica fora; campo não numérico conta 0"
+    );
+}
+
+#[test]
+fn interfaces_one_by_one() {
+    let text = std::fs::read_to_string(testdata("machine/proc/net/dev")).unwrap();
+    let ifaces = parse_interfaces(&text);
+    assert_eq!(ifaces.len(), 1, "só as físicas");
+    assert_eq!(ifaces["eth0"], NetTotals { rx: 1000, tx: 2000 });
+}
+
+#[test]
+fn rates_only_from_interfaces_in_both_readings() {
+    let map = |l: &[(&str, u64, u64)]| {
+        l.iter()
+            .map(|(n, rx, tx)| (n.to_string(), NetTotals { rx: *rx, tx: *tx }))
+            .collect()
+    };
+    let prev = map(&[("eth0", 1000, 2000), ("wlan0", 5000, 5000)]);
+    let cur = map(&[("eth0", 3000, 2400), ("usb0", 900_000, 900_000)]);
+    assert_eq!(
+        rates(&prev, &cur, 2.0),
+        (1000.0, 200.0),
+        "a que sumiu e a que apareceu não entram"
+    );
+    let back = map(&[("eth0", 10, 10)]);
+    assert_eq!(
+        rates(&prev, &back, 2.0),
+        (0.0, 0.0),
+        "contador que volta conta 0"
     );
 }

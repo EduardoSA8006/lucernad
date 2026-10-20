@@ -15,16 +15,17 @@ publish.workspace = true
 testing = []
 
 [dependencies]
+lucerna-service.workspace = true
 nvml-wrapper.workspace = true
 rustix.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 # Os testes deste crate usam o módulo `testing`.
 lucernad-system = { path = ".", features = ["testing"] }
 lucerna-ipc.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]
