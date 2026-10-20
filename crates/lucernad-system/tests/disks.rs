@@ -254,6 +254,15 @@ fn real_statvfs_of_root() {
     assert!(u.size > 0 && u.used <= u.size);
 }
 
+/// Uma árvore só de discos com estes nomes de kernel.
+fn tree_of(names: impl IntoIterator<Item = String>) -> BlockTree {
+    let disk = Node {
+        kind: Kind::Disk,
+        parent: None,
+    };
+    BlockTree::from_nodes(names.into_iter().map(|n| (n, disk.clone())), [])
+}
+
 fn ext4(source: &str, target: &str) -> Mount {
     Mount {
         source: source.into(),
@@ -266,9 +275,10 @@ fn ext4(source: &str, target: &str) -> Mount {
 async fn pending_is_per_source_and_target() {
     let fs = Arc::new(FixedStatfs::machine().slow("/var"));
     let r = DiskReader::new(fs.clone(), Duration::from_millis(100));
-    assert!(r.usages(&[ext4("/dev/sdb1", "/var")]).await.is_empty());
-    r.usages(&[ext4("/dev/sdb1", "/var")]).await;
-    r.usages(&[ext4("/dev/sdc1", "/var")]).await;
+    let t = tree_of(["sdb1".into(), "sdc1".into()]);
+    assert!(r.usages(&[ext4("/dev/sdb1", "/var")], &t).await.is_empty());
+    r.usages(&[ext4("/dev/sdb1", "/var")], &t).await;
+    r.usages(&[ext4("/dev/sdc1", "/var")], &t).await;
     assert_eq!(
         fs.calls()
             .iter()
@@ -293,10 +303,11 @@ async fn pending_has_a_global_cap() {
         .enumerate()
         .map(|(i, p)| ext4(&format!("/dev/sd{i}"), p))
         .collect();
+    let t = tree_of((0..=MAX_PENDING).map(|i| format!("sd{i}")));
     assert_eq!(MAX_PENDING, 16);
-    assert!(r.usages(&mounts[..MAX_PENDING]).await.is_empty());
+    assert!(r.usages(&mounts[..MAX_PENDING], &t).await.is_empty());
     let t0 = std::time::Instant::now();
-    assert!(r.usages(&mounts[MAX_PENDING..]).await.is_empty());
+    assert!(r.usages(&mounts[MAX_PENDING..], &t).await.is_empty());
     assert!(
         t0.elapsed() < Duration::from_millis(50),
         "acima do teto conta como prazo estourado, sem esperar"
@@ -306,4 +317,37 @@ async fn pending_has_a_global_cap() {
         MAX_PENDING,
         "acima do teto nenhuma thread nova"
     );
+}
+
+#[tokio::test]
+async fn fuse_and_unknown_sources_are_not_called() {
+    let fs = Arc::new(FixedStatfs::machine());
+    let r = DiskReader::new(fs.clone(), Duration::from_millis(200));
+    let t = BlockTree::read(&machine());
+    let with = |source: &str, target: &str, fstype: &str| Mount {
+        source: source.into(),
+        target: target.into(),
+        fstype: fstype.into(),
+    };
+    let mounts = [
+        with("/dev/x", "/var", "fuse.evil"),
+        with("/dev/sda2", "/var", "fuse"),
+        with("/dev/nvme0n1p1", "/var", "fuse.sshfs2"),
+        with("/dev/x", "/boot", "ext4"),
+        with("/dev/mapper/nada", "/boot", "ext4"),
+    ];
+    assert!(r.usages(&mounts, &t).await.is_empty());
+    assert!(
+        fs.calls().is_empty(),
+        "nem FUSE nem origem fora do /sys/block"
+    );
+    assert!(!is_candidate(&mounts[0]) && !is_candidate(&mounts[1]));
+
+    let fuseblk = with("/dev/sda2", "/mnt/dados antigos", "fuseblk");
+    assert!(is_candidate(&fuseblk));
+    let u = r.usages(&[fuseblk], &t).await;
+    assert_eq!(u.len(), 1, "fuseblk de um bloco real (ntfs-3g) conta");
+    let outside = with("/dev/x", "/mnt/dados antigos", "fuseblk");
+    assert!(r.usages(&[outside], &t).await.is_empty());
+    assert_eq!(fs.calls().len(), 1, "fuseblk fora da árvore não é pedido");
 }

@@ -90,7 +90,11 @@ pub const REMOTE_FS: &[&str] = &[
 
 /// Se a montagem entra na conta dos discos: origem em `/dev/` (o que não é
 /// dispositivo, como `tmpfs`, `overlay` e os de rede, fica fora), sem `loop`,
-/// `zram` e `ram` seguidos de dígito, e com um tipo fora de [`REMOTE_FS`].
+/// `zram` e `ram` seguidos de dígito, com um tipo fora de [`REMOTE_FS`] e que
+/// não seja FUSE (`fuse`, `fuse.*`): sem ser root, qualquer usuário monta um
+/// FUSE com a origem que quiser (`fsname=/dev/x`). O `fuseblk` (o `ntfs-3g`,
+/// sobre um bloco de verdade) conta; o [`DiskReader`] ainda exige a origem
+/// na [`BlockTree`].
 pub fn is_candidate(m: &Mount) -> bool {
     let Some(dev) = m.source.strip_prefix("/dev/") else {
         return false;
@@ -99,7 +103,8 @@ pub fn is_candidate(m: &Mount) -> bool {
         dev.strip_prefix(p)
             .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
     });
-    !virtual_dev && !REMOTE_FS.contains(&m.fstype.as_str())
+    let fuse = m.fstype.starts_with("fuse") && m.fstype != "fuseblk";
+    !virtual_dev && !fuse && !REMOTE_FS.contains(&m.fstype.as_str())
 }
 
 /// O tipo de um dispositivo de blocos.
@@ -202,6 +207,11 @@ impl BlockTree {
             return self.dm.get(name).cloned().unwrap_or_else(|| name.into());
         }
         source.rsplit('/').next().unwrap_or(source).to_string()
+    }
+
+    /// Se a origem é um bloco da árvore (pelo [`BlockTree::kernel_name`]).
+    pub fn contains(&self, source: &str) -> bool {
+        self.nodes.contains_key(&self.kernel_name(source))
     }
 
     /// O disco físico de uma origem (`/dev/nvme0n1p2` → `nvme0n1`), subindo
@@ -371,16 +381,22 @@ impl DiskReader {
         }
     }
 
-    /// O uso de cada origem candidata ([`is_candidate`]), pela origem.
+    /// O uso de cada origem candidata ([`is_candidate`]) que é um bloco de
+    /// `tree` ([`BlockTree::contains`]), pela origem. Uma origem que o kernel
+    /// não conhece como bloco (um FUSE com `fsname=/dev/…`) não gasta uma
+    /// vaga do teto de pendentes.
     ///
     /// Um `statvfs` por origem, no primeiro alvo dela, todos ao mesmo tempo,
     /// cada um com o prazo. A origem que dá erro, estoura o prazo, ainda tem
     /// a chamada anterior em andamento ou passa do teto de pendentes fica
     /// fora do mapa. Uma montagem travada é avisada uma vez no log.
-    pub async fn usages(&self, mounts: &[Mount]) -> HashMap<String, Usage> {
+    pub async fn usages(&self, mounts: &[Mount], tree: &BlockTree) -> HashMap<String, Usage> {
         let mut sources = HashSet::new();
         let mut calls = JoinSet::new();
-        for m in mounts.iter().filter(|m| is_candidate(m)) {
+        for m in mounts
+            .iter()
+            .filter(|m| is_candidate(m) && tree.contains(&m.source))
+        {
             if !sources.insert(m.source.as_str()) {
                 continue;
             }
@@ -442,6 +458,13 @@ impl DiskReader {
                 }
             }
         }
+        // Esquece os avisos de montagens que não existem mais.
+        let current: HashSet<(&str, &Path)> = mounts
+            .iter()
+            .map(|m| (m.source.as_str(), Path::new(&m.target)))
+            .collect();
+        lock(&self.warned)
+            .retain(|(source, target)| current.contains(&(source.as_str(), target.as_path())));
         out
     }
 
@@ -449,9 +472,8 @@ impl DiskReader {
     fn warn(&self, key: &Key, why: &str) {
         if lock(&self.warned).insert(key.clone()) {
             eprintln!(
-                "lucernad: o statvfs de {} ({}) {why}; ela fica fora dos discos até responder",
-                key.1.display(),
-                key.0
+                "lucernad: o statvfs de {:?} ({:?}) {why}; ela fica fora dos discos até responder",
+                key.1, key.0
             );
         }
     }
@@ -463,7 +485,7 @@ pub async fn read_disks(roots: &Roots, reader: &DiskReader) -> Vec<Disk> {
     let text = crate::read(&roots.procfs.join("self/mountinfo")).unwrap_or_default();
     let mounts = parse_mountinfo(&text);
     let tree = BlockTree::read(roots);
-    let usages = reader.usages(&mounts).await;
+    let usages = reader.usages(&mounts, &tree).await;
     aggregate(&mounts, &tree, &usages)
 }
 
@@ -471,6 +493,31 @@ pub async fn read_disks(roots: &Roots, reader: &DiskReader) -> Vec<Disk> {
 mod tests {
     use super::*;
     use crate::testing::FixedStatfs;
+
+    fn disk() -> Node {
+        Node {
+            kind: Kind::Disk,
+            parent: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn warned_forgets_mounts_that_are_gone() {
+        let fs = FixedStatfs::machine().slow("/var");
+        let r = DiskReader::new(Arc::new(fs), Duration::from_millis(100));
+        let t = BlockTree::from_nodes([("sdb1".to_string(), disk())], []);
+        let stuck = [Mount {
+            source: "/dev/sdb1".into(),
+            target: "/var".into(),
+            fstype: "ext4".into(),
+        }];
+        r.usages(&stuck, &t).await;
+        assert_eq!(lock(&r.warned).len(), 1, "a travada foi avisada");
+        r.usages(&stuck, &t).await;
+        assert_eq!(lock(&r.warned).len(), 1, "continua lá enquanto montada");
+        r.usages(&[], &t).await;
+        assert!(lock(&r.warned).is_empty(), "desmontada, sai do conjunto");
+    }
 
     #[tokio::test]
     async fn spawn_failure_counts_as_timed_out() {
@@ -481,14 +528,15 @@ mod tests {
             target: "/boot".into(),
             fstype: "ext4".into(),
         }];
-        assert!(r.usages(&mounts).await.is_empty(), "a origem fica fora");
+        let t = BlockTree::from_nodes([("sda2".to_string(), disk())], []);
+        assert!(r.usages(&mounts, &t).await.is_empty(), "a origem fica fora");
         assert!(
             lock(&r.pending).is_empty(),
             "o alvo não fica preso como pendente"
         );
         r.spawn = crate::spawn_thread;
         assert_eq!(
-            r.usages(&mounts).await.len(),
+            r.usages(&mounts, &t).await.len(),
             1,
             "e é pedida de novo depois"
         );
