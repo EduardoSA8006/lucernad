@@ -38,7 +38,7 @@ pub struct Lucernad {
     /// Os tópicos do módulo `system`.
     #[cfg(feature = "system")]
     pub system: lucernad_system::SystemTopics,
-    /// O laço do módulo `system`; largá-lo para a amostragem.
+    /// O laço do módulo `system`; soltá-lo encerra a amostragem.
     #[cfg(feature = "system")]
     pub system_task: lucernad_system::ModuleTask,
 }

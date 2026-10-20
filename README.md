@@ -42,11 +42,12 @@ O socket fica em `$XDG_RUNTIME_DIR/lucerna/lucernad.sock`; o systemd sobe o daem
 
 ## Desenvolvimento
 
-Os três checks do CI, com `TMPDIR=/tmp` (os testes criam sockets Unix, cujo caminho tem limite de ~108 bytes):
+Os comandos do CI (fmt, clippy, este também sem nenhum módulo, e test), com `TMPDIR=/tmp` (os testes criam sockets Unix, cujo caminho tem limite de ~108 bytes):
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy -p lucernad --no-default-features --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
