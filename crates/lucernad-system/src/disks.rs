@@ -15,9 +15,13 @@ use tokio::task::JoinSet;
 
 use crate::{Detached, Roots, Spawn, detached_with, spawn_thread};
 
-/// Uma linha do `mountinfo`: a origem, o ponto de montagem e o tipo.
+/// Uma linha do `mountinfo`: o `maj:min`, a origem, o ponto de montagem e o
+/// tipo.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mount {
+    /// O `maj:min` do dispositivo (o terceiro campo), como `8:2`; anônimo
+    /// (`0:N`) no btrfs e nos virtuais.
+    pub dev: String,
     pub source: String,
     pub target: String,
     pub fstype: String,
@@ -25,7 +29,7 @@ pub struct Mount {
 
 /// As montagens do texto de um `mountinfo`.
 ///
-/// O alvo é o quinto campo; o tipo e a origem são os dois campos depois do
+/// O `maj:min` é o terceiro campo; o alvo, o quinto; o tipo e a origem são os dois campos depois do
 /// separador `-` (antes dele pode haver campos opcionais, como `shared:1`).
 /// Os escapes octais do kernel (`\040` é o espaço) são desfeitos. Linhas
 /// incompletas são ignoradas.
@@ -40,6 +44,7 @@ fn parse_line(line: &str) -> Option<Mount> {
         return None;
     }
     Some(Mount {
+        dev: fields[2].to_string(),
         source: unescape(fields[sep + 2]),
         target: unescape(fields[4]),
         fstype: unescape(fields[sep + 1]),
@@ -136,6 +141,8 @@ pub struct BlockTree {
     nodes: HashMap<String, Node>,
     /// Nome do mapper → nome de kernel.
     dm: HashMap<String, String>,
+    /// `maj:min` → nome de kernel, dos links de `<sysfs>/dev/block`.
+    devs: HashMap<String, String>,
 }
 
 impl BlockTree {
@@ -146,7 +153,9 @@ impl BlockTree {
     /// `slaves/`; as outras são [`Kind::Disk`] se a `slaves/` estiver ausente ou
     /// vazia (no sysfs real, todo disco tem a pasta, vazia), e [`Kind::Other`]
     /// se não. Cada subpasta com o arquivo `partition` é uma [`Kind::Part`]
-    /// da entrada. Nomes começando com ponto são ignorados.
+    /// da entrada. Nomes começando com ponto são ignorados. Os links de
+    /// `<sysfs>/dev/block/<maj:min>` dão o nome de kernel de cada `maj:min`
+    /// (o último componente do destino), para [`BlockTree::resolve`].
     pub fn read(roots: &Roots) -> BlockTree {
         let block = roots.sysfs.join("block");
         let mut nodes = Vec::new();
@@ -181,7 +190,19 @@ impl BlockTree {
             let parent = if kind == Kind::Other { parent } else { None };
             nodes.push((name, Node { kind, parent }));
         }
-        BlockTree::from_nodes(nodes, dm_names)
+        let by_dev = roots.sysfs.join("dev/block");
+        let devs = list_names(&by_dev)
+            .into_iter()
+            .filter_map(|dev| {
+                let target = std::fs::read_link(by_dev.join(&dev)).ok()?;
+                let name = target.file_name()?.to_str()?.to_string();
+                Some((dev, name))
+            })
+            .collect();
+        BlockTree {
+            devs,
+            ..BlockTree::from_nodes(nodes, dm_names)
+        }
     }
 
     /// Uma árvore pronta: os dispositivos pelo nome de kernel e os pares
@@ -196,6 +217,7 @@ impl BlockTree {
                 .into_iter()
                 .map(|(kernel, name)| (name, kernel))
                 .collect(),
+            devs: HashMap::new(),
         }
     }
 
@@ -212,6 +234,26 @@ impl BlockTree {
     /// Se a origem é um bloco da árvore (pelo [`BlockTree::kernel_name`]).
     pub fn contains(&self, source: &str) -> bool {
         self.nodes.contains_key(&self.kernel_name(source))
+    }
+
+    /// As montagens com a origem trocada pelo bloco do `maj:min` quando o
+    /// nome não está na árvore: o `/dev/root` de uma VM vira `/dev/sda2` (e
+    /// soma no disco dele). Uma origem cujo `maj:min` também não leva a um nó
+    /// da árvore fica como está (e o [`DiskReader`] não a pede).
+    pub fn resolve(&self, mut mounts: Vec<Mount>) -> Vec<Mount> {
+        for m in &mut mounts {
+            if self.contains(&m.source) {
+                continue;
+            }
+            let node = self
+                .devs
+                .get(&m.dev)
+                .filter(|n| self.nodes.contains_key(*n));
+            if let Some(name) = node {
+                m.source = format!("/dev/{name}");
+            }
+        }
+        mounts
     }
 
     /// O disco físico de uma origem (`/dev/nvme0n1p2` → `nvme0n1`), subindo
@@ -479,12 +521,12 @@ impl DiskReader {
     }
 }
 
-/// Os discos de agora: o `mountinfo` do processo, a árvore de blocos e o uso
-/// de cada origem.
+/// Os discos de agora: o `mountinfo` do processo (com as origens resolvidas
+/// por [`BlockTree::resolve`]), a árvore de blocos e o uso de cada origem.
 pub async fn read_disks(roots: &Roots, reader: &DiskReader) -> Vec<Disk> {
     let text = crate::read(&roots.procfs.join("self/mountinfo")).unwrap_or_default();
-    let mounts = parse_mountinfo(&text);
     let tree = BlockTree::read(roots);
+    let mounts = tree.resolve(parse_mountinfo(&text));
     let usages = reader.usages(&mounts, &tree).await;
     aggregate(&mounts, &tree, &usages)
 }
@@ -507,6 +549,7 @@ mod tests {
         let r = DiskReader::new(Arc::new(fs), Duration::from_millis(100));
         let t = BlockTree::from_nodes([("sdb1".to_string(), disk())], []);
         let stuck = [Mount {
+            dev: "8:17".into(),
             source: "/dev/sdb1".into(),
             target: "/var".into(),
             fstype: "ext4".into(),
@@ -524,6 +567,7 @@ mod tests {
         let mut r = DiskReader::new(Arc::new(FixedStatfs::machine()), Duration::from_millis(100));
         r.spawn = |_job| Err(io::Error::other("sem threads"));
         let mounts = [Mount {
+            dev: "8:2".into(),
             source: "/dev/sda2".into(),
             target: "/boot".into(),
             fstype: "ext4".into(),

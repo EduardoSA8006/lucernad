@@ -25,6 +25,7 @@ fn mountinfo_fields_and_escapes() {
     assert_eq!(
         m[3],
         Mount {
+            dev: "8:2".into(),
             source: "/dev/sda2".into(),
             target: "/mnt/dados antigos".into(),
             fstype: "ext4".into()
@@ -52,11 +53,13 @@ fn candidates_skip_virtual_remote_loop() {
         ]
     );
     let zram = Mount {
+        dev: "253:0".into(),
         source: "/dev/zram0".into(),
         target: "/z".into(),
         fstype: "ext4".into(),
     };
     let nfs_dev = Mount {
+        dev: "0:50".into(),
         source: "/dev/x".into(),
         target: "/n".into(),
         fstype: "nfs".into(),
@@ -265,6 +268,7 @@ fn tree_of(names: impl IntoIterator<Item = String>) -> BlockTree {
 
 fn ext4(source: &str, target: &str) -> Mount {
     Mount {
+        dev: "0:0".into(),
         source: source.into(),
         target: target.into(),
         fstype: "ext4".into(),
@@ -325,6 +329,7 @@ async fn fuse_and_unknown_sources_are_not_called() {
     let r = DiskReader::new(fs.clone(), Duration::from_millis(200));
     let t = BlockTree::read(&machine());
     let with = |source: &str, target: &str, fstype: &str| Mount {
+        dev: "0:0".into(),
         source: source.into(),
         target: target.into(),
         fstype: fstype.into(),
@@ -350,4 +355,27 @@ async fn fuse_and_unknown_sources_are_not_called() {
     let outside = with("/dev/x", "/mnt/dados antigos", "fuseblk");
     assert!(r.usages(&[outside], &t).await.is_empty());
     assert_eq!(fs.calls().len(), 1, "fuseblk fora da árvore não é pedido");
+}
+
+#[tokio::test]
+async fn dev_root_resolves_by_major_minor() {
+    let roots = Roots::at(&testdata("cases/dev-root"));
+    let fs = Arc::new(FixedStatfs::machine());
+    let r = DiskReader::new(fs.clone(), Duration::from_millis(200));
+    let disks = read_disks(&roots, &r).await;
+    assert_eq!(
+        disks,
+        [Disk {
+            name: "sda".into(),
+            size: 2000,
+            used: 500,
+            root: true
+        }],
+        "/dev/root com o maj:min da sda2 soma na sda"
+    );
+    assert_eq!(
+        fs.calls(),
+        [PathBuf::from("/")],
+        "maj:min que não resolve para um nó da árvore (link para fora, sem link, anônimo) não é pedido"
+    );
 }
