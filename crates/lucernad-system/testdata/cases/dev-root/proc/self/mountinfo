@@ -1,0 +1,4 @@
+1 0 8:2 / / rw,relatime shared:1 - ext4 /dev/root rw
+2 1 8:9 / /boot rw - vfat /dev/sdz9 rw
+3 1 8:7 / /var rw - ext4 /dev/vda7 rw
+4 1 0:30 / /mnt/dados\040antigos rw - btrfs /dev/sdy1 rw

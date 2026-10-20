@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-only"
+repository = "https://github.com/lucerna-desktop/lucernad"
+homepage = "https://github.com/lucerna-desktop/lucernad"
+authors = ["Eduardo Alves"]
+publish = false
+
+[workspace.dependencies]
+lucerna-service = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
+lucerna-cli = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
+lucerna-ipc = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
+lucerna-manifest = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
+lucernad-system = { path = "crates/lucernad-system" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+rustix = { version = "1", features = ["fs"] }
+nvml-wrapper = "0.11"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"

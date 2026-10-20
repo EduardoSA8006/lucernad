@@ -1,0 +1,10 @@
+21 1 0:30 / / rw,relatime shared:1 - btrfs /dev/mapper/root rw,subvol=/@
+22 21 0:31 /@home /home rw,relatime - btrfs /dev/mapper/root rw,subvol=/@home
+23 21 259:1 / /boot rw,relatime - vfat /dev/nvme0n1p1 rw
+24 21 8:2 / /mnt/dados\040antigos rw,relatime - ext4 /dev/sda2 rw
+25 21 0:40 / /tmp rw - tmpfs tmpfs rw
+26 21 7:0 / /snap/x ro - squashfs /dev/loop0 ro
+27 21 0:50 / /mnt/nas rw - nfs4 nas:/export rw
+28 22 0:31 /@home/u/proj /srv/proj rw - btrfs /dev/mapper/root rw,subvol=/@home
+29 21 254:1 / /var rw - ext4 /dev/mapper/vg-home rw
+30 21 0:51 / /run/user/1000/gvfs rw - fuse.gvfsd-fuse gvfsd-fuse rw

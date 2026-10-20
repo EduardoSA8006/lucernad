@@ -1,0 +1,3 @@
+1 0 0:60 / / rw - overlay overlay rw
+2 1 259:2 /etc/hosts /etc/hosts rw - btrfs /dev/nvme0n1p2 rw
+3 1 8:2 /etc/hostname /etc/hostname rw - ext4 /dev/sda2 rw

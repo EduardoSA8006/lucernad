@@ -1,0 +1,76 @@
+# CI do `lucernad`: os três checks obrigatórios do main (fmt, clippy, test).
+# Os comandos são os mesmos que se roda na máquina local (README, "Desenvolvimento").
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Toda segunda às 06:00 UTC: pega quebras vindas de dependências ou do
+    # toolchain sem mudança no código.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR: um grupo por ref, a execução nova cancela a antiga. Fora de PR (main,
+# agenda, manual): um grupo por execução, para nenhuma ficar cancelada na fila.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # Os testes de processo do lucernad criam sockets Unix, cujo caminho tem
+  # limite de ~108 bytes: o TMPDIR precisa ser curto.
+  TMPDIR: /tmp
+
+jobs:
+  check:
+    name: ${{ matrix.job }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [fmt, clippy, test]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Sem argumentos, o rustup (1.28+) instala o toolchain e os componentes
+      # que o rust-toolchain.toml pede; o `rustup show` deixou de instalar.
+      - name: Toolchain (o que o rust-toolchain.toml pede)
+        run: rustup toolchain install
+
+      - name: Cache do cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ matrix.job }}-
+
+      - name: fmt
+        if: matrix.job == 'fmt'
+        run: cargo fmt --all --check
+
+      - name: clippy
+        if: matrix.job == 'clippy'
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          # O lucernad sem nenhum módulo também compila limpo.
+          cargo clippy -p lucernad --no-default-features --all-targets --locked -- -D warnings
+
+      - name: test
+        if: matrix.job == 'test'
+        run: cargo test --workspace --locked

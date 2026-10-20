@@ -1,0 +1,8 @@
+[Unit]
+Description=Lucerna Daemon
+Requires=lucerna-lucernad.socket
+After=lucerna-lucernad.socket
+
+[Service]
+ExecStart=/usr/bin/lucernad serve
+Restart=on-failure

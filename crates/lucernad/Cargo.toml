@@ -1,0 +1,42 @@
+[package]
+name = "lucernad"
+description = "O daemon do Lucerna: um binário com um módulo por área (o primeiro é o system)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = ["system"]
+# O módulo `system`: CPU, memória, rede, temperatura, discos e GPUs.
+system = ["dep:lucernad-system"]
+
+[lib]
+name = "lucernad"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lucernad"
+path = "src/main.rs"
+
+# Do SDK, só o lucerna-service e o lucerna-cli: eles reexportam o que o daemon usa.
+[dependencies]
+lucerna-cli.workspace = true
+lucerna-service.workspace = true
+lucernad-system = { workspace = true, optional = true }
+tokio.workspace = true
+
+[dev-dependencies]
+lucernad-system = { workspace = true, features = ["testing"] }
+lucerna-ipc.workspace = true
+lucerna-manifest.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
