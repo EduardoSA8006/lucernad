@@ -16,7 +16,7 @@ use lucerna_service::{RpcError, ServerBuilder, Topic};
 use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::disks::{DiskReader, RealStatfs, Statfs};
 use crate::nvidia::{Nvidia, Nvml};
@@ -220,8 +220,9 @@ impl System {
     }
 }
 
-fn ticker(period: Duration) -> tokio::time::Interval {
-    let mut t = tokio::time::interval(period);
+/// Um tick a cada `period`, o primeiro em `start`; tick perdido é pulado.
+fn ticker(start: Instant, period: Duration) -> tokio::time::Interval {
+    let mut t = tokio::time::interval_at(start, period);
     t.set_missed_tick_behavior(MissedTickBehavior::Skip);
     t
 }
@@ -244,15 +245,17 @@ async fn run(mut sampler: Sampler, t: SystemTopics, mut interval: watch::Receive
         }
         let period = *interval.borrow_and_update();
         sampler.set_interval(period);
-        // O primeiro tick é já.
-        let mut tick = ticker(period);
+        // O primeiro tick do ciclo é já.
+        let mut tick = ticker(Instant::now(), period);
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
                 Ok(()) = interval.changed() => {
                     let period = *interval.borrow_and_update();
                     sampler.set_interval(period);
-                    tick = ticker(period);
+                    // Sem amostra fora do ritmo: a próxima vem um
+                    // intervalo novo depois.
+                    tick = ticker(Instant::now() + period, period);
                     continue;
                 }
             }

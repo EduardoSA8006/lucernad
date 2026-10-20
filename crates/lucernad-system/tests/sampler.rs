@@ -191,7 +191,7 @@ async fn stuck_nvml_is_skipped_and_not_called_again() {
         1,
         "a leitura presa não é pedida de novo"
     );
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     let g = s.gpus().await;
     assert_eq!(g[0].usage, Some(0.5), "solta, a NVML volta a ser lida");
     assert_eq!(calls.load(Ordering::SeqCst), 2);

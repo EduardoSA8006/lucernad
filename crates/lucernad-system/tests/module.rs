@@ -161,7 +161,17 @@ async fn second_client_leaving_keeps_sampling() {
     let (a, b) = (client(&path).await, client(&path).await);
     a.subscribe(&["system.stats"]).await.unwrap();
     b.subscribe(&["system.stats"]).await.unwrap();
+    assert_eq!(topics.stats.subscribers(), 2);
     drop(b);
+    // Espera o servidor contar a saída do b antes de medir.
+    let end = tokio::time::Instant::now() + Duration::from_secs(1);
+    while topics.stats.subscribers() != 1 {
+        assert!(
+            tokio::time::Instant::now() < end,
+            "a saída do b não foi contada"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let n = topics.stats.current().seq;
     wait_seq(&topics.stats, n + 3).await;
     drop(a);
@@ -202,6 +212,29 @@ async fn configure_validates_and_changes_the_interval() {
         topics.stats.current().seq - n <= 3,
         "com 500 ms, no máximo 3 amostras em 1,2 s"
     );
+}
+
+#[tokio::test]
+async fn configure_does_not_sample_out_of_rhythm() {
+    // Começa com 10 s: a primeira amostra é já e a próxima só viria em 10 s.
+    let (_d, path, topics, ..) = serve(SystemConfig {
+        interval: Duration::from_secs(10),
+        ..machine_config()
+    })
+    .await;
+    let c = client(&path).await;
+    c.subscribe(&["system.stats"]).await.unwrap();
+    wait_seq(&topics.stats, 1).await;
+    c.call("system.configure", Some(json!({"interval_ms": 500})))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        topics.stats.current().seq,
+        1,
+        "mudar o intervalo não tira uma amostra na hora"
+    );
+    wait_seq(&topics.stats, 2).await;
 }
 
 #[tokio::test]
