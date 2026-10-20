@@ -14,3 +14,13 @@ fn memory_and_swap() {
         "chave que falta conta 0"
     );
 }
+
+#[test]
+fn non_numeric_value_counts_zero() {
+    let m =
+        parse_meminfo("MemTotal: abc kB\nMemAvailable: 1 kB\nSwapTotal: 2 kB\nSwapFree: x kB\n");
+    assert_eq!(
+        (m.mem_total, m.mem_used, m.swap_total, m.swap_used),
+        (0, 0, 2048, 2048)
+    );
+}

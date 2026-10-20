@@ -17,3 +17,22 @@ fn usage_between_two_reads() {
     assert_eq!(cpu_usage(a, a), None);
     assert_eq!(parse_stat("lixo"), None);
 }
+
+#[test]
+fn malformed_stat_and_idle_going_back() {
+    assert_eq!(parse_stat("cpu 1 2"), None, "menos de 4 campos");
+    assert_eq!(parse_stat("cpu a b c d"), None, "campos não numéricos");
+    let a = CpuTimes {
+        idle: 800,
+        total: 1000,
+    };
+    let b = CpuTimes {
+        idle: 700,
+        total: 1100,
+    };
+    assert_eq!(
+        cpu_usage(a, b),
+        Some(1.0),
+        "idle que volta conta 0 e o uso fica em 1"
+    );
+}

@@ -29,3 +29,13 @@ fn rate_and_history() {
     push_history(&mut short, 3.0);
     assert_eq!(short, vec![1.0, 2.0, 3.0]);
 }
+
+#[test]
+fn malformed_net_dev_lines() {
+    let text = "cabeçalho\ncabeçalho\nlinha sem dois pontos\n  eth0: 1000 x 0 0 0 0 0 0 2000\n  wlan0: abc 0 0 0 0 0 0 0 def\n";
+    assert_eq!(
+        parse_net_dev(text),
+        NetTotals { rx: 1000, tx: 2000 },
+        "linha sem `:` fica fora; campo não numérico conta 0"
+    );
+}

@@ -37,8 +37,9 @@ pub fn find_sensor(roots: &Roots) -> Option<PathBuf> {
     pick_sensor(&chips)
 }
 
-/// A temperatura em °C (o arquivo traz milésimos); `None` sem leitura.
+/// A temperatura em °C (o arquivo traz milésimos de grau, inteiros); `None`
+/// sem leitura ou com um valor que não é inteiro (`nan`, `inf`, `48000.5`).
 pub fn read_temp(path: &Path) -> Option<f64> {
-    let milli: f64 = read(path)?.trim().parse().ok()?;
-    Some(milli / 1000.0)
+    let milli: i64 = read(path)?.trim().parse().ok()?;
+    Some(milli as f64 / 1000.0)
 }

@@ -30,3 +30,18 @@ fn preferred_sensor() {
     assert_eq!(read_temp(&path), Some(48.0));
     assert_eq!(read_temp(Path::new("/inexistente")), None);
 }
+
+#[test]
+fn invalid_temperature_is_none() {
+    let t = tempfile::tempdir().unwrap();
+    for (text, why) in [
+        ("abc\n", "texto"),
+        ("nan\n", "nan"),
+        ("inf\n", "inf"),
+        ("48000.5\n", "não inteiro"),
+    ] {
+        let path = t.path().join("temp1_input");
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(read_temp(&path), None, "{why}");
+    }
+}
