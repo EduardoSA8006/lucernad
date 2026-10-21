@@ -29,6 +29,12 @@ pub const LOW_HZ: f32 = 45.0;
 pub const HIGH_HZ: f32 = 14_000.0;
 /// A faixa mostrada, em dB abaixo da referência.
 pub const RANGE_DB: f32 = 54.0;
+/// A faixa mostrada nas bandas graves (as de [`fft_size_of`] `LOW_FFT_SIZE`),
+/// em dB abaixo da referência: menor que `RANGE_DB`, para o bumbo saltar.
+pub const BASS_RANGE_DB: f32 = 36.0;
+/// Cada banda grave fica com pelo menos esta parte da vizinha de cima: sem
+/// buraco quando a música não tem sub-grave e a energia começa logo acima.
+pub const BASS_BORROW: f32 = 0.5;
 /// A inclinação em volta de 1 kHz, em dB por oitava.
 pub const TILT_DB_PER_OCTAVE: f32 = 1.5;
 /// A parte do caminho até o alvo que o valor sobe por quadro.
@@ -191,9 +197,34 @@ impl Default for AutoGain {
     }
 }
 
-/// Os níveis de 0 a 1: `reference_db` é 1 e `RANGE_DB` abaixo dela é 0.
+/// A faixa da banda `b`, em dB: `BASS_RANGE_DB` nas graves, `RANGE_DB` nas
+/// outras.
+pub fn range_of(b: usize) -> f32 {
+    if fft_size_of(b) == LOW_FFT_SIZE {
+        BASS_RANGE_DB
+    } else {
+        RANGE_DB
+    }
+}
+
+/// Os níveis de 0 a 1: `reference_db` é 1 e [`range_of`] abaixo dela é 0.
 pub fn levels(bands_db: &[f32; BANDS], reference_db: f32) -> [f32; BANDS] {
-    bands_db.map(|db| ((db - (reference_db - RANGE_DB)) / RANGE_DB).clamp(0.0, 1.0))
+    std::array::from_fn(|b| {
+        let range = range_of(b);
+        ((bands_db[b] - (reference_db - range)) / range).clamp(0.0, 1.0)
+    })
+}
+
+/// O empréstimo dos graves: de cima para baixo, cada banda grave fica com
+/// pelo menos `BASS_BORROW` da vizinha de cima (já emprestada).
+pub fn borrow_bass(levels: &[f32; BANDS]) -> [f32; BANDS] {
+    let mut out = *levels;
+    for b in (0..BANDS - 1).rev() {
+        if fft_size_of(b) == LOW_FFT_SIZE {
+            out[b] = out[b].max(BASS_BORROW * out[b + 1]);
+        }
+    }
+    out
 }
 
 /// A suavização: ataque rápido, queda com gravidade.
@@ -272,6 +303,6 @@ impl Analyzer {
         let max = db.iter().copied().fold(MIN_DB, f32::max);
         self.gain.step(max, FRAME_DT);
         self.smoother
-            .step(&levels(&db, self.gain.reference_db), FRAME_DT)
+            .step(&borrow_bass(&levels(&db, self.gain.reference_db)), FRAME_DT)
     }
 }

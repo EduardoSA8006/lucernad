@@ -1,7 +1,7 @@
 use lucernad_spectrum::analysis::{
-    Analyzer, AutoGain, BANDS, FFT_SIZE, FPS, GRAVITY, HIGH_HZ, LOW_FFT_SIZE, LOW_HZ, LOW_SPLIT_HZ,
-    MIN_DB, RANGE_DB, Smoother, TILT_DB_PER_OCTAVE, band_bins, band_edges, band_of, bands_db,
-    bands_db_split, fft_size_of, levels,
+    Analyzer, AutoGain, BANDS, BASS_BORROW, BASS_RANGE_DB, FFT_SIZE, FPS, GRAVITY, HIGH_HZ,
+    LOW_FFT_SIZE, LOW_HZ, LOW_SPLIT_HZ, MIN_DB, RANGE_DB, Smoother, TILT_DB_PER_OCTAVE, band_bins,
+    band_edges, band_of, bands_db, bands_db_split, borrow_bass, fft_size_of, levels, range_of,
 };
 use lucernad_spectrum::testing::{noise, sine};
 
@@ -203,11 +203,59 @@ fn attack_and_gravity() {
 
 #[test]
 fn levels_map_the_range() {
-    let db = |x: f32| levels(&[x; BANDS], -10.0)[0];
+    // Uma banda que não é grave: RANGE_DB.
+    let db = |x: f32| levels(&[x; BANDS], -10.0)[BANDS - 1];
     assert!((db(-10.0) - 1.0).abs() < 1e-6);
     assert!((db(-10.0 - RANGE_DB / 2.0) - 0.5).abs() < 1e-6);
     assert_eq!(db(-10.0 - RANGE_DB), 0.0);
     assert_eq!(db(0.0), 1.0);
+}
+
+#[test]
+fn bass_bands_have_a_shorter_range() {
+    // As bandas da FFT dos graves usam BASS_RANGE_DB; as outras, RANGE_DB.
+    for b in 0..BANDS {
+        let expected = if fft_size_of(b) == LOW_FFT_SIZE {
+            BASS_RANGE_DB
+        } else {
+            RANGE_DB
+        };
+        assert_eq!(range_of(b), expected, "banda {b}");
+    }
+    // O mesmo nível, metade da faixa dos graves abaixo da referência: 0,5
+    // na banda 0 e mais que isso numa banda de cima.
+    let out = levels(&[-10.0 - BASS_RANGE_DB / 2.0; BANDS], -10.0);
+    assert!((out[0] - 0.5).abs() < 1e-6, "{}", out[0]);
+    let expected = 1.0 - BASS_RANGE_DB / 2.0 / RANGE_DB;
+    assert!((out[BANDS - 1] - expected).abs() < 1e-6);
+    // BASS_RANGE_DB abaixo da referência a banda grave já é 0.
+    assert_eq!(levels(&[-10.0 - BASS_RANGE_DB; BANDS], -10.0)[0], 0.0);
+}
+
+#[test]
+fn bass_borrows_from_the_band_above() {
+    let bass = (0..BANDS)
+        .filter(|&b| fft_size_of(b) == LOW_FFT_SIZE)
+        .count();
+    // Graves em zero e a primeira banda de cima em 0,8: em cascata, cada
+    // grave fica com BASS_BORROW da vizinha (0,4, 0,2, 0,1…).
+    let mut input = [0.0; BANDS];
+    input[bass] = 0.8;
+    let out = borrow_bass(&input);
+    for (b, level) in out.iter().enumerate().take(bass) {
+        let expected = 0.8 * BASS_BORROW.powi((bass - b) as i32);
+        assert!((level - expected).abs() < 1e-6, "banda {b}: {level}");
+    }
+    // Uma banda grave acima do empréstimo fica como está; as de cima não mudam.
+    let mut input = [0.3; BANDS];
+    input[0] = 0.9;
+    let out = borrow_bass(&input);
+    assert_eq!(out[0], 0.9);
+    assert_eq!(out[bass..], input[bass..]);
+    // As de cima nunca emprestam.
+    let mut input = [0.0; BANDS];
+    input[BANDS - 1] = 1.0;
+    assert_eq!(borrow_bass(&input)[BANDS - 2], 0.0);
 }
 
 #[test]
