@@ -632,9 +632,14 @@ dependencies = [
 name = "lucernad-spectrum"
 version = "0.1.0"
 dependencies = [
+ "lucerna-ipc",
+ "lucerna-service",
+ "lucernad-core",
  "lucernad-spectrum",
  "pipewire",
  "rustfft",
+ "serde_json",
+ "tempfile",
  "tokio",
  "zbus",
 ]

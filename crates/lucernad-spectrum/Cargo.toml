@@ -15,14 +15,19 @@ publish.workspace = true
 testing = []
 
 [dependencies]
+lucerna-service.workspace = true
+lucernad-core.workspace = true
 pipewire.workspace = true
 rustfft.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]
 # Os testes deste crate usam o módulo `testing`.
 lucernad-spectrum = { path = ".", features = ["testing"] }
+lucerna-ipc.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

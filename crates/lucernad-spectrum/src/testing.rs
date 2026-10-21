@@ -3,9 +3,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use tokio::sync::mpsc::{self, UnboundedSender};
 
+use crate::SpectrumConfig;
 use crate::backend::{Backend, Control, Event, OutputNode, Session};
 use crate::dbus::{BoxFuture, Bus, Identity};
 
@@ -280,4 +282,21 @@ impl Bus for FakeBus {
             id
         })
     }
+}
+
+/// O módulo com o `backend` e o `bus` dados, o `/proc` do `testdata` e
+/// prazos de 100 ms (o D-Bus e a nova tentativa).
+pub fn fake_config(backend: FakeBackend, bus: FakeBus) -> SpectrumConfig {
+    SpectrumConfig {
+        backend: Arc::new(backend),
+        bus: Arc::new(bus),
+        procfs: testdata("proc"),
+        dbus_timeout: Duration::from_millis(100),
+        retry: Duration::from_millis(100),
+    }
+}
+
+/// O módulo sem PipeWire nem D-Bus de verdade, para os testes do binário.
+pub fn quiet_config() -> SpectrumConfig {
+    fake_config(FakeBackend::new(), FakeBus::new())
 }
