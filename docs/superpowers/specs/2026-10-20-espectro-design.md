@@ -53,7 +53,7 @@ As barras e ondas em volta da capa (card de mídia da aba Painel e aba Mídia) v
 ### Análise
 
 - **FFT própria** (por exemplo `rustfft`), janela de Hann, tamanho e sobreposição escolhidos pelo construtor para dar resolução nos graves e **60 quadros por segundo** de saída.
-- **48 bandas** de ~30 Hz a ~16 kHz em escala que segue o ouvido (logarítmica ou mel; escolha do construtor), juntando os bins de cada banda.
+- **40 bandas** (ajustado olhando o anel com o usuário em 2026-10-20: eram 48) de ~45 Hz (eram ~30 Hz, no mesmo ajuste) a ~16 kHz em escala que segue o ouvido (logarítmica ou mel; escolha do construtor), juntando os bins de cada banda.
 - **Suavização no daemon:** subida rápida (ataque) e queda suave com aceleração (gravidade); valores finais em 0..1. As constantes são do construtor, ajustadas olhando o anel com música real.
 - **Ganho automático lento**, para uma música baixa ainda mexer bem e uma alta não colar no teto; sem bombear entre faixas.
 - **Separação para o equalizador:** captura, análise e publicação em partes separadas, com a análise como função pura (amostras → bandas) testável sem PipeWire.
@@ -68,15 +68,15 @@ As barras e ondas em volta da capa (card de mídia da aba Painel e aba Mídia) v
 
 ### Tópicos e métodos
 
-- `spectrum.bands` — tópico contínuo (o "só o último" do `lucerna-ipc`), `{bands: [48 números 0..1]}`, a 60 por segundo enquanto captura; ao parar, um último quadro com zeros (o anel desce). Números com 3 casas.
+- `spectrum.bands` — tópico contínuo (o "só o último" do `lucerna-ipc`), `{bands: [40 números 0..1]}`, a 60 por segundo enquanto captura; ao parar, um último quadro com zeros (o anel desce). Números com 3 casas.
 - `spectrum.status` — `{available: bool, capturing: bool, player: string?, error: string?}`: módulo disponível (PipeWire alcançável), capturando agora, o player atual e o erro.
 - `spectrum.configure {player: string|null}` → `{}`: o nome D-Bus do player exibido (ou `null` para nenhum).
 
 ## Lado do shell (`lucerna-shell`)
 
-- **`services/Spectrum.qml` vira adaptador** do `spectrum.bands`, pelo cliente do protocolo que já existe (`services/Lucernad.qml`, `services/lucerna/LucernaClient.qml`). Mantém o papel de hoje para quem consome: `active` (quem mostra pede), `available` (daemon conectado e `spectrum.status.available`), `bars` (agora 48) e `values` (o último quadro). `active` liga e desliga a assinatura de `spectrum.bands`.
+- **`services/Spectrum.qml` vira adaptador** do `spectrum.bands`, pelo cliente do protocolo que já existe (`services/Lucernad.qml`, `services/lucerna/LucernaClient.qml`). Mantém o papel de hoje para quem consome: `active` (quem mostra pede), `available` (daemon conectado e `spectrum.status.available`), `bars` (agora 40; eram 48, ajustado olhando o anel com o usuário em 2026-10-20) e `values` (o último quadro). `active` liga e desliga a assinatura de `spectrum.bands`.
 - **O player exibido:** o adaptador manda `spectrum.configure {player}` com o nome D-Bus de `Media.active` (o `MprisPlayer` do Quickshell; o construtor confirma a propriedade do nome D-Bus) sempre que ele muda, e `null` sem player; reenvia ao reconectar.
-- **Mais detalhe (decisão do construtor do documento):** card de mídia com 48 barras; aba Mídia espelhada com 96 (as mesmas 48 bandas nas duas metades, como hoje com 32 → 64). Se ficar apertado no tamanho do card, voltar aos números de hoje é aceitável e deve ir no PR.
+- **Mais detalhe (decisão do construtor do documento):** card de mídia com 40 barras; aba Mídia espelhada com 80 (as mesmas 40 bandas nas duas metades, como hoje com 32 → 64). Ajustado olhando o anel com o usuário em 2026-10-20: o desenho começou com 48/96; 32 ficou pouco e 40 foi o meio-termo escolhido. Se ficar apertado no tamanho do card, voltar aos números de hoje é aceitável e deve ir no PR.
 - **Renderização:** o daemon já entrega suavizado a 60 por segundo; o `SpectrumRing.qml` desenha direto, sem `Behavior` por barra. Uma interpolação no QML entre quadros só entra se a fumaça ou o olho mostrarem engasgo.
 - **Sai do shell:** `services/spectrum/Cava.qml`, a config gerada, o `setpriv`, o `command -v cava`, as funções `configFor`/`parse`/`shape`/`failuresAfter`/`retryDelay` e os testes e entradas no `tests/coverage.json` correspondentes; o modo de reserva por `Audio.peak` no `DashboardState.qml` (e o `Audio.monitorPeak`, se ninguém mais usa); o `cava` do `dev/Dockerfile`; as menções no README (dependência opcional) e nas Pendências (a linha do espectro e a de que o `cava` escuta a saída inteira).
 - **Sem o `lucernad`** ou com o módulo indisponível: o anel fica parado no tamanho de repouso, sem aviso extra na interface.

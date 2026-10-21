@@ -39,8 +39,8 @@ fn band_edges_are_logarithmic() {
 
 #[test]
 fn band_of_maps_frequencies() {
-    assert_eq!(band_of(1000.0), Some(25));
-    assert_eq!(band_of(100.0), Some(6));
+    assert_eq!(band_of(1000.0), Some(21));
+    assert_eq!(band_of(100.0), Some(5));
     assert_eq!(band_of(LOW_HZ), Some(0));
     assert_eq!(band_of(LOW_HZ - 1.0), None);
     assert_eq!(band_of(17_000.0), None);
@@ -52,11 +52,11 @@ fn sine_lights_its_band() {
         let signal = sine(1000.0, rate, 0.5, FFT_SIZE + 120 * hop);
         let mut analyzer = Analyzer::new(rate);
         let last = *run(&mut analyzer, &signal, hop, 120).last().unwrap();
-        assert_eq!(argmax(&last), 25, "rate {rate}");
+        assert_eq!(argmax(&last), 21, "rate {rate}");
         if rate == 48_000 {
-            assert!(last[25] > 0.9, "pico {}", last[25]);
+            assert!(last[21] > 0.9, "pico {}", last[21]);
             for (b, v) in last.iter().enumerate() {
-                if !(22..=28).contains(&b) {
+                if !(18..=24).contains(&b) {
                     assert!(*v < 0.2, "banda {b} = {v}");
                 }
             }
@@ -82,7 +82,7 @@ fn white_noise_spreads() {
     let last = *run(&mut analyzer, &signal, 800, 120).last().unwrap();
     // Com a inclinação de +1,5 dB/oitava (−6,6 dB no centro da banda 0), o
     // ruído branco sobe para os agudos e os graves podem ficar baixos.
-    assert!(last.iter().filter(|&&v| v > 0.05).count() >= 36, "{last:?}");
+    assert!(last.iter().filter(|&&v| v > 0.05).count() >= 30, "{last:?}");
     assert!(last[BANDS - 12..].iter().all(|&v| v > 0.3), "{last:?}");
 }
 
@@ -146,7 +146,7 @@ fn steady_sine_does_not_pump() {
     let mut analyzer = Analyzer::new(48_000);
     let band: Vec<f32> = run(&mut analyzer, &signal, hop, total)
         .iter()
-        .map(|f| f[25])
+        .map(|f| f[21])
         .collect();
     let spread = |frames: &[f32]| {
         let min = frames.iter().copied().fold(f32::MAX, f32::min);
@@ -228,29 +228,30 @@ fn center(edges: &[f32; BANDS + 1], b: usize) -> f32 {
 fn tilt_follows_the_octaves() {
     let edges = band_edges();
     let out = bands_db(&flat(-20.0), 48_000);
-    for b in [0, 10, 26, 40, 47] {
+    for b in [0, 10, 21, 33, BANDS - 1] {
         let expected = -20.0 + TILT_DB_PER_OCTAVE * (center(&edges, b) / 1000.0).log2();
         assert!((out[b] - expected).abs() < 0.05, "banda {b}: {}", out[b]);
     }
     // Duas bandas separadas por uma oitava (razão 2 entre os centros)
     // diferem TILT_DB_PER_OCTAVE: entre os centros da primeira e da última
-    // banda (45 Hz a 16 kHz) são 8,3 oitavas.
-    let octaves = (center(&edges, 47) / center(&edges, 0)).log2();
-    assert!((out[47] - out[0] - TILT_DB_PER_OCTAVE * octaves).abs() < 0.05);
-    assert!((octaves - 8.3).abs() < 0.05, "{octaves}");
+    // banda (45 Hz a 16 kHz) são 8,26 oitavas.
+    let last = BANDS - 1;
+    let octaves = (center(&edges, last) / center(&edges, 0)).log2();
+    assert!((out[last] - out[0] - TILT_DB_PER_OCTAVE * octaves).abs() < 0.05);
+    assert!((octaves - 8.26).abs() < 0.01, "{octaves}");
 }
 
 #[test]
 fn band_without_bin_interpolates_at_the_geometric_center() {
-    // A banda 1 (50,9 a 57,5 Hz) fica entre os bins 4 e 5 (46,9 e 58,6 Hz).
+    // A banda 2 (60,4 a 69,9 Hz) fica entre os bins 5 e 6 (58,6 e 70,3 Hz).
     let edges = band_edges();
     let mut mags = flat(0.0);
-    mags[5] = 100.0;
+    mags[6] = 100.0;
     let out = bands_db(&mags, 48_000);
-    let c = center(&edges, 1);
+    let c = center(&edges, 2);
     let pos = c / (48_000.0 / FFT_SIZE as f32);
-    let expected = 100.0 * (pos - 4.0) + TILT_DB_PER_OCTAVE * (c / 1000.0).log2();
-    assert!((out[1] - expected).abs() < 0.05, "{} vs {expected}", out[1]);
+    let expected = 100.0 * (pos - 5.0) + TILT_DB_PER_OCTAVE * (c / 1000.0).log2();
+    assert!((out[2] - expected).abs() < 0.05, "{} vs {expected}", out[2]);
 }
 
 #[test]
@@ -258,7 +259,11 @@ fn bands_above_nyquist_are_silent() {
     // A 24 kHz, Nyquist é 12 kHz: a banda a 16 kHz não tem o que medir.
     let out = bands_db(&flat(-20.0), 24_000);
     let edges = band_edges();
-    let expected = MIN_DB + TILT_DB_PER_OCTAVE * (center(&edges, 47) / 1000.0).log2();
-    assert!((out[47] - expected).abs() < 0.05, "{}", out[47]);
-    assert!(out[26] > -30.0, "{}", out[26]);
+    let expected = MIN_DB + TILT_DB_PER_OCTAVE * (center(&edges, BANDS - 1) / 1000.0).log2();
+    assert!(
+        (out[BANDS - 1] - expected).abs() < 0.05,
+        "{}",
+        out[BANDS - 1]
+    );
+    assert!(out[21] > -30.0, "{}", out[21]);
 }

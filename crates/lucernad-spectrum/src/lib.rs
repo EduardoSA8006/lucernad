@@ -83,7 +83,7 @@ impl SpectrumConfig {
 /// Os tópicos do módulo.
 #[derive(Clone)]
 pub struct SpectrumTopics {
-    /// O contínuo `spectrum.bands`: `{"bands": [48 números de 0 a 1]}`.
+    /// O contínuo `spectrum.bands`: `{"bands": [40 números de 0 a 1]}`.
     pub bands: Topic,
     /// O comum `spectrum.status`.
     pub status: Topic,

@@ -1,4 +1,4 @@
-//! A análise como função pura: amostras → 48 bandas de 0 a 1.
+//! A análise como função pura: amostras → 40 bandas de 0 a 1.
 //!
 //! Janela de Hann, FFT, o maior bin de cada banda logarítmica, inclinação,
 //! ganho automático e suavização.
@@ -10,7 +10,7 @@ use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
 /// O número de bandas.
-pub const BANDS: usize = 48;
+pub const BANDS: usize = 40;
 /// O tamanho da FFT, em amostras.
 pub const FFT_SIZE: usize = 4096;
 /// Os quadros por segundo.
@@ -186,7 +186,7 @@ impl Default for Smoother {
     }
 }
 
-/// A cadeia inteira: janela de amostras → 48 bandas suavizadas.
+/// A cadeia inteira: janela de amostras → 40 bandas suavizadas.
 pub struct Analyzer {
     rate: u32,
     fft: Arc<dyn Fft<f32>>,

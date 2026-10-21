@@ -8,6 +8,7 @@ use std::time::Duration;
 use lucerna_ipc::{Client, ClientError};
 use lucerna_service::ServerBuilder;
 use lucernad_core::ModuleTask;
+use lucernad_spectrum::analysis::BANDS;
 use lucernad_spectrum::backend::OutputNode;
 use lucernad_spectrum::testing::{FakeBackend, FakeBus, fake_config, noise, sine};
 use lucernad_spectrum::{Spectrum, SpectrumConfig, SpectrumTopics, register};
@@ -134,7 +135,7 @@ fn max_band(t: &SpectrumTopics) -> f64 {
 }
 
 fn all_zero(t: &SpectrumTopics) -> bool {
-    bands(t).is_some_and(|b| b.len() == 48 && b.iter().all(|&v| v == 0.0))
+    bands(t).is_some_and(|b| b.len() == BANDS && b.iter().all(|&v| v == 0.0))
 }
 
 fn status(t: &SpectrumTopics) -> Value {
@@ -246,7 +247,7 @@ async fn captures_the_player_and_publishes_bands() {
     })
     .await;
     let b = bands(&t).unwrap();
-    assert_eq!(b.len(), 48);
+    assert_eq!(b.len(), BANDS);
     for v in &b {
         assert!((0.0..=1.0).contains(v), "{v} fora de [0, 1]");
         assert!(
