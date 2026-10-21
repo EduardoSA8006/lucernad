@@ -90,9 +90,16 @@ struct FakeState {
     /// As cópias seguradas: a ponta de escrita e os bytes, até o
     /// [`FakeBackend::release`].
     held: Vec<(PipeWriter, Vec<u8>)>,
+    /// Com [`FakeBackend::defer_echoes`], os ecos das nossas fontes esperam o
+    /// [`FakeBackend::flush_echoes`].
+    defer_echoes: bool,
+    echoes: Vec<(Vec<String>, SelectionData)>,
     /// A sessão aberta por último, enquanto viva.
     current: Option<FakeSession>,
 }
+
+/// Os bytes de uma seleção, por tipo.
+type SelectionData = HashMap<String, Vec<u8>>;
 
 struct FakeSelection {
     offer: u64,
@@ -199,6 +206,21 @@ impl FakeBackend {
     fn select(&self, mimes: &[&str], data: HashMap<String, Vec<u8>>, pipe: Pipe) -> u64 {
         let mimes = mimes.iter().map(|m| m.to_string()).collect();
         self.lock().set_selection(mimes, data, pipe)
+    }
+
+    /// Daqui em diante, o eco de cada fonte nossa só chega no
+    /// [`FakeBackend::flush_echoes`]: o compositor atrasado, com seleções
+    /// alheias no meio.
+    pub fn defer_echoes(&self) {
+        self.lock().defer_echoes = true;
+    }
+
+    /// Manda os ecos guardados, na ordem.
+    pub fn flush_echoes(&self) {
+        let mut state = self.lock();
+        for (mimes, data) in std::mem::take(&mut state.echoes) {
+            state.set_selection(mimes, data, Pipe::Normal);
+        }
     }
 
     /// Outro app copiou por cima da nossa fonte: `Cancelled`, se havia uma.
@@ -336,7 +358,11 @@ impl Control for FakeControl {
                 .map(|(m, bytes)| (m.clone(), bytes.to_vec()))
                 .collect();
             state.owned = Some(source);
-            state.set_selection(mimes, data, Pipe::Normal);
+            if state.defer_echoes {
+                state.echoes.push((mimes, data));
+            } else {
+                state.set_selection(mimes, data, Pipe::Normal);
+            }
         }
     }
 }

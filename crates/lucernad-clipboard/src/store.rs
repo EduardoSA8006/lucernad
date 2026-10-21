@@ -28,6 +28,11 @@ const DB_FILE: &str = "history.db";
 const IMAGES_DIR: &str = "images";
 /// A versão do esquema.
 const SCHEMA_VERSION: i64 = 1;
+/// O maior texto (ou lista de URIs, em bytes) devolvido pelo [`Store::get`]:
+/// a resposta inteira cabe numa mensagem do protocolo (1 MiB).
+pub const GET_TEXT_MAX: usize = 256 << 10;
+/// Quantas URIs de um item de arquivos vão numa página do [`Store::list`].
+pub const LIST_URIS: usize = 50;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS items(
@@ -111,6 +116,11 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    /// Os bytes da imagem (para servir a seleção sem copiá-los de novo).
+    pub fn into_image(self) -> Option<Vec<u8>> {
+        self.image.map(|(bytes, _)| bytes)
+    }
+
     /// Os arquivos da imagem, dentro de `images/`.
     fn files(&self) -> Vec<String> {
         let mut files: Vec<String> = self.file.iter().cloned().collect();
@@ -318,6 +328,23 @@ pub fn wipe(dir: &Path) -> Result<(), String> {
 /// bytes.
 pub type Content = (Kind, Option<String>, Vec<u8>);
 
+/// Os bytes de um item: já na mão (texto, arquivos) ou num arquivo (imagem).
+#[derive(Debug)]
+pub enum Data {
+    Bytes(Vec<u8>),
+    File(PathBuf),
+}
+
+impl Data {
+    /// Os bytes; o arquivo é lido agora (bloqueia).
+    pub fn read(self) -> Result<Vec<u8>, String> {
+        match self {
+            Data::Bytes(bytes) => Ok(bytes),
+            Data::File(path) => fs::read(&path).map_err(|e| format!("{}: {e}", path.display())),
+        }
+    }
+}
+
 /// Uma página do `clipboard.list`.
 #[derive(Debug, Clone, Default)]
 pub struct ListQuery {
@@ -400,7 +427,27 @@ impl Record {
                     .iter()
                     .map(|uri| file_names(&[uri.to_string()]))
                     .collect();
-                out.insert("uris".into(), json!(uris));
+                // A página e o `get` cabem numa mensagem: a página leva as
+                // primeiras URIs e o total; o `get`, até `GET_TEXT_MAX` bytes.
+                let kept = if full {
+                    let mut bytes = 0;
+                    uris.iter()
+                        .take_while(|uri| {
+                            bytes += uri.len();
+                            bytes <= GET_TEXT_MAX
+                        })
+                        .count()
+                } else {
+                    uris.len().min(LIST_URIS)
+                };
+                out.insert("uris".into(), json!(uris[..kept]));
+                if kept < uris.len() {
+                    if full {
+                        out.insert("truncated".into(), json!(true));
+                    } else {
+                        out.insert("urisTotal".into(), json!(uris.len()));
+                    }
+                }
                 Some(names.join(", "))
             }
             Kind::Image => None,
@@ -413,7 +460,14 @@ impl Record {
             }
         }
         if full && self.kind == Kind::Text {
-            out.insert("text".into(), json!(text));
+            let mut end = text.len().min(GET_TEXT_MAX);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.insert("text".into(), json!(text[..end]));
+            if end < text.len() {
+                out.insert("truncated".into(), json!(true));
+            }
         }
         if let Some(file) = &self.file {
             out.insert("image".into(), json!(images.join(file)));
@@ -582,12 +636,37 @@ impl Store {
     /// ganha `used = now_ms`, com o mesmo id e o mesmo `pinned`. Aplica o
     /// limite na mesma transação.
     pub fn insert(&mut self, p: Prepared, now_ms: i64) -> Result<(i64, bool), String> {
+        self.insert_ref(&p, now_ms)
+    }
+
+    /// O [`Store::insert`] sem consumir a cópia (quem chama ainda usa os
+    /// bytes, pelo [`Prepared::into_image`]).
+    pub fn insert_ref(&mut self, p: &Prepared, now_ms: i64) -> Result<(i64, bool), String> {
+        let images = self.images();
+        let inserted = self.insert_here(&images, p, now_ms);
+        // Preparada para outra pasta (a persistência trocou no meio): o que
+        // ficou lá sai, e a pasta também, se vazia, deu certo ou não; senão a
+        // imagem sobraria no disco depois de desligar a persistência.
+        if let Some(old) = p.written_in.as_ref().filter(|old| **old != images) {
+            for file in p.files() {
+                let _ = remove_quietly(&old.join(file));
+            }
+            let _ = fs::remove_dir(old);
+        }
+        inserted
+    }
+
+    fn insert_here(
+        &mut self,
+        images: &Path,
+        p: &Prepared,
+        now_ms: i64,
+    ) -> Result<(i64, bool), String> {
         // Antes do `COMMIT`, para o item nunca ficar sem arquivo. Normalmente o
         // `prepare` já gravou e nada muda; só falta algo se a persistência
         // trocou no meio ou se o mesmo item saiu pelo limite enquanto esta
         // cópia era preparada.
-        let images = self.images();
-        write_image_files(&images, &p)?;
+        write_image_files(images, p)?;
         let tx = self.conn.transaction().map_err(err)?;
         let existing: Option<i64> = tx
             .query_row("SELECT id FROM items WHERE hash = ?1", [&p.hash], |row| {
@@ -630,15 +709,6 @@ impl Store {
         let evicted = Self::evict(&tx, self.limit)?;
         tx.commit().map_err(err)?;
         self.delete_files(&evicted);
-        // Preparada para outra pasta (a persistência trocou no meio): o que
-        // ficou lá sai, e a pasta também, se vazia; senão a imagem sobraria
-        // no disco depois de desligar a persistência.
-        if let Some(old) = p.written_in.as_ref().filter(|old| **old != images) {
-            for file in p.files() {
-                let _ = remove_quietly(&old.join(file));
-            }
-            let _ = fs::remove_dir(old);
-        }
         Ok((id, new))
     }
 
@@ -810,17 +880,23 @@ impl Store {
     /// O que o `offers_for` precisa: o tipo, o mime (imagem) e os bytes (o
     /// texto, a `text/uri-list` crua ou o arquivo da imagem).
     pub fn content(&self, id: i64) -> Result<Option<Content>, String> {
+        let Some((kind, mime, data)) = self.locate(id)? else {
+            return Ok(None);
+        };
+        Ok(Some((kind, mime, data.read()?)))
+    }
+
+    /// O [`Store::content`] sem ler o arquivo da imagem: quem chama o lê com
+    /// o [`Data::read`] depois de soltar o lock.
+    pub fn locate(&self, id: i64) -> Result<Option<(Kind, Option<String>, Data)>, String> {
         let Some(record) = self.record(id)? else {
             return Ok(None);
         };
-        let bytes = match &record.file {
-            Some(file) => {
-                let path = self.images().join(file);
-                fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?
-            }
-            None => record.text.clone().unwrap_or_default().into_bytes(),
+        let data = match &record.file {
+            Some(file) => Data::File(self.images().join(file)),
+            None => Data::Bytes(record.text.clone().unwrap_or_default().into_bytes()),
         };
-        Ok(Some((record.kind, record.mime, bytes)))
+        Ok(Some((record.kind, record.mime, data)))
     }
 
     /// Troca onde o histórico mora. Memória → disco: apaga o destino, copia o

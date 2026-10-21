@@ -497,6 +497,12 @@ async fn owned_selection_outlives_the_subscriber() {
     assert_eq!(r.fake.sessions(), 1, "a seleção nossa segura a sessão");
     assert_eq!(r.work.pending(), 1);
 
+    // Sem assinante, a sessão só segura a seleção: nada de outro app é lido.
+    let reads = r.fake.reads();
+    text(&r.fake, "alheio");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!((r.fake.reads(), count(&r.t)), (reads, 1));
+
     r.fake.cancel();
     wait_until(Duration::from_secs(1), "a sessão solta", || {
         r.work.pending() == 0 && r.fake.sessions() == 0
@@ -890,4 +896,105 @@ async fn panic_marks_the_module_unavailable() {
     .await;
     let again = client(&r.path).await;
     assert_eq!(again.hello().app, "lucernad");
+}
+
+#[tokio::test]
+async fn big_items_fit_in_a_message() {
+    let r = rig();
+    let c = ready(&r).await;
+    let big = "Ação do dia, linha ".repeat(49_000);
+    assert!(big.len() <= 1 << 20, "{}", big.len());
+    copied(&r, &big, 1).await;
+    let uris: Vec<String> = (0..5000)
+        .map(|i| format!("file:///home/u/{}/arquivo-{i:05}.txt", "pasta".repeat(20)))
+        .collect();
+    let list_bytes = uris.join("\r\n");
+    assert!(list_bytes.len() <= 1 << 20, "{}", list_bytes.len());
+    r.fake.copy(
+        &["text/uri-list"],
+        &[("text/uri-list", list_bytes.as_bytes())],
+    );
+    wait_count(&r.t, 2).await;
+
+    let page = list_all(&c).await;
+    let files = &items(&page)[0];
+    assert_eq!(files["uris"].as_array().unwrap().len(), 50);
+    assert_eq!(files["urisTotal"], 5000);
+    let text_id = ids(&page)[1];
+
+    // O `get` cabe no limite do SDK (senão a chamada falharia) e diz que cortou.
+    let item = call(&c, "clipboard.get", json!({"id": text_id}))
+        .await
+        .unwrap();
+    assert_eq!(item["truncated"], true);
+    let text = item["text"].as_str().unwrap();
+    assert!(
+        text.len() <= 256 << 10 && text.len() > 250 << 10,
+        "{}",
+        text.len()
+    );
+    assert!(big.starts_with(text));
+    let item = call(&c, "clipboard.get", json!({"id": files["id"]}))
+        .await
+        .unwrap();
+    assert_eq!(item["truncated"], true);
+    let kept = item["uris"].as_array().unwrap();
+    assert!(kept.len() < 5000 && kept[0] == uris[0].as_str());
+
+    // Um texto pequeno vem inteiro, sem `truncated`.
+    copied(&r, "curto", 3).await;
+    let id = ids(&list_all(&c).await)[0];
+    let item = call(&c, "clipboard.get", json!({"id": id})).await.unwrap();
+    assert_eq!(
+        (item["text"].clone(), item.get("truncated")),
+        (json!("curto"), None)
+    );
+}
+
+#[tokio::test]
+async fn echo_queue_skips_only_our_sources() {
+    let r = rig();
+    let c = ready(&r).await;
+    r.fake.defer_echoes();
+    let stored = r.dir.path().join("guardada.png");
+    std::fs::write(&stored, png_bytes(24, 24)).unwrap();
+    let kept = call(&c, "clipboard.copyImage", json!({"path": stored}))
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    wait_count(&r.t, 1).await;
+    let capture = r.dir.path().join("captura.png");
+    std::fs::write(&capture, png_bytes(40, 40)).unwrap();
+    call(
+        &c,
+        "clipboard.copyImage",
+        json!({"path": capture, "store": false}),
+    )
+    .await
+    .unwrap();
+
+    // Uma cópia alheia chega antes dos dois ecos e não esvazia a fila.
+    copied(&r, "alheio", 2).await;
+    let reads = r.fake.reads();
+    r.fake.flush_echoes();
+    copied(&r, "sentinela", 3).await;
+    assert_eq!(r.fake.reads(), reads + 1, "os ecos não foram lidos");
+    let images = json!({"kind": "image", "offset": 0, "limit": 10});
+    assert_eq!(ids(&list(&c, images.clone()).await), [kept]);
+
+    // A seleção deixou de ser nossa: os mesmos tipos, de outro app, entram.
+    call(
+        &c,
+        "clipboard.copyImage",
+        json!({"path": capture, "store": false}),
+    )
+    .await
+    .unwrap();
+    r.fake.cancel();
+    let other = png_bytes(56, 56);
+    tick().await;
+    r.fake.copy(&["image/png"], &[("image/png", &other)]);
+    wait_count(&r.t, 4).await;
+    assert_eq!(list(&c, images).await["total"], 2);
 }

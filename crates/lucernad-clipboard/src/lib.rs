@@ -14,6 +14,7 @@
 //! assinante de `clipboard.history` **ou** enquanto a seleção for nossa
 //! (depois de um `clipboard.copy`), com um `WorkGuard` segurando o daemon.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::future::Future;
 use std::io::Read;
@@ -62,6 +63,9 @@ pub const LIST_MAX: usize = 200;
 /// A maior consulta do `clipboard.list`, em caracteres.
 const QUERY_MAX: usize = 1000;
 
+/// Quantas fontes nossas esperam o eco, no máximo (um compositor que não
+/// ecoa não faz a fila crescer).
+const MAX_ECHOES: usize = 16;
 /// O id do módulo nas pastas da `lucerna-paths`.
 const APP: &str = "clipboard";
 
@@ -405,7 +409,12 @@ impl Ctx {
             .await
             .is_err()
         {
-            self.configure(Settings::default(), true).await?;
+            // Numa tarefa própria: quem espera pode desistir (o laço atende
+            // uma cópia no meio) sem cortar o `configure` ao meio.
+            let ctx = self.clone();
+            let default =
+                tokio::spawn(async move { ctx.configure(Settings::default(), true).await });
+            default.await.map_err(|_| stopped())??;
         }
         Ok(())
     }
@@ -450,7 +459,7 @@ impl Ctx {
 
     /// Grava a cópia preparada e publica o histórico (bloqueia); o id, ou
     /// `None` sem histórico aberto.
-    fn insert_prepared(&self, p: Prepared, now: i64) -> Result<Option<i64>, String> {
+    fn insert_prepared(&self, p: &Prepared, now: i64) -> Result<Option<i64>, String> {
         let Some(db) = self.db.upgrade() else {
             return Ok(None);
         };
@@ -458,7 +467,7 @@ impl Ctx {
         let Some(store) = slot.as_mut() else {
             return Ok(None);
         };
-        let (id, _) = store.insert(p, now)?;
+        let (id, _) = store.insert_ref(p, now)?;
         self.shared.publish_history(store);
         Ok(Some(id))
     }
@@ -515,6 +524,8 @@ impl Ctx {
 
     async fn get(self, p: Value) -> Result<Value, RpcError> {
         let id = id_of(&p)?;
+        // O texto vem cortado em `GET_TEXT_MAX`, com `truncated` (a resposta
+        // cabe numa mensagem; o shell nunca precisa do texto inteiro).
         self.with_store(move |_, store| store.get(id).map_err(internal)?.ok_or_else(|| gone(id)))
             .await
     }
@@ -522,10 +533,12 @@ impl Ctx {
     async fn copy(self, p: Value) -> Result<Value, RpcError> {
         let id = id_of(&p)?;
         let (kind, mime, data) = self
-            .with_store(move |_, store| {
-                store.content(id).map_err(internal)?.ok_or_else(|| gone(id))
-            })
+            .with_store(move |_, store| store.locate(id).map_err(internal)?.ok_or_else(|| gone(id)))
             .await?;
+        // O arquivo da imagem é lido sem o lock.
+        let data = join(tokio::task::spawn_blocking(move || data.read()))
+            .await
+            .map_err(internal)?;
         let source = Source {
             offers: offers_for(kind, mime.as_deref(), &data, id),
         };
@@ -600,17 +613,19 @@ impl Ctx {
         let ctx = self.clone();
         let clip = NewClip::Image {
             mime: mime.clone(),
-            bytes: bytes.clone(),
+            bytes,
         };
         let now = now_ms();
-        let id = join(tokio::task::spawn_blocking(move || {
-            match ctx.prepare_clip(clip).map_err(internal)? {
-                Some(p) => ctx.insert_prepared(p, now).map_err(internal),
-                None => Ok(None),
-            }
+        let stored = join(tokio::task::spawn_blocking(move || {
+            let Some(p) = ctx.prepare_clip(clip).map_err(internal)? else {
+                return Ok(None);
+            };
+            let id = ctx.insert_prepared(&p, now).map_err(internal)?;
+            // Os mesmos bytes servem a seleção, sem outra cópia.
+            Ok(id.zip(p.into_image()))
         }))
-        .await?
-        .ok_or_else(|| self.shared.unavailable())?;
+        .await?;
+        let (id, bytes) = stored.ok_or_else(|| self.shared.unavailable())?;
         let source = Source {
             offers: offers_for(Kind::Image, Some(&mime), &bytes, id),
         };
@@ -755,6 +770,7 @@ impl Clipboard {
             copies: self.copies,
             parked: None,
             owned: None,
+            echoes: VecDeque::new(),
             last_read: None,
         };
         let run = tokio::spawn(run(module));
@@ -794,6 +810,9 @@ struct Module {
     /// Um pedido de cópia recebido fora da sessão, para a próxima.
     parked: Option<CopyRequest>,
     owned: Option<Owned>,
+    /// Os tipos (em ordem) de cada fonte nossa ainda sem eco, da mais velha
+    /// para a mais nova; só valem enquanto a seleção for nossa.
+    echoes: VecDeque<Vec<String>>,
     /// Fecha quando a última leitura gravou (ou desistiu): a ordem das cópias.
     last_read: Option<oneshot::Receiver<()>>,
 }
@@ -839,8 +858,17 @@ impl Module {
             self.settings.borrow_and_update();
             let subscribed = history.subscribers() > 0;
             if subscribed {
-                // Sem `configure`, o padrão depois da espera.
-                let _ = self.ctx.ensure_configured().await;
+                // Sem `configure`, o padrão depois da espera; uma cópia pedida
+                // no meio (o `copyImage` sem guardar) não espera.
+                let ctx = self.ctx.clone();
+                tokio::select! {
+                    _ = ctx.ensure_configured() => {}
+                    request = self.copies.recv() => {
+                        if request.is_some() {
+                            return request;
+                        }
+                    }
+                }
                 if self.store_open() {
                     return None;
                 }
@@ -902,25 +930,23 @@ impl Module {
             control,
         } = session;
         let history = self.shared().topics.history.clone();
-        // Os tipos da nossa fonte, até o compositor a ecoar como seleção.
-        let mut echo = None;
         if let Some(request) = first {
-            self.serve(&*control, request, &mut echo);
+            self.serve(&*control, request);
         }
         loop {
             tokio::select! {
                 event = events.recv() => match event {
                     Some(Event::Selection { offer, mimes }) => {
-                        self.selection(&*control, offer, mimes, &mut echo);
+                        self.selection(&*control, offer, mimes);
                     }
-                    Some(Event::Cancelled) => self.owned = None,
+                    Some(Event::Cancelled) => self.release(),
                     Some(Event::Cleared) => {}
                     Some(Event::Disconnected(why)) => return Exit::Dropped(why),
                     None => return Exit::Dropped(disconnected("a sessão terminou")),
                 },
                 request = self.copies.recv() => {
                     if let Some(request) = request {
-                        self.serve(&*control, request, &mut echo);
+                        self.serve(&*control, request);
                     }
                 }
                 _ = self.settings.changed() => {
@@ -933,14 +959,19 @@ impl Module {
         }
     }
 
+    /// A seleção deixou de ser nossa: o trabalho e os ecos esperados saem.
+    fn release(&mut self) {
+        self.owned = None;
+        self.echoes.clear();
+    }
+
     /// Vira dono da seleção com a fonte do pedido.
-    fn serve(
-        &mut self,
-        control: &dyn Control,
-        request: CopyRequest,
-        echo: &mut Option<Vec<String>>,
-    ) {
-        *echo = Some(sorted(request.source.offers.iter().map(|(m, _)| m.clone())));
+    fn serve(&mut self, control: &dyn Control, request: CopyRequest) {
+        let mimes = sorted(request.source.offers.iter().map(|(m, _)| m.clone()));
+        if self.echoes.len() == MAX_ECHOES {
+            self.echoes.pop_front();
+        }
+        self.echoes.push_back(mimes);
         control.offer(request.source);
         self.owned = Some(Owned {
             id: request.own,
@@ -951,21 +982,19 @@ impl Module {
 
     /// Uma seleção nova: o eco da nossa fonte é pulado; o resto, pela
     /// escolha do tipo.
-    fn selection(
-        &mut self,
-        control: &dyn Control,
-        offer: u64,
-        mimes: Vec<String>,
-        echo: &mut Option<Vec<String>>,
-    ) {
-        if echo
-            .take()
-            .is_some_and(|ours| ours == sorted(mimes.iter().cloned()))
-        {
-            return;
+    fn selection(&mut self, control: &dyn Control, offer: u64, mimes: Vec<String>) {
+        // O eco de uma fonte nossa (e o das mais velhas, que não vêm mais).
+        // Uma seleção alheia no meio não mexe na fila.
+        if self.owned.is_some() {
+            let these = sorted(mimes.iter().cloned());
+            if let Some(at) = self.echoes.iter().position(|ours| *ours == these) {
+                self.echoes.drain(..=at);
+                return;
+            }
         }
-        // Antes do `configure`, nada é lido (a persistência ainda não se sabe).
-        if !self.store_open() {
+        // Sem assinante (a sessão só segura a seleção nossa) e antes do
+        // `configure`, nada é lido: o histórico pode estar desligado.
+        if self.shared().topics.history.subscribers() == 0 || !self.store_open() {
             return;
         }
         match choose(&mimes) {
@@ -1024,10 +1053,12 @@ impl Module {
                 let _ = previous.await;
             }
             let inserted = match prepared {
-                Ok(Ok(Some(p))) => tokio::task::spawn_blocking(move || ctx.insert_prepared(p, now))
-                    .await
-                    .unwrap_or_else(|e| Err(format!("pânico: {e}")))
-                    .map(drop),
+                Ok(Ok(Some(p))) => {
+                    tokio::task::spawn_blocking(move || ctx.insert_prepared(&p, now))
+                        .await
+                        .unwrap_or_else(|e| Err(format!("pânico: {e}")))
+                        .map(drop)
+                }
                 Ok(Ok(None)) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(format!("pânico: {e}")),
@@ -1106,7 +1137,7 @@ async fn run(mut m: Module) {
         };
         let exit = m.session(session, socket, pending).await;
         // A sessão já foi largada, e a seleção nossa com ela.
-        m.owned = None;
+        m.release();
         if let Exit::Dropped(why) = exit {
             eprintln!("lucernad: {why}");
             m.wayland(Err(why));

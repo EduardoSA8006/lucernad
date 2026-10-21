@@ -138,10 +138,9 @@ struct Scan<'a> {
     found: Vec<Range<usize>>,
     /// Os últimos caracteres normalizados (circular), com o original de cada um.
     recent: Vec<(char, usize)>,
-    /// Quantos caracteres normalizados já passaram desde o último casamento.
+    /// Quantos caracteres normalizados já passaram desde o último casamento
+    /// (zerar depois de um casamento é o que evita a sobreposição).
     seen: usize,
-    /// Sem sobreposição: depois de um casamento, segue do caractere seguinte.
-    skip_until: usize,
     window: bool,
     limit: usize,
     folder: Folder,
@@ -154,7 +153,6 @@ impl<'a> Scan<'a> {
             found: Vec::new(),
             recent: vec![('\0', 0); needle.len()],
             seen: 0,
-            skip_until: 0,
             window,
             limit: usize::MAX,
             folder: Folder {
@@ -169,15 +167,11 @@ impl<'a> Scan<'a> {
         if n == 0 || i >= self.limit || self.found.len() >= MAX_MATCHES {
             return false;
         }
-        if i < self.skip_until {
-            return true;
-        }
         let Scan {
             needle,
             found,
             recent,
             seen,
-            skip_until,
             window,
             limit,
             folder,
@@ -195,7 +189,6 @@ impl<'a> Scan<'a> {
             let start = recent[first % n].1;
             found.push(start..i + 1);
             *seen = 0;
-            *skip_until = i + 1;
             if *window && found.len() == 1 {
                 *limit = window_start(start) + PREVIEW_CHARS;
             }
