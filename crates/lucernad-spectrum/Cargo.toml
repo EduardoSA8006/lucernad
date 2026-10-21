@@ -1,0 +1,26 @@
+[package]
+name = "lucernad-spectrum"
+description = "Módulo spectrum do lucernad: o espectro do som do player exibido, pelo PipeWire."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+# O FakeBackend, os sinais de teste e o testdata(), para os testes.
+testing = []
+
+[dependencies]
+pipewire.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# Os testes deste crate usam o módulo `testing`.
+lucernad-spectrum = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true
