@@ -1,11 +1,13 @@
 //! Ajudantes para os testes (feature `testing`).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::backend::{Backend, Control, Event, OutputNode, Session};
+use crate::dbus::{BoxFuture, Bus, Identity};
 
 /// O caminho de `rel` dentro do `testdata/` deste crate.
 pub fn testdata(rel: &str) -> PathBuf {
@@ -208,5 +210,74 @@ impl Drop for FakeControl {
         if state.current.as_ref().is_some_and(|s| s.id == self.id) {
             state.current = None;
         }
+    }
+}
+
+/// O dublê do [`Bus`]: o teste diz quem é o dono de cada nome.
+#[derive(Clone, Default)]
+pub struct FakeBus {
+    state: Arc<Mutex<FakeBusState>>,
+}
+
+#[derive(Default)]
+struct FakeBusState {
+    owners: HashMap<String, u32>,
+    entries: HashMap<String, String>,
+    hanging: bool,
+}
+
+impl FakeBus {
+    /// Um barramento sem nomes: o `identify` devolve só o `name`.
+    pub fn new() -> FakeBus {
+        FakeBus::default()
+    }
+
+    /// Com `pid` como dono de `name`.
+    pub fn owner(self, name: &str, pid: u32) -> FakeBus {
+        self.set_owner(name, pid);
+        self
+    }
+
+    /// Com `entry` como `DesktopEntry` do player `name`.
+    pub fn desktop_entry(self, name: &str, entry: &str) -> FakeBus {
+        self.lock()
+            .entries
+            .insert(name.to_string(), entry.to_string());
+        self
+    }
+
+    /// Um barramento cujo `identify` nunca volta.
+    pub fn hanging() -> FakeBus {
+        let bus = FakeBus::new();
+        bus.lock().hanging = true;
+        bus
+    }
+
+    /// Troca o dono de `name` (o player que reinicia com PID novo).
+    pub fn set_owner(&self, name: &str, pid: u32) {
+        self.lock().owners.insert(name.to_string(), pid);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, FakeBusState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Bus for FakeBus {
+    fn identify<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Identity> {
+        let state = self.lock();
+        let hanging = state.hanging;
+        let id = Identity {
+            name: name.to_string(),
+            owner_pid: state.owners.get(name).copied(),
+            desktop_entry: state.entries.get(name).cloned(),
+        };
+        drop(state);
+        Box::pin(async move {
+            if hanging {
+                std::future::pending::<()>().await;
+            }
+            id
+        })
     }
 }

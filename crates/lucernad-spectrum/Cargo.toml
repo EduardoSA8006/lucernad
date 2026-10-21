@@ -11,13 +11,14 @@ authors.workspace = true
 publish.workspace = true
 
 [features]
-# O FakeBackend, os sinais de teste e o testdata(), para os testes.
+# O FakeBackend, o FakeBus, os sinais de teste e o testdata(), para os testes.
 testing = []
 
 [dependencies]
 pipewire.workspace = true
 rustfft.workspace = true
 tokio.workspace = true
+zbus.workspace = true
 
 [dev-dependencies]
 # Os testes deste crate usam o módulo `testing`.
