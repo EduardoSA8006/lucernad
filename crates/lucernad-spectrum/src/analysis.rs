@@ -16,13 +16,13 @@ pub const FFT_SIZE: usize = 4096;
 /// Os quadros por segundo.
 pub const FPS: u32 = 60;
 /// A frequência da borda de baixo da primeira banda.
-pub const LOW_HZ: f32 = 30.0;
+pub const LOW_HZ: f32 = 45.0;
 /// A frequência da borda de cima da última banda.
 pub const HIGH_HZ: f32 = 16_000.0;
 /// A faixa mostrada, em dB abaixo da referência.
-pub const RANGE_DB: f32 = 48.0;
+pub const RANGE_DB: f32 = 54.0;
 /// A inclinação em volta de 1 kHz, em dB por oitava.
-pub const TILT_DB_PER_OCTAVE: f32 = 3.0;
+pub const TILT_DB_PER_OCTAVE: f32 = 1.5;
 /// A parte do caminho até o alvo que o valor sobe por quadro.
 pub const ATTACK: f32 = 0.6;
 /// A gravidade da queda, em unidades por segundo ao quadrado.
