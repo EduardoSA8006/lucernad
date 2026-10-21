@@ -1,11 +1,16 @@
-//! O protocolo do `lucernad`, em processo, sobre a máquina de exemplo.
-#![cfg(feature = "system")]
+//! O protocolo do `lucernad`, em processo: o `system` sobre a máquina de
+//! exemplo e o `spectrum` com os dublês.
+#![cfg(any(feature = "system", feature = "spectrum"))]
 
 mod common;
 
 use common::start;
+#[cfg(feature = "system")]
 use serde_json::Value;
+#[cfg(feature = "spectrum")]
+use serde_json::json;
 
+#[cfg(feature = "system")]
 #[tokio::test]
 async fn the_daemon_serves_the_system_module() {
     let r = start().await;
@@ -30,5 +35,25 @@ async fn the_daemon_serves_the_system_module() {
     let s = c.next_state().await.unwrap();
     assert_eq!(s.topic, "system.stats");
     assert_eq!(s.data["memTotal"], 16384000);
+    r.stop().await;
+}
+
+#[cfg(feature = "spectrum")]
+#[tokio::test]
+async fn the_daemon_serves_the_spectrum_module() {
+    let r = start().await;
+    let c = r.client().await;
+    assert_eq!(c.hello().streams, ["spectrum.bands"]);
+    assert_eq!(
+        c.hello().topics.last().map(String::as_str),
+        Some("spectrum.status"),
+        "{:?}",
+        c.hello().topics
+    );
+    let v = c
+        .call("spectrum.configure", Some(json!({"player": null})))
+        .await
+        .unwrap();
+    assert_eq!(v, json!({}));
     r.stop().await;
 }

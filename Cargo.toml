@@ -17,13 +17,18 @@ lucerna-service = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev 
 lucerna-cli = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
 lucerna-ipc = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
 lucerna-manifest = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
+lucernad-core = { path = "crates/lucernad-core" }
 lucernad-system = { path = "crates/lucernad-system" }
+lucernad-spectrum = { path = "crates/lucernad-spectrum" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rustix = { version = "1", features = ["fs"] }
 nvml-wrapper = "0.11"
 tempfile = "3"
+pipewire = "0.10"
+rustfft = "6"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

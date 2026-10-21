@@ -50,6 +50,12 @@ jobs:
       - name: Toolchain (o que o rust-toolchain.toml pede)
         run: rustup toolchain install
 
+      # O módulo de espectro liga na libpipewire, e o bindgen do libspa-sys
+      # carrega a libclang na compilação.
+      - name: Dependências do PipeWire
+        if: matrix.job != 'fmt'
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev libclang-dev pkg-config
+
       - name: Cache do cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -70,6 +76,9 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           # O lucernad sem nenhum módulo também compila limpo.
           cargo clippy -p lucernad --no-default-features --all-targets --locked -- -D warnings
+          # E com cada módulo sozinho.
+          cargo clippy -p lucernad --no-default-features --features system --all-targets --locked -- -D warnings
+          cargo clippy -p lucernad --no-default-features --features spectrum --all-targets --locked -- -D warnings
 
       - name: test
         if: matrix.job == 'test'

@@ -13,7 +13,9 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
-use crate::{Detached, Roots, Spawn, detached_with, spawn_thread};
+use lucernad_core::{Detached, Spawn, detached_with, spawn_thread};
+
+use crate::Roots;
 
 /// Uma linha do `mountinfo`: o `maj:min`, a origem, o ponto de montagem e o
 /// tipo.
@@ -577,7 +579,7 @@ mod tests {
             lock(&r.pending).is_empty(),
             "o alvo não fica preso como pendente"
         );
-        r.spawn = crate::spawn_thread;
+        r.spawn = spawn_thread;
         assert_eq!(
             r.usages(&mounts, &t).await.len(),
             1,

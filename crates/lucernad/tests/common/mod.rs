@@ -1,4 +1,5 @@
-//! O `lucernad` em processo, num socket temporário, sobre a máquina de exemplo.
+//! O `lucernad` em processo, num socket temporário: o módulo `system` sobre a
+//! máquina de exemplo e o `spectrum` sem PipeWire nem D-Bus de verdade.
 
 // Cada arquivo de teste usa uma parte das ferramentas.
 #![allow(dead_code)]
@@ -8,7 +9,10 @@ use std::time::Duration;
 
 use lucerna_ipc::Client;
 use lucernad::{Modules, lucernad};
-use lucernad_system::ModuleTask;
+use lucernad_core::ModuleTask;
+#[cfg(feature = "spectrum")]
+use lucernad_spectrum::testing::quiet_config;
+#[cfg(feature = "system")]
 use lucernad_system::testing::machine_config;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -18,18 +22,21 @@ use tokio::task::JoinHandle;
 pub struct Running {
     _dir: TempDir,
     pub path: PathBuf,
-    _system_task: ModuleTask,
+    _tasks: Vec<ModuleTask>,
     task: JoinHandle<()>,
 }
 
-/// Sobe o `lucernad` (módulo `system` na máquina de exemplo) num socket
-/// temporário, sem shell.
+/// Sobe o `lucernad` (o `system` na máquina de exemplo, o `spectrum` com os
+/// dublês) num socket temporário, sem shell.
 pub async fn start() -> Running {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("lucernad.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let mut d = lucernad(Modules {
+        #[cfg(feature = "system")]
         system: machine_config(),
+        #[cfg(feature = "spectrum")]
+        spectrum: quiet_config(),
     });
     d.service.idle_timeout(Duration::from_secs(60));
     let service = d.service;
@@ -39,7 +46,12 @@ pub async fn start() -> Running {
     Running {
         _dir: dir,
         path,
-        _system_task: d.system_task,
+        _tasks: vec![
+            #[cfg(feature = "system")]
+            d.system_task,
+            #[cfg(feature = "spectrum")]
+            d.spectrum_task,
+        ],
         task,
     }
 }

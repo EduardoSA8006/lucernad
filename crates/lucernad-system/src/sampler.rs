@@ -21,7 +21,9 @@ use crate::memory::parse_meminfo;
 use crate::net::{NetTotals, push_history, rates, read_interfaces, sum};
 use crate::nvidia::{NoNvidia, Nvidia};
 use crate::temp::{find_sensor, read_temp};
-use crate::{Detached, Roots, detached, panic_message, read};
+use lucernad_core::{Detached, detached, panic_message};
+
+use crate::{Roots, read};
 
 /// O prazo de uma leitura das GPUs com a NVML.
 pub const NVIDIA_TIMEOUT: Duration = Duration::from_secs(2);

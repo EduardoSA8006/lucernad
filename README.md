@@ -4,7 +4,7 @@
 
 Daemon em Rust com a lógica do shell Lucerna (espectro de áudio, sistema, área de transferência, energia e mais); o shell fica só com a interface.
 
-**Situação:** o módulo `system` está pronto (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs).
+**Situação:** dois módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs) e o `spectrum` (o espectro do som do player exibido, pelo PipeWire).
 
 ## Módulos
 
@@ -22,7 +22,26 @@ Lê tudo do `/proc` e do `/sys`, sem nenhum processo externo, e só mede enquant
 
 Método: `system.configure {"interval_ms": n}` → `{}`, com `n` inteiro de `500` a `10000` (padrão `2000`); vale o último pedido.
 
+### `spectrum`
+
+Captura pelo PipeWire **só o som do player exibido** (não a saída inteira), com uma FFT própria, e entrega 40 bandas suavizadas a 60 quadros por segundo. Roda **só com assinante e com player**: sem assinante de `spectrum.bands` ou sem player configurado, nem a conexão com o PipeWire fica aberta. Os fluxos de captura são só de entrada, ligados às saídas do player: o roteamento do som não muda, e quando o player some o fluxo nunca cai no microfone.
+
+| Tópico | O que traz | Quando muda |
+| --- | --- | --- |
+| `spectrum.bands` | `{"bands":[40 números de 0 a 1, com até 3 casas]}`, dos graves aos agudos | a cada quadro (até 60 por segundo) enquanto captura, só quando muda; ao parar, um quadro de zeros; `null` até o primeiro quadro |
+| `spectrum.status` | `{"available","capturing","player","error"}`: `available` diz se a última conexão com o PipeWire deu certo, `capturing` se há um nó do player sendo capturado, `player` o configurado e `error` o último erro (`null` depois de uma conexão boa) | quando o estado muda |
+
+Método: `spectrum.configure {"player": "org.mpris.MediaPlayer2.<…>" | null}` → `{}`; outro valor dá `-32602`. Vale o último pedido.
+
+Como o player (nome MPRIS) casa com os nós de saída do PipeWire:
+
+1. O nó é do player se o PID do client dele é o do dono do nome no D-Bus ou um descendente dele; quando o dono é uma ponte conhecida (o `plasma-browser-integration-host`), a busca parte do pai.
+2. Sem o dono no `/proc` (ou com o proxy do Flatpak), a reserva compara o executável do client com o nome do player (o fim do nome D-Bus, sem o `.instance…`, ou o `DesktopEntry`), só com igualdade exata e só se todos os nós que casam vierem de um mesmo processo.
+3. Vários nós casando somam (as abas do navegador tocando juntas); em dúvida, nenhum: o anel parado é melhor que as barras de outro app.
+
 ## Instalação
+
+Para compilar: `libpipewire`, `clang` e `pkgconf` (Arch) ou `libpipewire-0.3-dev`, `libclang-dev` e `pkg-config` (Debian/Ubuntu). O espectro precisa do PipeWire com o WirePlumber rodando.
 
 ```sh
 cargo build --release --locked -p lucernad
@@ -38,16 +57,19 @@ O socket fica em `$XDG_RUNTIME_DIR/lucerna/lucernad.sock`; o systemd sobe o daem
 
 - `lucernad status`: o estado de todos os tópicos.
 - `lucernad watch system.stats`: cada mudança de um tópico, até o Ctrl+C.
+- `lucernad player org.mpris.MediaPlayer2.spotify`: escolhe o player cujo som o espectro mostra (sem nome, nenhum); `lucernad watch spectrum.bands` mostra as bandas.
 - `--json` (antes do subcomando): a saída em JSON, uma linha por estado.
 
 ## Desenvolvimento
 
-Os comandos do CI (fmt, clippy, este também sem nenhum módulo, e test), com `TMPDIR=/tmp` (os testes criam sockets Unix, cujo caminho tem limite de ~108 bytes):
+Os comandos do CI (fmt, clippy, este também sem nenhum módulo e com cada módulo sozinho, e test), com `TMPDIR=/tmp` (os testes criam sockets Unix, cujo caminho tem limite de ~108 bytes):
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy -p lucernad --no-default-features --all-targets --locked -- -D warnings
+cargo clippy -p lucernad --no-default-features --features system --all-targets --locked -- -D warnings
+cargo clippy -p lucernad --no-default-features --features spectrum --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 

@@ -6,16 +6,15 @@
 //! `testdata/`. O módulo se registra num servidor com [`register`] e roda com
 //! [`System::spawn`].
 
-use std::any::Any;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use lucerna_service::{RpcError, ServerBuilder, Topic};
+use lucernad_core::publish_changed;
 use serde_json::{Value, json};
-use tokio::sync::{oneshot, watch};
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::disks::{DiskReader, RealStatfs, Statfs};
@@ -35,6 +34,8 @@ pub mod temp;
 
 #[cfg(feature = "testing")]
 pub mod testing;
+
+pub use lucernad_core::ModuleTask;
 
 /// Onde ficam o `/proc`, o `/sys` e o `/etc` lidos pelo módulo.
 #[derive(Clone, Debug)]
@@ -114,20 +115,6 @@ pub struct System {
     interval: watch::Receiver<Duration>,
 }
 
-/// O laço e o supervisor do módulo; largar aborta os dois.
-#[must_use = "largar o ModuleTask para o módulo"]
-pub struct ModuleTask {
-    tasks: Vec<AbortHandle>,
-}
-
-impl Drop for ModuleTask {
-    fn drop(&mut self) {
-        for t in &self.tasks {
-            t.abort();
-        }
-    }
-}
-
 /// O `interval_ms` dos parâmetros, se for um inteiro na faixa aceita.
 fn parse_interval(params: Option<&Value>) -> Option<Duration> {
     params?
@@ -195,23 +182,15 @@ impl System {
     /// indisponível; o servidor continua atendendo.
     pub fn spawn(self) -> ModuleTask {
         let Some(sampler) = self.sampler else {
-            return ModuleTask { tasks: Vec::new() };
+            return ModuleTask::new(Vec::new());
         };
         let run: JoinHandle<()> = tokio::spawn(run(sampler, self.topics.clone(), self.interval));
-        let run_abort = run.abort_handle();
-        let status = self.topics.status.clone();
-        let supervisor = tokio::spawn(async move {
-            if let Err(e) = run.await
-                && e.is_panic()
-            {
-                let msg = panic_message(&*e.into_panic());
-                eprintln!("lucernad: o módulo de sistema parou: {msg:?}");
-                status.publish(json!({"available": false, "error": PANIC_ERROR}));
-            }
-        });
-        ModuleTask {
-            tasks: vec![supervisor.abort_handle(), run_abort],
-        }
+        lucernad_core::supervise(
+            run,
+            self.topics.status.clone(),
+            "de sistema",
+            json!({"available": false, "error": PANIC_ERROR}),
+        )
     }
 }
 
@@ -220,13 +199,6 @@ fn ticker(start: Instant, period: Duration) -> tokio::time::Interval {
     let mut t = tokio::time::interval_at(start, period);
     t.set_missed_tick_behavior(MissedTickBehavior::Skip);
     t
-}
-
-/// Publica `data` em `topic` só se ele mudou desde o retrato atual.
-fn publish_changed(topic: &Topic, data: Value) {
-    if topic.current().data != data {
-        topic.publish(data);
-    }
 }
 
 /// O laço: espera um assinante, amostra no intervalo os grupos assinados e
@@ -280,103 +252,7 @@ async fn run(mut sampler: Sampler, t: SystemTopics, mut interval: watch::Receive
     }
 }
 
-/// O texto de um pânico (`&str` ou `String`); vazio com outra carga.
-pub(crate) fn panic_message(p: &(dyn Any + Send)) -> String {
-    p.downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| p.downcast_ref::<String>().cloned())
-        .unwrap_or_default()
-}
-
 /// O conteúdo do arquivo, ou `None` se ele não puder ser lido.
 pub(crate) fn read(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
-}
-
-/// O fim de um trabalho rodado por [`detached`].
-pub(crate) enum Detached<T> {
-    /// Voltou a tempo com este valor.
-    Done(T),
-    /// Não voltou no prazo; a thread segue solta até terminar.
-    TimedOut,
-    /// Entrou em pânico, com a carga dele.
-    Panicked(Box<dyn Any + Send>),
-    /// A thread não pôde ser criada; `f` não rodou.
-    SpawnFailed(std::io::Error),
-}
-
-/// Um trabalho entregue a uma thread solta.
-pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
-
-/// Como o [`detached`] cria a thread (trocável nos testes, para simular a
-/// falha).
-pub(crate) type Spawn = fn(Job) -> std::io::Result<()>;
-
-/// Cria a thread solta de verdade.
-pub(crate) fn spawn_thread(job: Job) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("lucernad-detached".into())
-        .spawn(job)
-        .map(drop)
-}
-
-/// Roda `f` numa `std::thread` solta e espera a resposta até `timeout`.
-///
-/// Para o trabalho que pode travar (o `statvfs` de uma montagem morta, a
-/// NVML): a thread não é do runtime, então uma chamada presa não segura os
-/// outros trabalhos nem a saída do processo, como o `spawn_blocking`
-/// seguraria. O resultado chega por um `oneshot`; o pânico de `f` é pego.
-pub(crate) async fn detached<T: Send + 'static>(
-    f: impl FnOnce() -> T + Send + 'static,
-    timeout: Duration,
-) -> Detached<T> {
-    detached_with(spawn_thread, f, timeout).await
-}
-
-/// O [`detached`], com a criação da thread dada por `spawn`.
-pub(crate) async fn detached_with<T: Send + 'static>(
-    spawn: Spawn,
-    f: impl FnOnce() -> T + Send + 'static,
-    timeout: Duration,
-) -> Detached<T> {
-    let (tx, rx) = oneshot::channel();
-    let job: Job = Box::new(move || {
-        let _ = tx.send(catch_unwind(AssertUnwindSafe(f)));
-    });
-    if let Err(e) = spawn(job) {
-        return Detached::SpawnFailed(e);
-    }
-    match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(Ok(value))) => Detached::Done(value),
-        Ok(Ok(Err(panic))) => Detached::Panicked(panic),
-        // O `catch_unwind` sempre responde; sem resposta, a thread morreu.
-        Ok(Err(closed)) => Detached::Panicked(Box::new(closed)),
-        Err(_) => Detached::TimedOut,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn detached_returns_times_out_and_catches_panics() {
-        let short = Duration::from_millis(100);
-        assert!(matches!(detached(|| 7, short).await, Detached::Done(7)));
-        let slow = || std::thread::sleep(Duration::from_millis(500));
-        assert!(matches!(detached(slow, short).await, Detached::TimedOut));
-        match detached(|| -> () { panic!("de propósito") }, short).await {
-            Detached::Panicked(p) => assert_eq!(p.downcast_ref::<&str>(), Some(&"de propósito")),
-            _ => panic!("o pânico não foi pego"),
-        }
-    }
-
-    #[tokio::test]
-    async fn spawn_failure_is_its_own_outcome() {
-        let fail: Spawn = |_job| Err(std::io::Error::other("sem threads"));
-        match detached_with(fail, || 7, Duration::from_millis(100)).await {
-            Detached::SpawnFailed(e) => assert_eq!(e.to_string(), "sem threads"),
-            _ => panic!("a falha ao criar a thread não foi notada"),
-        }
-    }
 }
