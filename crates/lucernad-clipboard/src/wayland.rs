@@ -10,8 +10,7 @@
 //! Cada `send` da nossa fonte é escrito numa thread própria, para quem cola
 //! devagar não segurar o laço.
 
-use std::fs::File;
-use std::io::{ErrorKind, PipeReader, PipeWriter, Write};
+use std::io::{ErrorKind, PipeReader, PipeWriter, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -19,7 +18,7 @@ use std::path::Path;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, poll};
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -38,6 +37,8 @@ use wayland_protocols_wlr::data_control::v1::client::{
 };
 
 use crate::backend::{Backend, Control, Event, Session, Source};
+use crate::mime::READ_TIMEOUT;
+use crate::pipe::write_pipe;
 
 /// O prazo para o compositor responder à abertura.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -93,6 +94,8 @@ impl Backend for Wayland {
         // responder no prazo (a thread presa no `read` acorda com o EOF).
         let killer = stream.try_clone().map_err(|e| connect_failed(socket, e))?;
         let (wake_reader, wake) = std::io::pipe().map_err(|e| connect_failed(socket, e))?;
+        rustix::io::ioctl_fionbio(&wake_reader, true).map_err(|e| connect_failed(socket, e))?;
+        rustix::io::ioctl_fionbio(&wake, true).map_err(|e| connect_failed(socket, e))?;
         let (events_tx, events) = mpsc::unbounded_channel();
         let (ready_tx, ready) = std_mpsc::channel();
         let only = self.only;
@@ -297,12 +300,12 @@ impl State {
             return;
         };
         let bytes = bytes.clone();
-        // Quem cola pode fechar antes do fim: o erro de pipe quebrado fica
-        // de fora.
+        // Quem cola pode fechar antes do fim ou nem ler: o erro e o prazo
+        // (o mesmo da leitura) só encerram a thread, que leva o fd.
         let _ = std::thread::Builder::new()
             .name("lucernad-colar".into())
             .spawn(move || {
-                let _ = File::from(fd).write_all(&bytes);
+                let _ = write_pipe(&fd, &bytes, Instant::now() + READ_TIMEOUT);
             });
     }
 
@@ -507,28 +510,35 @@ fn dispatch(
                 "o dispositivo da área de transferência terminou",
             ));
         }
-        match conn.flush() {
-            Ok(()) => {}
-            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {}
+        // O que não coube no socket fica no buffer: o `POLLOUT` avisa
+        // quando dá para mandar o resto.
+        let pending = match conn.flush() {
+            Ok(()) => false,
+            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => true,
             Err(e) => return Err(disconnected(e)),
-        }
+        };
         let Some(guard) = queue.prepare_read() else {
             continue;
         };
         let (readable, woken) = {
             let fd = guard.connection_fd();
-            let mut fds = [
-                PollFd::new(&fd, PollFlags::IN),
-                PollFd::new(wake, PollFlags::IN),
-            ];
+            let mut flags = PollFlags::IN;
+            if pending {
+                flags |= PollFlags::OUT;
+            }
+            let mut fds = [PollFd::new(&fd, flags), PollFd::new(wake, PollFlags::IN)];
             match poll(&mut fds, None) {
                 Ok(_) => {}
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(disconnected(e)),
             }
-            (!fds[0].revents().is_empty(), !fds[1].revents().is_empty())
+            let conn_events = fds[0].revents();
+            (
+                conn_events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
+                !fds[1].revents().is_empty(),
+            )
         };
-        if woken {
+        if woken && drain(wake) {
             // A outra ponta do pipe fechou: o Control foi largado.
             return Ok(());
         }
@@ -542,10 +552,26 @@ fn dispatch(
     }
 }
 
+/// Esvazia o pipe de despertar (não bloqueante). `true` quando a outra
+/// ponta fechou.
+fn drain(wake: &PipeReader) -> bool {
+    let mut buf = [0u8; 64];
+    loop {
+        match (&*wake).read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // `WouldBlock`: vazio, a outra ponta ainda aberta.
+            Err(_) => return false,
+        }
+    }
+}
+
 /// O [`Control`] do Wayland.
 struct WaylandControl {
     handles: Handles,
-    /// Largar fecha o pipe de despertar, e a thread da sessão sai.
+    /// Um byte acorda a thread da sessão para o `flush`; largar fecha o
+    /// pipe, e ela sai.
     wake: Option<PipeWriter>,
     thread: Option<JoinHandle<()>>,
 }
@@ -560,7 +586,7 @@ impl Control for WaylandControl {
                 _ => return Err(SELECTION_CHANGED.to_string()),
             }
         }
-        self.handles.conn.flush().map_err(disconnected)?;
+        self.flush()?;
         // A ponta de escrita sai daqui na hora: só quem copiou a segura, e o
         // EOF chega quando ele fecha.
         drop(writer);
@@ -586,7 +612,25 @@ impl Control for WaylandControl {
             old.destroy();
         }
         drop(owned);
-        let _ = h.conn.flush();
+        let _ = self.flush();
+    }
+}
+
+impl WaylandControl {
+    /// Manda os pedidos. O socket cheio (`WouldBlock`) não é queda: o resto
+    /// fica no buffer, e a thread da sessão, acordada, termina o `flush`.
+    fn flush(&self) -> Result<(), String> {
+        match self.handles.conn.flush() {
+            Ok(()) => Ok(()),
+            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                if let Some(mut wake) = self.wake.as_ref() {
+                    // Pipe cheio: a thread já tem o que acordar.
+                    let _ = wake.write(&[1]);
+                }
+                Ok(())
+            }
+            Err(e) => Err(disconnected(e)),
+        }
     }
 }
 

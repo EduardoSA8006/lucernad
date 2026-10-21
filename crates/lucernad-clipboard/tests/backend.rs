@@ -117,11 +117,20 @@ fn fake_counts_and_fails() {
 
 #[test]
 fn sonda_refuses_outside_the_container() {
-    assert!(
-        std::env::var_os("LUCERNA_ISOLADO").is_none(),
-        "este teste roda sem LUCERNA_ISOLADO"
+    // No container da sonda a trava deixa passar: aqui não há o que conferir.
+    if std::env::var_os("LUCERNA_ISOLADO").is_some() {
+        return;
+    }
+    let payload = std::panic::catch_unwind(isolated).expect_err("a trava recusa");
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .expect("o texto do pânico");
+    assert_eq!(
+        message,
+        "sonda.rs: só roda pelo tests/isolado.sh, num container"
     );
-    assert!(std::panic::catch_unwind(isolated).is_err());
 }
 
 #[test]

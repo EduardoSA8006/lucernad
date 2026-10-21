@@ -1,7 +1,8 @@
-//! A leitura do conteúdo de uma cópia pelo pipe, com prazo e limite, e o
-//! caminho do socket do Wayland.
+//! A leitura do conteúdo de uma cópia pelo pipe, com prazo e limite, a
+//! escrita para quem cola, com prazo, e o caminho do socket do Wayland.
 
-use std::io::{ErrorKind, PipeReader, Read};
+use std::io::{Error, ErrorKind, PipeReader, Read};
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,39 @@ pub fn read_pipe(
             Err(e) => return Err(ReadError::Io(e.to_string())),
         }
     }
+}
+
+/// Escreve `data` inteiro em `fd` (o pipe de quem cola), sem passar do
+/// `deadline`: o fd vira não bloqueante e cada pedaço espera o `POLLOUT` com
+/// o tempo que falta. Quem não lê dá `ErrorKind::TimedOut`; quem fecha antes
+/// do fim, o erro de pipe quebrado. Bloqueia a thread: chame fora do laço.
+pub fn write_pipe(fd: impl AsFd, data: &[u8], deadline: Instant) -> std::io::Result<()> {
+    rustix::io::ioctl_fionbio(&fd, true)?;
+    let mut rest = data;
+    while !rest.is_empty() {
+        match rustix::io::write(&fd, rest) {
+            Ok(n) => {
+                rest = &rest[n..];
+                continue;
+            }
+            Err(rustix::io::Errno::AGAIN) | Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left == Duration::ZERO {
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                "quem cola não leu no prazo",
+            ));
+        }
+        let timeout = Timespec::try_from(left).map_err(Error::other)?;
+        let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 /// O caminho do socket de uma exibição do Wayland: absoluto vale como está;

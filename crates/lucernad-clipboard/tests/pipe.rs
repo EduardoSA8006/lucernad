@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lucernad_clipboard::mime::TEXT_MAX;
-use lucernad_clipboard::pipe::{ReadError, read_pipe, socket_path};
+use lucernad_clipboard::pipe::{ReadError, read_pipe, socket_path, write_pipe};
 
 #[test]
 fn reads_until_eof() {
@@ -81,4 +81,34 @@ fn socket_paths() {
     assert!(err.contains("XDG_RUNTIME_DIR"), "{err}");
     let err = socket_path("", Some(Path::new("/run/user/1000"))).unwrap_err();
     assert!(err.contains("WAYLAND_DISPLAY"), "{err}");
+}
+
+#[test]
+fn stalled_reader_does_not_hold_the_writer() {
+    // Quem cola e não lê: a escrita desiste no prazo, sem prender a thread.
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let data = vec![7u8; 1 << 20];
+    let start = Instant::now();
+    let err =
+        write_pipe(writer, &data, start + Duration::from_millis(200)).expect_err("o leitor não lê");
+    let took = start.elapsed();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        took >= Duration::from_millis(150) && took < Duration::from_secs(1),
+        "{took:?}"
+    );
+    drop(reader);
+}
+
+#[test]
+fn writer_delivers_everything_and_closes() {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let data: Vec<u8> = (0..(300u32 << 10)).map(|i| i as u8).collect();
+    let expected = data.clone();
+    let thread = std::thread::spawn(move || {
+        write_pipe(writer, &data, Instant::now() + Duration::from_secs(3))
+    });
+    let got = read_pipe(reader, 1 << 20, Instant::now() + Duration::from_secs(3));
+    assert_eq!(got, Ok(expected));
+    thread.join().expect("a thread").expect("escrever tudo");
 }
