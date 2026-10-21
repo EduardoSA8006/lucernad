@@ -2,6 +2,7 @@
 //! e busca.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use lucernad_clipboard::mime::Kind;
@@ -418,7 +419,7 @@ fn back_to_disk_over_leftover_files() {
     fs::create_dir_all(&d).unwrap();
     fs::write(d.join("history.db"), b"lixo").unwrap();
     fs::write(d.join("history.db-wal"), b"lixo").unwrap();
-    let store = store.move_to(Origin::Disk(d.clone())).expect("ir ao disco");
+    store.move_to(Origin::Disk(d.clone())).expect("ir ao disco");
     assert_eq!(all(&store).total, 2);
     drop(store);
     let store = disk_at(&d);
@@ -471,7 +472,7 @@ fn persist_off_then_on_moves_items_and_files() {
     add(&mut store, t("antigo"), 1);
     add(&mut store, png(50), 2);
 
-    let mut store = store.move_to(memory).expect("desligar");
+    store.move_to(memory).expect("desligar");
     assert!(db_files(&d).is_empty());
     assert!(names(&d.join("images")).is_empty());
     assert_eq!(all(&store).total, 0);
@@ -481,7 +482,7 @@ fn persist_off_then_on_moves_items_and_files() {
     store.pin(text, true).unwrap();
     assert_eq!(names(&rt.join("images")).len(), 2);
 
-    let store = store.move_to(Origin::Disk(d.clone())).expect("religar");
+    store.move_to(Origin::Disk(d.clone())).expect("religar");
     let page = all(&store);
     assert_eq!(ids(&page), vec![text, image]);
     assert_eq!(item(&page, text)["pinned"], true);
@@ -556,5 +557,143 @@ fn get_content_touch_remove_and_clear() {
     assert_eq!(store.clear(false).unwrap(), 1);
     assert_eq!(ids(&all(&store)), vec![files]);
     assert_eq!(store.clear(true).unwrap(), 1);
+    assert_eq!(store.counts().unwrap(), (0, 0));
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn memory_in(tmp: &TempDir) -> (Store, PathBuf, PathBuf) {
+    let rt = tmp.path().join("runtime").join("clipboard");
+    let d = tmp.path().join("data").join("clipboard");
+    let store = Store::open(
+        Origin::Memory {
+            files: rt.clone(),
+            disk: d.clone(),
+        },
+        100,
+    )
+    .unwrap();
+    (store, rt, d)
+}
+
+#[test]
+fn prepared_before_persist_off_leaves_nothing_on_disk() {
+    let tmp = TempDir::new().unwrap();
+    let d = tmp.path().join("data").join("clipboard");
+    let rt = tmp.path().join("runtime").join("clipboard");
+    let mut store = disk_at(&d);
+    // A cópia começa com o disco ligado...
+    let stale = store.files_dir();
+    store
+        .move_to(Origin::Memory {
+            files: rt.clone(),
+            disk: d.clone(),
+        })
+        .unwrap();
+    // ...e o `prepare` termina depois do `wipe`, gravando na pasta velha.
+    let prepared = prepare(png(70), &stale).unwrap();
+    assert_eq!(names(&d.join("images")).len(), 2);
+    let (id, _) = store.insert(prepared, 1).unwrap();
+    assert!(!d.join("images").exists());
+    assert!(db_files(&d).is_empty());
+    assert_eq!(names(&rt.join("images")).len(), 2);
+    let page = all(&store);
+    assert!(Path::new(item(&page, id)["image"].as_str().unwrap()).starts_with(&rt));
+    assert!(Path::new(item(&page, id)["thumb"].as_str().unwrap()).exists());
+}
+
+#[test]
+fn failed_move_to_disk_keeps_the_memory() {
+    let tmp = TempDir::new().unwrap();
+    let (mut store, rt, _) = memory_in(&tmp);
+    add(&mut store, t("um"), 1);
+    let (image, _) = add(&mut store, png(80), 2);
+
+    // O destino numa pasta sem permissão de escrita.
+    let locked = tmp.path().join("trancada");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+    let target = locked.join("clipboard");
+    assert!(store.move_to(Origin::Disk(target.clone())).is_err());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(all(&store).total, 2);
+    assert!(!target.exists());
+
+    // A falha no meio (depois do `VACUUM INTO`): uma imagem que não se lê.
+    let d = tmp.path().join("outro").join("clipboard");
+    let image_path = PathBuf::from(item(&all(&store), image)["image"].as_str().unwrap());
+    fs::set_permissions(&image_path, fs::Permissions::from_mode(0o000)).unwrap();
+    let failed = store.move_to(Origin::Disk(d.clone()));
+    fs::set_permissions(&image_path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(failed.is_err());
+    assert!(db_files(&d).is_empty());
+    assert!(names(&d.join("images")).is_empty());
+    assert_eq!(all(&store).total, 2);
+    assert_eq!(names(&rt.join("images")).len(), 2);
+    assert!(store.content(image).unwrap().is_some());
+
+    // E, depois, a troca funciona.
+    store.move_to(Origin::Disk(d.clone())).unwrap();
+    assert_eq!(all(&store).total, 2);
+}
+
+#[test]
+fn history_files_are_private() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("clipboard");
+    let mut store = disk_at(&dir);
+    add(&mut store, t("texto"), 1);
+    add(&mut store, png(90), 2);
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&dir.join("images")), 0o700);
+    assert_eq!(mode(&dir.join("history.db")), 0o600);
+    assert_eq!(mode(&dir.join("history.db-wal")), 0o600);
+    for name in names(&dir.join("images")) {
+        assert_eq!(mode(&dir.join("images").join(&name)), 0o600, "{name}");
+    }
+
+    // Os que vêm da memória também.
+    let (mut memory, _, d) = memory_in(&tmp);
+    add(&mut memory, png(91), 1);
+    memory.move_to(Origin::Disk(d.clone())).unwrap();
+    assert_eq!(mode(&d.join("history.db")), 0o600);
+    for name in names(&d.join("images")) {
+        assert_eq!(mode(&d.join("images").join(&name)), 0o600, "{name}");
+    }
+}
+
+#[test]
+fn unknown_kind_in_the_database_is_an_error() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("clipboard");
+    let mut store = disk_at(&dir);
+    let (id, _) = add(&mut store, t("texto"), 1);
+    drop(store);
+    let conn = rusqlite::Connection::open(dir.join("history.db")).unwrap();
+    conn.execute("UPDATE items SET kind = 'outro' WHERE id = ?1", [id])
+        .unwrap();
+    drop(conn);
+    let store = disk_at(&dir);
+    let failed = store.list(&ListQuery {
+        limit: 10,
+        ..ListQuery::default()
+    });
+    assert!(failed.unwrap_err().contains("outro"));
+    assert!(store.get(id).is_err());
+}
+
+#[test]
+fn image_files_are_written_before_the_commit() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("clipboard");
+    let mut store = disk_at(&dir);
+    // Preparada em outra pasta; no lugar da pasta do banco, um arquivo.
+    let prepared = prepare(png(95), &tmp.path().join("outra")).unwrap();
+    let images = dir.join("images");
+    fs::remove_dir(&images).unwrap();
+    fs::write(&images, b"no caminho").unwrap();
+    assert!(store.insert(prepared, 1).is_err());
     assert_eq!(store.counts().unwrap(), (0, 0));
 }

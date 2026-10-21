@@ -6,8 +6,9 @@
 //! uma imagem grande.
 
 use std::fmt::Display;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions, Permissions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -105,6 +106,19 @@ pub struct Prepared {
     file: Option<String>,
     /// Os bytes da imagem e da miniatura, para regravar o que faltar.
     image: Option<(Vec<u8>, Option<Vec<u8>>)>,
+    /// A pasta `images/` onde o [`prepare`] gravou.
+    written_in: Option<PathBuf>,
+}
+
+impl Prepared {
+    /// Os arquivos da imagem, dentro de `images/`.
+    fn files(&self) -> Vec<String> {
+        let mut files: Vec<String> = self.file.iter().cloned().collect();
+        if let Some((_, Some(_))) = &self.image {
+            files.push(thumb_name(&self.hash));
+        }
+        files
+    }
 }
 
 /// O hash do conteúdo, com o tipo na frente: SHA-256 em hex.
@@ -124,12 +138,15 @@ fn thumb_name(hash: &str) -> String {
     format!("{hash}.thumb.png")
 }
 
-/// Grava `bytes` em `path` por um arquivo temporário na mesma pasta e um
-/// `rename`; se `path` já existe, não faz nada.
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if path.exists() {
-        return Ok(());
-    }
+/// O modo dos arquivos do histórico: só o dono lê.
+const PRIVATE_FILE: u32 = 0o600;
+
+/// Grava em `path` pelo que `fill` escreve num arquivo temporário (modo
+/// `0600`) na mesma pasta e um `rename`.
+fn write_private(
+    path: &Path,
+    fill: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> Result<(), String> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = path.with_file_name(format!(
@@ -137,11 +154,45 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let written = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE_FILE)
+        .open(&tmp)
+        .and_then(|mut file| fill(&mut file).and_then(|()| file.sync_all()))
+        .and_then(|()| fs::rename(&tmp, path));
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     written.map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Grava `bytes` em `path` (modo `0600`, por temporário e `rename`); se
+/// `path` já existe, não faz nada.
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+    write_private(path, |file| file.write_all(bytes))
+}
+
+/// Copia `from` para `to` com modo `0600` (por temporário e `rename`: entre
+/// sistemas de arquivos diferentes, o `rename` direto daria `EXDEV`).
+fn copy_private(from: &Path, to: &Path) -> Result<(), String> {
+    let mut source = fs::File::open(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    write_private(to, |file| io::copy(&mut source, file).map(|_| ()))
+}
+
+/// Cria `path` vazio com modo `0600` se não existe e corrige o modo se existe.
+fn private_file(path: &Path) -> Result<(), String> {
+    let fix = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(PRIVATE_FILE)
+        .open(path)
+        .and_then(|_| fs::set_permissions(path, Permissions::from_mode(PRIVATE_FILE)));
+    fix.map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn remove_quietly(path: &Path) -> io::Result<()> {
@@ -198,6 +249,7 @@ pub fn prepare(clip: NewClip, files_dir: &Path) -> Result<Prepared, String> {
         lines: None,
         file: None,
         image: None,
+        written_in: None,
     };
     match clip {
         NewClip::Text(text) => {
@@ -234,11 +286,13 @@ pub fn prepare(clip: NewClip, files_dir: &Path) -> Result<Prepared, String> {
                 file: Some(file),
                 ..empty(Kind::Image, hash, bytes.len())
             };
+            let images = images_in(files_dir);
             let prepared = Prepared {
                 image: Some((bytes, thumb.map(|t| t.png))),
+                written_in: Some(images.clone()),
                 ..prepared
             };
-            write_image_files(&images_in(files_dir), &prepared)?;
+            write_image_files(&images, &prepared)?;
             Ok(prepared)
         }
     }
@@ -302,7 +356,13 @@ impl Record {
         let kind: String = row.get(1)?;
         Ok(Record {
             id: row.get(0)?,
-            kind: Kind::parse(&kind).unwrap_or(Kind::Text),
+            kind: Kind::parse(&kind).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    format!("tipo de item desconhecido no histórico: {kind}").into(),
+                )
+            })?,
             hash: row.get(2)?,
             text: row.get(3)?,
             mime: row.get(4)?,
@@ -394,19 +454,29 @@ impl Store {
     /// `0700`), com os órfãos de `images/` apagados. Na memória: apaga antes o
     /// histórico do disco e o que houver em `files/images/`.
     pub fn open(origin: Origin, limit: usize) -> Result<Store, String> {
+        if let Origin::Memory { disk, .. } = &origin {
+            wipe(disk)?;
+        }
+        Store::open_here(origin, limit)
+    }
+
+    /// O [`Store::open`] sem apagar o disco na memória.
+    fn open_here(origin: Origin, limit: usize) -> Result<Store, String> {
         let conn = match &origin {
             Origin::Disk(dir) => {
                 private_dir(dir)?;
                 private_dir(&images_in(dir))?;
-                let conn = Connection::open(dir.join(DB_FILE)).map_err(err)?;
+                let db = dir.join(DB_FILE);
+                // O SQLite cria o `-wal` e o `-shm` com o modo do banco.
+                private_file(&db)?;
+                let conn = Connection::open(&db).map_err(err)?;
                 conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
                     .map_err(err)?;
                 conn.pragma_update(None, "synchronous", "NORMAL")
                     .map_err(err)?;
                 conn
             }
-            Origin::Memory { files, disk } => {
-                wipe(disk)?;
+            Origin::Memory { files, .. } => {
                 private_dir(files)?;
                 let images = images_in(files);
                 remove_dir_quietly(&images).map_err(|e| format!("{}: {e}", images.display()))?;
@@ -507,6 +577,12 @@ impl Store {
     /// ganha `used = now_ms`, com o mesmo id e o mesmo `pinned`. Aplica o
     /// limite na mesma transação.
     pub fn insert(&mut self, p: Prepared, now_ms: i64) -> Result<(i64, bool), String> {
+        // Antes do `COMMIT`, para o item nunca ficar sem arquivo. Normalmente o
+        // `prepare` já gravou e nada muda; só falta algo se a persistência
+        // trocou no meio ou se o mesmo item saiu pelo limite enquanto esta
+        // cópia era preparada.
+        let images = self.images();
+        write_image_files(&images, &p)?;
         let tx = self.conn.transaction().map_err(err)?;
         let existing: Option<i64> = tx
             .query_row("SELECT id FROM items WHERE hash = ?1", [&p.hash], |row| {
@@ -549,10 +625,15 @@ impl Store {
         let evicted = Self::evict(&tx, self.limit)?;
         tx.commit().map_err(err)?;
         self.delete_files(&evicted);
-        // Normalmente o `prepare` já gravou; só falta algo se a pasta mudou no
-        // meio (a persistência trocada) ou se o mesmo item saiu pelo limite
-        // enquanto esta cópia era preparada.
-        write_image_files(&self.images(), &p)?;
+        // Preparada para outra pasta (a persistência trocou no meio): o que
+        // ficou lá sai, e a pasta também, se vazia; senão a imagem sobraria
+        // no disco depois de desligar a persistência.
+        if let Some(old) = p.written_in.as_ref().filter(|old| **old != images) {
+            for file in p.files() {
+                let _ = remove_quietly(&old.join(file));
+            }
+            let _ = fs::remove_dir(old);
+        }
         Ok((id, new))
     }
 
@@ -739,48 +820,73 @@ impl Store {
 
     /// Troca onde o histórico mora. Memória → disco: apaga o destino, copia o
     /// banco (`VACUUM INTO`) e os arquivos (copiados, não renomeados: o tmpfs
-    /// e o disco são sistemas de arquivos diferentes). Disco → memória: apaga
-    /// o disco e começa vazio.
-    pub fn move_to(self, origin: Origin) -> Result<Store, String> {
+    /// e o disco são sistemas de arquivos diferentes); se algo falha, o
+    /// destino parcial é apagado e o histórico em memória fica como estava.
+    /// Disco → memória: começa vazio e apaga o disco; se falha ao abrir a
+    /// memória, nada muda; se falha só ao apagar o disco, o histórico já está
+    /// na memória e o erro diz o que sobrou.
+    pub fn move_to(&mut self, origin: Origin) -> Result<(), String> {
         if self.origin == origin {
-            return Ok(self);
+            return Ok(());
         }
         let limit = self.limit;
-        match (&self.origin, &origin) {
+        match (self.origin.clone(), origin.clone()) {
             (Origin::Memory { files, .. }, Origin::Disk(dir)) => {
-                wipe(dir)?;
-                private_dir(dir)?;
-                let target = images_in(dir);
-                private_dir(&target)?;
-                let tmp = dir.join(format!("{DB_FILE}.tmp"));
-                self.conn
-                    .execute("VACUUM INTO ?1", [tmp.to_string_lossy()])
-                    .map_err(err)?;
-                let source = images_in(files);
-                for entry in
-                    fs::read_dir(&source).map_err(|e| format!("{}: {e}", source.display()))?
-                {
-                    let entry = entry.map_err(err)?;
-                    let to = target.join(entry.file_name());
-                    let copy =
-                        to.with_file_name(format!(".{}.copy", entry.file_name().to_string_lossy()));
-                    fs::copy(entry.path(), &copy)
-                        .and_then(|_| fs::rename(&copy, &to))
-                        .map_err(|e| format!("{}: {e}", to.display()))?;
+                let moved = self
+                    .copy_to_disk(&files, &dir)
+                    .and_then(|()| Store::open_here(origin, limit));
+                match moved {
+                    Ok(store) => {
+                        // A memória antiga sai e leva os arquivos dela.
+                        drop(std::mem::replace(self, store));
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = wipe(&dir);
+                        Err(e)
+                    }
                 }
-                fs::rename(&tmp, dir.join(DB_FILE)).map_err(err)?;
-                drop(self);
-                Store::open(origin, limit)
             }
-            (old, _) => {
-                let old = old.clone();
-                drop(self);
-                if let Origin::Disk(dir) = old {
-                    wipe(&dir)?;
+            (Origin::Disk(old), Origin::Memory { disk, .. }) => {
+                let store = Store::open_here(origin, limit)?;
+                // Fecha o banco do disco antes de apagar.
+                drop(std::mem::replace(self, store));
+                wipe(&old)?;
+                if disk != old {
+                    wipe(&disk)?;
                 }
-                Store::open(origin, limit)
+                Ok(())
+            }
+            (Origin::Memory { files: a, .. }, Origin::Memory { files: b, disk }) if a == b => {
+                wipe(&disk)?;
+                self.origin = origin;
+                Ok(())
+            }
+            _ => {
+                let store = Store::open(origin, limit)?;
+                drop(std::mem::replace(self, store));
+                Ok(())
             }
         }
+    }
+
+    /// O banco e os arquivos da memória em `dir`, por cima do que houver.
+    fn copy_to_disk(&self, files: &Path, dir: &Path) -> Result<(), String> {
+        wipe(dir)?;
+        private_dir(dir)?;
+        let target = images_in(dir);
+        private_dir(&target)?;
+        let tmp = dir.join(format!("{DB_FILE}.tmp"));
+        self.conn
+            .execute("VACUUM INTO ?1", [tmp.to_string_lossy()])
+            .map_err(err)?;
+        fs::set_permissions(&tmp, Permissions::from_mode(PRIVATE_FILE)).map_err(err)?;
+        let source = images_in(files);
+        for entry in fs::read_dir(&source).map_err(|e| format!("{}: {e}", source.display()))? {
+            let entry = entry.map_err(err)?;
+            copy_private(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        fs::rename(&tmp, dir.join(DB_FILE)).map_err(err)
     }
 }
 
