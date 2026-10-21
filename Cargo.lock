@@ -784,6 +784,7 @@ dependencies = [
  "lucerna-ipc",
  "lucerna-manifest",
  "lucerna-service",
+ "lucernad-clipboard",
  "lucernad-core",
  "lucernad-spectrum",
  "lucernad-system",

@@ -1,4 +1,4 @@
-//! O binário `lucernad`: `serve` roda o daemon; `status`, `watch` e `player`
+//! O binário `lucernad`: `serve` roda o daemon; `status`, `watch`, `player`, `historico` e `copiar`
 //! falam com ele. Sem argumentos (ou com `tui …`), mostra a ajuda: não há TUI.
 
 use std::fmt::Display;
@@ -15,12 +15,14 @@ async fn main() -> ExitCode {
         Ok(Invocation::Tui(_)) => report(cli.clap().print_help()),
         Ok(Invocation::Serve) => {
             // As tarefas dos módulos vivem até o serviço parar. As threads
-            // soltas (statvfs, NVML, PipeWire) não seguram a saída do processo.
+            // soltas (statvfs, NVML, PipeWire, Wayland) não seguram a saída do processo.
             let d = lucernad(Modules::real());
             #[cfg(feature = "system")]
             let _system_task = d.system_task;
             #[cfg(feature = "spectrum")]
             let _spectrum_task = d.spectrum_task;
+            #[cfg(feature = "clipboard")]
+            let _clipboard_task = d.clipboard_task;
             report(d.service.run().await)
         }
         Ok(Invocation::Cli(run)) => cli.run_from_env(run).await,

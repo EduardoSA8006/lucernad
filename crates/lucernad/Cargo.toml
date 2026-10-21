@@ -1,6 +1,6 @@
 [package]
 name = "lucernad"
-description = "O daemon do Lucerna: um binário com um módulo por área (system e spectrum)."
+description = "O daemon do Lucerna: um binário com um módulo por área (system, spectrum e clipboard)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,11 +11,13 @@ authors.workspace = true
 publish.workspace = true
 
 [features]
-default = ["system", "spectrum"]
+default = ["system", "spectrum", "clipboard"]
 # O módulo `system`: CPU, memória, rede, temperatura, discos e GPUs.
 system = ["dep:lucernad-system", "dep:lucernad-core"]
 # O módulo `spectrum`: o espectro do som do player exibido, pelo PipeWire.
 spectrum = ["dep:lucernad-spectrum", "dep:lucernad-core", "dep:serde_json"]
+# O módulo da área de transferência: o histórico do Wayland.
+clipboard = ["dep:lucernad-clipboard", "dep:lucernad-core", "dep:serde_json"]
 
 [lib]
 name = "lucernad"
@@ -30,12 +32,14 @@ path = "src/main.rs"
 lucerna-cli.workspace = true
 lucerna-service.workspace = true
 lucernad-core = { workspace = true, optional = true }
+lucernad-clipboard = { workspace = true, optional = true }
 lucernad-spectrum = { workspace = true, optional = true }
 lucernad-system = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio.workspace = true
 
 [dev-dependencies]
+lucernad-clipboard = { workspace = true, features = ["testing"] }
 lucernad-spectrum = { workspace = true, features = ["testing"] }
 lucernad-system = { workspace = true, features = ["testing"] }
 lucerna-ipc.workspace = true

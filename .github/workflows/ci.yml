@@ -79,6 +79,7 @@ jobs:
           # E com cada módulo sozinho.
           cargo clippy -p lucernad --no-default-features --features system --all-targets --locked -- -D warnings
           cargo clippy -p lucernad --no-default-features --features spectrum --all-targets --locked -- -D warnings
+          cargo clippy -p lucernad --no-default-features --features clipboard --all-targets --locked -- -D warnings
 
       - name: test
         if: matrix.job == 'test'
