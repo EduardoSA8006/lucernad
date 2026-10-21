@@ -27,3 +27,18 @@ pub fn png_bytes(w: u32, h: u32) -> Vec<u8> {
 pub fn jpeg_bytes(w: u32, h: u32) -> Vec<u8> {
     encode(w, h, ImageFormat::Jpeg)
 }
+
+/// Um JPEG com a orientação EXIF dada (1 a 8) num APP1 logo depois do SOI.
+pub fn jpeg_bytes_oriented(w: u32, h: u32, orientation: u16) -> Vec<u8> {
+    let plain = jpeg_bytes(w, h);
+    let mut app1 = vec![0xFF, 0xE1, 0x00, 34];
+    app1.extend_from_slice(b"Exif\0\0");
+    app1.extend_from_slice(b"MM\0*\0\0\0\x08");
+    app1.extend_from_slice(&[0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1]);
+    app1.extend_from_slice(&orientation.to_be_bytes());
+    app1.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    let mut out = plain[..2].to_vec();
+    out.extend_from_slice(&app1);
+    out.extend_from_slice(&plain[2..]);
+    out
+}

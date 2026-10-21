@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use lucernad_clipboard::testing::{jpeg_bytes, png_bytes};
+use lucernad_clipboard::testing::{jpeg_bytes, jpeg_bytes_oriented, png_bytes};
 use lucernad_clipboard::thumb::{extension_for, sniff, thumbnail};
 
 fn crc32(data: &[u8]) -> u32 {
@@ -37,17 +37,45 @@ fn jpeg_and_small_images() {
     assert_eq!(decoded_size(&t.png), (100, 50));
 }
 
-#[test]
-fn huge_dimensions_are_refused() {
+/// Um PNG de 1 x 1 com o IHDR reescrito para `w` x `h` (o CRC recalculado).
+fn png_declaring(w: u32, h: u32) -> Vec<u8> {
     let mut png = png_bytes(1, 1);
     // assinatura (8) + tamanho (4) + "IHDR" (4) + dados (13) + CRC (4)
-    png[16..20].copy_from_slice(&100_000u32.to_be_bytes());
-    png[20..24].copy_from_slice(&100_000u32.to_be_bytes());
+    png[16..20].copy_from_slice(&w.to_be_bytes());
+    png[20..24].copy_from_slice(&h.to_be_bytes());
     let crc = crc32(&png[12..29]);
     png[29..33].copy_from_slice(&crc.to_be_bytes());
+    png
+}
+
+#[test]
+fn huge_dimensions_are_refused() {
     let start = Instant::now();
-    assert!(thumbnail(&png, "image/png").is_err());
+    assert!(thumbnail(&png_declaring(100_000, 100_000), "image/png").is_err());
     assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn declared_allocation_over_the_limit_is_refused() {
+    // 16 000 x 16 000 cabe no limite de lado, mas são 768 MB de saída (> 512 MiB).
+    let start = Instant::now();
+    assert!(thumbnail(&png_declaring(16_000, 16_000), "image/png").is_err());
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn exif_orientation_is_applied() {
+    // Orientação 6: gira 90°, então a imagem vista é 40 x 100.
+    let t = thumbnail(&jpeg_bytes_oriented(100, 40, 6), "image/jpeg").unwrap();
+    assert_eq!((t.width, t.height), (40, 100));
+    assert_eq!(decoded_size(&t.png), (40, 100));
+    let t = thumbnail(&jpeg_bytes_oriented(100, 40, 1), "image/jpeg").unwrap();
+    assert_eq!((t.width, t.height), (100, 40));
+}
+
+#[test]
+fn mime_case_is_ignored() {
+    assert!(thumbnail(&png_bytes(4, 4), "IMAGE/PNG").is_ok());
 }
 
 #[test]

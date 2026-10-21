@@ -2,6 +2,7 @@
 
 use std::io::Cursor;
 
+use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 
 /// O lado maior da miniatura.
@@ -19,23 +20,34 @@ pub struct Thumb {
     pub png: Vec<u8>,
 }
 
-/// Decodifica com limites e reduz até `THUMB_SIDE`, sem aumentar.
+/// Decodifica com limites, aplica a orientação EXIF e reduz até `THUMB_SIDE`,
+/// sem aumentar. `width` e `height` são os da imagem como é vista.
 pub fn thumbnail(bytes: &[u8], mime: &str) -> Result<Thumb, String> {
-    let format = match mime {
-        "image/png" => ImageFormat::Png,
-        "image/jpeg" => ImageFormat::Jpeg,
-        "image/webp" => ImageFormat::WebP,
-        other => return Err(format!("sem miniatura para {other}")),
+    let format = if mime.eq_ignore_ascii_case("image/png") {
+        ImageFormat::Png
+    } else if mime.eq_ignore_ascii_case("image/jpeg") {
+        ImageFormat::Jpeg
+    } else if mime.eq_ignore_ascii_case("image/webp") {
+        ImageFormat::WebP
+    } else {
+        return Err(format!("sem miniatura para {mime}"));
     };
     let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
     limits.max_alloc = Some(MAX_ALLOC);
-    reader.limits(limits);
-    let decoder = reader.into_decoder().map_err(|e| e.to_string())?;
-    let (width, height) = decoder.dimensions();
-    let img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    // O buffer de saída é reservado contra o limite antes de decodificar.
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    img.apply_orientation(orientation);
+    // As dimensões "vistas": já com a orientação aplicada.
+    let (width, height) = (img.width(), img.height());
     let small = if width > THUMB_SIDE || height > THUMB_SIDE {
         img.thumbnail(THUMB_SIDE, THUMB_SIDE)
     } else {
