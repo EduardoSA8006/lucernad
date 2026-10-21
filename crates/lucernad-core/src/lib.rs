@@ -110,19 +110,32 @@ pub async fn detached<T: Send + 'static>(
     detached_with(spawn_thread, f, timeout).await
 }
 
+/// Roda `f` numa thread solta criada por `spawn`, sem prazo: a resposta (ou
+/// o pânico de `f`) chega pelo `oneshot` quando a thread termina. Para quem
+/// precisa saber quando a thread acabou de verdade (o [`detached`] desiste no
+/// prazo e a thread segue solta).
+pub fn detached_task<T: Send + 'static>(
+    spawn: Spawn,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<oneshot::Receiver<std::thread::Result<T>>> {
+    let (tx, rx) = oneshot::channel();
+    let job: Job = Box::new(move || {
+        let _ = tx.send(catch_unwind(AssertUnwindSafe(f)));
+    });
+    spawn(job)?;
+    Ok(rx)
+}
+
 /// O [`detached`], com a criação da thread dada por `spawn`.
 pub async fn detached_with<T: Send + 'static>(
     spawn: Spawn,
     f: impl FnOnce() -> T + Send + 'static,
     timeout: Duration,
 ) -> Detached<T> {
-    let (tx, rx) = oneshot::channel();
-    let job: Job = Box::new(move || {
-        let _ = tx.send(catch_unwind(AssertUnwindSafe(f)));
-    });
-    if let Err(e) = spawn(job) {
-        return Detached::SpawnFailed(e);
-    }
+    let rx = match detached_task(spawn, f) {
+        Ok(rx) => rx,
+        Err(e) => return Detached::SpawnFailed(e),
+    };
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(Ok(value))) => Detached::Done(value),
         Ok(Ok(Err(panic))) => Detached::Panicked(panic),
@@ -146,6 +159,19 @@ mod tests {
             Detached::Panicked(p) => assert_eq!(p.downcast_ref::<&str>(), Some(&"de propósito")),
             _ => panic!("o pânico não foi pego"),
         }
+    }
+
+    #[tokio::test]
+    async fn detached_task_answers_when_the_thread_ends() {
+        let rx = detached_task(spawn_thread, || {
+            std::thread::sleep(Duration::from_millis(50));
+            7
+        })
+        .unwrap();
+        assert_eq!(rx.await.unwrap().unwrap(), 7);
+        let rx = detached_task(spawn_thread, || -> () { panic!("de propósito") }).unwrap();
+        let p = rx.await.unwrap().unwrap_err();
+        assert_eq!(p.downcast_ref::<&str>(), Some(&"de propósito"));
     }
 
     #[tokio::test]

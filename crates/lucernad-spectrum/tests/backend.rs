@@ -106,3 +106,11 @@ fn signals_are_deterministic() {
     let mean = a.iter().sum::<f32>() / a.len() as f32;
     assert!(mean.abs() < 0.05, "média: {mean}");
 }
+
+#[test]
+fn disconnect_keeps_the_pipewire_message() {
+    assert_eq!(
+        lucernad_spectrum::pipewire::disconnected("connection reset", -104),
+        "O PipeWire fechou a conexão: connection reset (-104)."
+    );
+}

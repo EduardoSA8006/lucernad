@@ -33,8 +33,15 @@ use crate::backend::{Backend, Control, Event, OutputNode, Session};
 pub const NODE_NAME: &str = "lucernad-espectro";
 /// O prazo da conexão com o PipeWire.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-/// O texto da queda da conexão (`Event::Disconnected`).
+/// O texto da queda da conexão sem mensagem do servidor (o canal da sessão
+/// fechou).
 pub const DISCONNECTED: &str = "O PipeWire fechou a conexão.";
+
+/// O texto da queda da conexão com a mensagem e o código do servidor
+/// (`Event::Disconnected`).
+pub fn disconnected(message: &str, res: i32) -> String {
+    format!("O PipeWire fechou a conexão: {message} ({res}).")
+}
 
 /// A espera para reabrir um fluxo que o servidor destruiu.
 const REOPEN_DELAY: Duration = Duration::from_millis(500);
@@ -320,7 +327,7 @@ fn run(
                     mainloop.quit();
                 }
             })
-            .error(move |id, _seq, _res, message| {
+            .error(move |id, _seq, res, message| {
                 if id != pw::core::PW_ID_CORE {
                     return;
                 }
@@ -329,7 +336,7 @@ fn run(
                         let _ = ready.send(Err(connect_error(&message)));
                     }
                     None => {
-                        let _ = error_events.send(Event::Disconnected(DISCONNECTED.into()));
+                        let _ = error_events.send(Event::Disconnected(disconnected(message, res)));
                     }
                 }
                 if let Some(mainloop) = error_quit.upgrade() {
@@ -490,6 +497,9 @@ fn open_capture(
     let listener = stream
         .add_local_listener_with_user_data(Format::default())
         .state_changed(move |_, _, _, new| {
+            if let StreamState::Error(e) = &new {
+                eprintln!("lucernad: o fluxo de captura do nó {serial} caiu: {e}");
+            }
             if matches!(new, StreamState::Error(_) | StreamState::Unconnected) {
                 flag.set(true);
             }

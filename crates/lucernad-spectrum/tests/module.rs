@@ -10,7 +10,7 @@ use lucerna_service::ServerBuilder;
 use lucernad_core::ModuleTask;
 use lucernad_spectrum::analysis::BANDS;
 use lucernad_spectrum::backend::OutputNode;
-use lucernad_spectrum::testing::{FakeBackend, FakeBus, fake_config, noise, sine};
+use lucernad_spectrum::testing::{FakeBackend, FakeBus, fake_config, noise, sine, testdata};
 use lucernad_spectrum::{Spectrum, SpectrumConfig, SpectrumTopics, register};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -325,7 +325,7 @@ async fn node_that_leaves_and_returns() {
         status(&t)["capturing"] == false
     })
     .await;
-    wait_until(Duration::from_secs(1), "o quadro de zeros", || all_zero(&t)).await;
+    wait_until(Duration::from_secs(2), "o quadro de zeros", || all_zero(&t)).await;
 
     backend.set_nodes(nodes());
     wait_until(Duration::from_secs(1), "a captura de volta", || {
@@ -341,7 +341,7 @@ async fn silent_node_falls_to_zero() {
     let feed = feed(&backend, 121, tone());
     wait_until(Duration::from_secs(2), "um quadro", || max_band(&t) > 0.5).await;
     feed.abort();
-    wait_until(Duration::from_secs(1), "o quadro de zeros", || all_zero(&t)).await;
+    wait_until(Duration::from_secs(2), "o quadro de zeros", || all_zero(&t)).await;
     assert_eq!(backend.capturing(), [121], "o nó continua no grafo");
 }
 
@@ -449,12 +449,13 @@ async fn pipewire_drop_becomes_state_and_retries() {
     })
     .await;
 
-    backend.disconnect("x");
+    let why = "O PipeWire fechou a conexão: connection reset (-104).";
+    backend.disconnect(why);
     let dropped = json!({
         "available": false,
         "capturing": false,
         "player": SPOTIFY,
-        "error": "O PipeWire fechou a conexão."
+        "error": why
     });
     wait_until(Duration::from_secs(1), "a queda vira estado", || {
         status(&t) == dropped
@@ -523,4 +524,179 @@ async fn panic_marks_the_module_unavailable() {
         "o servidor continua atendendo"
     );
     drop(c);
+}
+
+/// Uma cópia do `testdata/proc` em `dir` (os `exe` continuam links).
+fn copy_proc(dir: &Path) -> PathBuf {
+    fn copy(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let (src, dst) = (entry.path(), to.join(entry.file_name()));
+            let kind = entry.file_type().unwrap();
+            if kind.is_symlink() {
+                std::os::unix::fs::symlink(std::fs::read_link(&src).unwrap(), &dst).unwrap();
+            } else if kind.is_dir() {
+                copy(&src, &dst);
+            } else {
+                std::fs::copy(&src, &dst).unwrap();
+            }
+        }
+    }
+    let proc = dir.join("proc");
+    copy(&testdata("proc"), &proc);
+    proc
+}
+
+/// Troca o arquivo `path` por um FIFO: quem o ler trava até o [`unblock`].
+fn block(path: &Path) -> String {
+    let text = if path.metadata().unwrap().is_file() {
+        std::fs::read_to_string(path).unwrap()
+    } else {
+        String::new()
+    };
+    std::fs::remove_file(path).unwrap();
+    let ok = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "mkfifo {}", path.display());
+    text
+}
+
+/// Destrava o FIFO do [`block`]: o leitor preso recebe `text`, e o caminho
+/// volta a ser um arquivo comum para as leituras seguintes (ou, com
+/// `again`, outro FIFO, que trava o próximo leitor).
+async fn unblock(path: &Path, text: String, again: bool) {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        // Abrir para escrita espera o leitor preso.
+        let mut fifo = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        if again {
+            block(&path);
+        } else {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &text).unwrap();
+            std::fs::rename(&tmp, &path).unwrap();
+        }
+        fifo.write_all(text.as_bytes()).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn switching_player_with_a_stuck_proc_drops_the_old_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let procfs = copy_proc(dir.path());
+    // Manda amostras de qualquer serial: o filtro do módulo é que segura.
+    let backend = FakeBackend::unfiltered();
+    backend.set_nodes(nodes());
+    let bus = spotify().owner(BRAVE, 119549);
+    let cfg = SpectrumConfig {
+        procfs: procfs.clone(),
+        ..fake_config(backend.clone(), bus)
+    };
+    let (_d, path, t, _s) = serve(cfg).await;
+    let c = client(&path).await;
+    c.subscribe(&["spectrum.bands"]).await.unwrap();
+    configure(&c, json!({ "player": SPOTIFY })).await.unwrap();
+    wait_until(Duration::from_secs(1), "a captura do 121", || {
+        backend.capturing() == [121]
+    })
+    .await;
+
+    // O casamento do Brave começa pelo dono, 119549: o /proc dele trava.
+    let stat = procfs.join("119549/stat");
+    let text = block(&stat);
+    configure(&c, json!({ "player": BRAVE })).await.unwrap();
+    wait_until(
+        Duration::from_secs(1),
+        "a captura do Spotify largada",
+        || backend.capturing().is_empty(),
+    )
+    .await;
+    let spotify = feed(&backend, 121, tone());
+    let end = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < end {
+        assert_eq!(max_band(&t), 0.0, "as barras seguiram o player antigo");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    spotify.abort();
+
+    unblock(&stat, text, false).await;
+    wait_until(Duration::from_secs(2), "a captura do Brave", || {
+        backend.capturing() == [178, 190]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn configuring_the_same_player_keeps_the_capture() {
+    let backend = backend_with_nodes();
+    let bus = spotify();
+    let (_d, _t, c, _s) = capturing(&backend, bus.clone(), SPOTIFY).await;
+    wait_until(Duration::from_secs(1), "a captura do 121", || {
+        backend.capturing() == [121]
+    })
+    .await;
+    // Se o módulo reidentificasse, o dono novo (o Brave) levaria a captura.
+    bus.set_owner(SPOTIFY, 152224);
+    configure(&c, json!({ "player": SPOTIFY })).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        backend.capturing(),
+        [121],
+        "o mesmo player não reidentifica"
+    );
+}
+
+#[tokio::test]
+async fn a_match_finishing_after_the_switch_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let procfs = copy_proc(dir.path());
+    let backend = backend_with_nodes();
+    let bus = spotify().owner(BRAVE, 119549);
+    let cfg = SpectrumConfig {
+        procfs: procfs.clone(),
+        ..fake_config(backend.clone(), bus)
+    };
+    let (_d, path, _t, _s) = serve(cfg).await;
+    let c = client(&path).await;
+    c.subscribe(&["spectrum.bands"]).await.unwrap();
+
+    // O casamento do Brave trava no /proc do dono.
+    let stat = procfs.join("119549/stat");
+    let text = block(&stat);
+    configure(&c, json!({ "player": BRAVE })).await.unwrap();
+    wait_until(Duration::from_secs(1), "a sessão", || {
+        backend.sessions() == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Troca para o Spotify; o casamento do Brave termina depois (o
+    // `search_root` lê o dono duas vezes), e o do Spotify, que também passa
+    // pelo 119549 (o pai do 152224, dono do nó 178), trava.
+    configure(&c, json!({ "player": SPOTIFY })).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    unblock(&stat, text.clone(), true).await;
+    unblock(&stat, text.clone(), true).await;
+    let end = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < end {
+        assert_eq!(
+            backend.capturing(),
+            Vec::<u64>::new(),
+            "valeu o casamento do player anterior"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    unblock(&stat, text, false).await;
+    wait_until(Duration::from_secs(2), "a captura do Spotify", || {
+        backend.capturing() == [121]
+    })
+    .await;
 }

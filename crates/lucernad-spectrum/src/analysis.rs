@@ -84,12 +84,23 @@ pub fn magnitudes_db(window: &[f32]) -> Vec<f32> {
 /// Os módulos em dBFS dos `len/2 + 1` bins de uma FFT do tamanho de `fft`,
 /// sobre as primeiras amostras de `window` (zeros se faltarem).
 fn spectrum_db(fft: &dyn Fft<f32>, window: &[f32]) -> Vec<f32> {
+    spectrum_db_with(fft, &hann(fft.len()), window)
+}
+
+/// A janela de Hann de `size` amostras.
+fn hann(size: usize) -> Vec<f32> {
+    (0..size)
+        .map(|n| 0.5 * (1.0 - (TAU * n as f32 / size as f32).cos()))
+        .collect()
+}
+
+/// O [`spectrum_db`] com a janela `hann` (do tamanho da FFT) já calculada.
+fn spectrum_db_with(fft: &dyn Fft<f32>, hann: &[f32], window: &[f32]) -> Vec<f32> {
     let size = fft.len();
-    let mut buf: Vec<Complex<f32>> = (0..size)
-        .map(|n| {
-            let hann = 0.5 * (1.0 - (TAU * n as f32 / size as f32).cos());
-            Complex::new(window.get(n).copied().unwrap_or(0.0) * hann, 0.0)
-        })
+    let mut buf: Vec<Complex<f32>> = hann
+        .iter()
+        .enumerate()
+        .map(|(n, &h)| Complex::new(window.get(n).copied().unwrap_or(0.0) * h, 0.0))
         .collect();
     fft.process(&mut buf);
     buf[..=size / 2]
@@ -101,7 +112,11 @@ fn spectrum_db(fft: &dyn Fft<f32>, window: &[f32]) -> Vec<f32> {
 /// O tamanho da FFT que mede a banda `b`: `LOW_FFT_SIZE` para as bandas com
 /// centro abaixo de `LOW_SPLIT_HZ`, `FFT_SIZE` para as outras.
 pub fn fft_size_of(b: usize) -> usize {
-    let edges = band_edges();
+    fft_size_with(&band_edges(), b)
+}
+
+/// O [`fft_size_of`] sobre as bordas `edges` já calculadas.
+fn fft_size_with(edges: &[f32; BANDS + 1], b: usize) -> usize {
     if (edges[b] * edges[b + 1]).sqrt() < LOW_SPLIT_HZ {
         LOW_FFT_SIZE
     } else {
@@ -128,7 +143,11 @@ pub fn band_bins(b: usize, size: usize, rate: u32) -> Range<usize> {
 /// O valor é o maior bin dentro da banda; sem bin, a interpolação linear no
 /// centro geométrico; acima de Nyquist, `MIN_DB`.
 pub fn bands_db(mags_db: &[f32], rate: u32) -> [f32; BANDS] {
-    let edges = band_edges();
+    bands_db_with(&band_edges(), mags_db, rate)
+}
+
+/// O [`bands_db`] sobre as bordas `edges` já calculadas.
+fn bands_db_with(edges: &[f32; BANDS + 1], mags_db: &[f32], rate: u32) -> [f32; BANDS] {
     let bin_hz = rate as f32 / ((mags_db.len().max(2) - 1) * 2) as f32;
     std::array::from_fn(|b| {
         let (lo, hi) = (edges[b], edges[b + 1]);
@@ -156,15 +175,7 @@ pub fn bands_db(mags_db: &[f32], rate: u32) -> [f32; BANDS] {
 /// As bandas pelas duas FFTs: as de [`fft_size_of`] `LOW_FFT_SIZE` saem de
 /// `low_mags_db`, as outras de `mags_db`.
 pub fn bands_db_split(low_mags_db: &[f32], mags_db: &[f32], rate: u32) -> [f32; BANDS] {
-    let low = bands_db(low_mags_db, rate);
-    let high = bands_db(mags_db, rate);
-    std::array::from_fn(|b| {
-        if fft_size_of(b) == LOW_FFT_SIZE {
-            low[b]
-        } else {
-            high[b]
-        }
-    })
+    Layout::new().bands_db_split(low_mags_db, mags_db, rate)
 }
 
 /// A referência do ganho automático, em dBFS.
@@ -201,7 +212,12 @@ impl Default for AutoGain {
 /// A faixa da banda `b`, em dB: `BASS_RANGE_DB` nas graves, `RANGE_DB` nas
 /// outras.
 pub fn range_of(b: usize) -> f32 {
-    if fft_size_of(b) == LOW_FFT_SIZE {
+    range_with(&band_edges(), b)
+}
+
+/// O [`range_of`] sobre as bordas `edges` já calculadas.
+fn range_with(edges: &[f32; BANDS + 1], b: usize) -> f32 {
+    if fft_size_with(edges, b) == LOW_FFT_SIZE {
         BASS_RANGE_DB
     } else {
         RANGE_DB
@@ -210,10 +226,7 @@ pub fn range_of(b: usize) -> f32 {
 
 /// Os níveis de 0 a 1: `reference_db` é 1 e [`range_of`] abaixo dela é 0.
 pub fn levels(bands_db: &[f32; BANDS], reference_db: f32) -> [f32; BANDS] {
-    std::array::from_fn(|b| {
-        let range = range_of(b);
-        ((bands_db[b] - (reference_db - range)) / range).clamp(0.0, 1.0)
-    })
+    Layout::new().levels(bands_db, reference_db)
 }
 
 /// O empréstimo dos graves: cada banda grave fica com pelo menos
@@ -221,15 +234,54 @@ pub fn levels(bands_db: &[f32; BANDS], reference_db: f32) -> [f32; BANDS] {
 /// cascata o empréstimo cairia pela metade a cada banda e não protegeria as
 /// mais baixas.
 pub fn borrow_bass(levels: &[f32; BANDS]) -> [f32; BANDS] {
-    let Some(first) = (0..BANDS).find(|&b| fft_size_of(b) != LOW_FFT_SIZE) else {
-        return *levels;
-    };
-    let floor = BASS_BORROW * levels[first];
-    let mut out = *levels;
-    for level in &mut out[..first] {
-        *level = level.max(floor);
+    Layout::new().borrow_bass(levels)
+}
+
+/// As tabelas que não mudam entre quadros: as bordas das bandas, quais são
+/// graves, a faixa de cada uma e a primeira que não é grave.
+struct Layout {
+    edges: [f32; BANDS + 1],
+    low: [bool; BANDS],
+    ranges: [f32; BANDS],
+    first_high: Option<usize>,
+}
+
+impl Layout {
+    fn new() -> Layout {
+        let edges = band_edges();
+        let low = std::array::from_fn(|b| fft_size_with(&edges, b) == LOW_FFT_SIZE);
+        Layout {
+            ranges: std::array::from_fn(|b| range_with(&edges, b)),
+            first_high: low.iter().position(|&l| !l),
+            low,
+            edges,
+        }
     }
-    out
+
+    fn bands_db_split(&self, low_mags_db: &[f32], mags_db: &[f32], rate: u32) -> [f32; BANDS] {
+        let low = bands_db_with(&self.edges, low_mags_db, rate);
+        let high = bands_db_with(&self.edges, mags_db, rate);
+        std::array::from_fn(|b| if self.low[b] { low[b] } else { high[b] })
+    }
+
+    fn levels(&self, bands_db: &[f32; BANDS], reference_db: f32) -> [f32; BANDS] {
+        std::array::from_fn(|b| {
+            let range = self.ranges[b];
+            ((bands_db[b] - (reference_db - range)) / range).clamp(0.0, 1.0)
+        })
+    }
+
+    fn borrow_bass(&self, levels: &[f32; BANDS]) -> [f32; BANDS] {
+        let Some(first) = self.first_high else {
+            return *levels;
+        };
+        let floor = BASS_BORROW * levels[first];
+        let mut out = *levels;
+        for level in &mut out[..first] {
+            *level = level.max(floor);
+        }
+        out
+    }
 }
 
 /// A suavização: ataque rápido, queda com gravidade.
@@ -275,8 +327,11 @@ impl Default for Smoother {
 /// A cadeia inteira: janela de amostras → 40 bandas suavizadas.
 pub struct Analyzer {
     rate: u32,
+    layout: Layout,
     fft: Arc<dyn Fft<f32>>,
     low_fft: Arc<dyn Fft<f32>>,
+    hann: Vec<f32>,
+    low_hann: Vec<f32>,
     gain: AutoGain,
     smoother: Smoother,
 }
@@ -286,8 +341,11 @@ impl Analyzer {
         let mut planner = FftPlanner::<f32>::new();
         Analyzer {
             rate,
+            layout: Layout::new(),
             fft: planner.plan_fft_forward(FFT_SIZE),
             low_fft: planner.plan_fft_forward(LOW_FFT_SIZE),
+            hann: hann(FFT_SIZE),
+            low_hann: hann(LOW_FFT_SIZE),
             gain: AutoGain::new(),
             smoother: Smoother::new(),
         }
@@ -300,14 +358,19 @@ impl Analyzer {
         let tail = &window[window.len().saturating_sub(LOW_FFT_SIZE)..];
         let mut padded = vec![0.0; LOW_FFT_SIZE - tail.len()];
         padded.extend_from_slice(tail);
-        let db = bands_db_split(
-            &spectrum_db(self.low_fft.as_ref(), &padded),
-            &spectrum_db(self.fft.as_ref(), &padded[LOW_FFT_SIZE - FFT_SIZE..]),
+        let db = self.layout.bands_db_split(
+            &spectrum_db_with(self.low_fft.as_ref(), &self.low_hann, &padded),
+            &spectrum_db_with(
+                self.fft.as_ref(),
+                &self.hann,
+                &padded[LOW_FFT_SIZE - FFT_SIZE..],
+            ),
             self.rate,
         );
         let max = db.iter().copied().fold(MIN_DB, f32::max);
         self.gain.step(max, FRAME_DT);
+        let levels = self.layout.levels(&db, self.gain.reference_db);
         self.smoother
-            .step(&borrow_bass(&levels(&db, self.gain.reference_db)), FRAME_DT)
+            .step(&self.layout.borrow_bass(&levels), FRAME_DT)
     }
 }

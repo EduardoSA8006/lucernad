@@ -55,6 +55,8 @@ struct FakeState {
     nodes: Vec<OutputNode>,
     failing: Option<String>,
     panicking: bool,
+    /// O `play` manda amostras de qualquer serial, capturado ou não.
+    unfiltered: bool,
     opened: usize,
     live: usize,
     /// A sessão aberta por último, enquanto viva.
@@ -88,6 +90,14 @@ impl FakeBackend {
         fake
     }
 
+    /// Um dublê cujo `play` manda amostras de qualquer serial (como as
+    /// amostras atrasadas de um nó que acabou de sair da captura).
+    pub fn unfiltered() -> FakeBackend {
+        let fake = FakeBackend::new();
+        fake.lock().unfiltered = true;
+        fake
+    }
+
     /// Guarda os nós e manda o `Graph` à sessão aberta.
     pub fn set_nodes(&self, nodes: Vec<OutputNode>) {
         let mut state = self.lock();
@@ -97,14 +107,15 @@ impl FakeBackend {
         }
     }
 
-    /// Manda `Samples` à sessão aberta, só se `serial` está na captura atual.
+    /// Manda `Samples` à sessão aberta, só se `serial` está na captura atual
+    /// (com qualquer serial no [`FakeBackend::unfiltered`]).
     pub fn play(&self, serial: u64, rate: u32, mono: &[f32]) {
         let state = self.lock();
         let Some(session) = state.current.as_ref() else {
             return;
         };
         if let Some(events) = &session.events
-            && session.capturing.contains(&serial)
+            && (state.unfiltered || session.capturing.contains(&serial))
         {
             let _ = events.send(Event::Samples {
                 serial,

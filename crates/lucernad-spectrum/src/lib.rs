@@ -18,9 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lucerna_service::{RpcError, ServerBuilder, Topic};
-use lucernad_core::{Detached, ModuleTask, detached, publish_changed};
+use lucernad_core::{Detached, ModuleTask, detached, detached_task, publish_changed, spawn_thread};
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::analysis::{Analyzer, BANDS, FPS};
@@ -39,8 +39,6 @@ pub mod pipewire;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-/// O prazo de cada leitura do `/proc` (o casamento dos nós).
-pub const PROC_TIMEOUT: Duration = Duration::from_secs(1);
 /// O prazo da sonda e da abertura de uma sessão.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Quanto esperar para tentar de novo depois de uma falha do PipeWire.
@@ -129,7 +127,13 @@ pub fn register(server: &mut ServerBuilder, cfg: SpectrumConfig) -> Spectrum {
                     "player precisa ser um nome org.mpris.MediaPlayer2.* ou null",
                 )
             })?;
-            tx.send_replace(player);
+            // O mesmo player de novo não mexe no laço (nem limpa os anéis nem
+            // reidentifica).
+            tx.send_if_modified(|current| {
+                let changed = *current != player;
+                *current = player;
+                changed
+            });
             Ok(json!({}))
         }
     });
@@ -199,8 +203,8 @@ fn spawn_failed(e: &std::io::Error) -> String {
 enum Exit {
     /// Sem assinante ou sem player: volta a esperar os dois.
     Idle,
-    /// A conexão caiu: espera o `retry` e tenta de novo.
-    Dropped,
+    /// A conexão caiu, com este texto: espera o `retry` e tenta de novo.
+    Dropped(String),
 }
 
 /// O estado do laço que atravessa as sessões.
@@ -327,6 +331,9 @@ impl Module {
             matched: Vec::new(),
             rings: Rings::new(),
             analyzer: None,
+            epoch: 0,
+            pending: None,
+            wanted: false,
         };
         let mut tick = tokio::time::interval(FRAME);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -341,49 +348,97 @@ impl Module {
                 }
                 _ = reidentify.tick(), if capture.matched.is_empty() => {
                     capture.identity = self.identify(&name).await;
-                    self.rematch(&mut capture).await;
+                    self.request_rematch(&mut capture);
+                }
+                (epoch, result) = rematch_done(&mut capture.pending), if capture.pending.is_some() => {
+                    capture.pending = None;
+                    match result {
+                        // Um casamento de um player anterior não vale mais.
+                        Ok(Ok(matched)) if epoch == capture.epoch => self.apply(&mut capture, matched),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(p)) => resume_unwind(p),
+                        // O `catch_unwind` sempre responde; sem resposta, a
+                        // thread morreu.
+                        Err(closed) => resume_unwind(Box::new(closed)),
+                    }
+                    self.start_rematch(&mut capture);
                 }
                 event = events.recv() => match event {
                     Some(Event::Graph(nodes)) => {
                         capture.nodes = nodes;
-                        self.rematch(&mut capture).await;
+                        self.request_rematch(&mut capture);
                     }
                     Some(Event::Samples { serial, rate, mono }) => {
                         capture.push(serial, rate, &mono);
                     }
-                    Some(Event::Disconnected(_)) | None => return Exit::Dropped,
+                    Some(Event::Disconnected(why)) => return Exit::Dropped(why),
+                    None => return Exit::Dropped(DISCONNECTED.to_string()),
                 },
                 _ = self.player.changed() => {
                     let Some(new) = self.current_player() else {
                         return Exit::Idle;
                     };
                     name = new;
-                    capture.identity = self.identify(&name).await;
+                    // Larga a captura do player anterior já: um /proc lento
+                    // não pode deixar as barras seguindo outro app.
+                    capture.epoch += 1;
                     capture.rings.clear();
-                    self.rematch(&mut capture).await;
+                    self.apply(&mut capture, Vec::new());
+                    capture.identity = self.identify(&name).await;
+                    self.request_rematch(&mut capture);
                 }
                 _ = self.t.bands.wait_unsubscribed() => return Exit::Idle,
             }
         }
     }
 
-    /// Casa os nós com o player e manda a captura ao backend.
-    async fn rematch(&mut self, capture: &mut Capture) {
+    /// Pede um casamento novo; ele começa já ou quando o que está em voo
+    /// terminar.
+    fn request_rematch(&self, capture: &mut Capture) {
+        capture.wanted = true;
+        self.start_rematch(capture);
+    }
+
+    /// Começa o casamento pedido, se nenhum está em voo: no máximo uma
+    /// thread lendo o `/proc` por vez, mesmo com ele travado.
+    fn start_rematch(&self, capture: &mut Capture) {
+        if capture.pending.is_some() || !capture.wanted {
+            return;
+        }
+        capture.wanted = false;
         let identity = capture.identity.clone();
         let nodes = capture.nodes.clone();
         let procfs = self.cfg.procfs.clone();
         let job = move || match_nodes(&identity, &nodes, &ProcFs::new(procfs));
-        match detached(job, PROC_TIMEOUT).await {
-            Detached::Done(matched) => capture.matched = matched,
-            // O `/proc` não respondeu: fica o casamento anterior.
-            Detached::TimedOut | Detached::SpawnFailed(_) => {}
-            Detached::Panicked(p) => resume_unwind(p),
+        match detached_task(spawn_thread, job) {
+            Ok(rx) => capture.pending = Some((capture.epoch, rx)),
+            // Sem thread, fica o casamento anterior até o próximo pedido.
+            Err(e) => eprintln!("lucernad: não consegui criar a thread do casamento: {e}"),
         }
+    }
+
+    /// Manda a captura `matched` ao backend.
+    fn apply(&mut self, capture: &mut Capture, matched: Vec<u64>) {
+        capture.matched = matched;
         capture.control.capture(&capture.matched);
         capture.rings.retain(&capture.matched);
         self.status.capturing = !capture.matched.is_empty();
         self.publish_status();
     }
+}
+
+/// A resposta de um casamento em voo, com a época em que ele começou.
+type Pending = (u64, oneshot::Receiver<std::thread::Result<Vec<u64>>>);
+
+/// Espera o casamento em voo (só chame com um em voo).
+async fn rematch_done(
+    pending: &mut Option<Pending>,
+) -> (
+    u64,
+    Result<std::thread::Result<Vec<u64>>, oneshot::error::RecvError>,
+) {
+    let (epoch, rx) = pending.as_mut().expect("um casamento em voo");
+    (*epoch, rx.await)
 }
 
 /// O estado de uma sessão aberta.
@@ -396,6 +451,13 @@ struct Capture {
     rings: Rings,
     /// A análise e a taxa para a qual ela foi criada.
     analyzer: Option<(u32, Analyzer)>,
+    /// Sobe a cada troca de player: o casamento de uma época anterior é
+    /// descartado.
+    epoch: u64,
+    /// O casamento em voo.
+    pending: Option<Pending>,
+    /// Um casamento foi pedido com outro em voo: refazer quando ele acabar.
+    wanted: bool,
 }
 
 impl Capture {
@@ -449,8 +511,9 @@ async fn run(cfg: SpectrumConfig, t: SpectrumTopics, player: Arc<watch::Sender<O
                 m.status.capturing = false;
                 m.publish_status();
             }
-            Exit::Dropped => {
-                m.failed(DISCONNECTED.to_string());
+            Exit::Dropped(why) => {
+                eprintln!("lucernad: {why}");
+                m.failed(why);
                 m.wait_retry().await;
             }
         }
