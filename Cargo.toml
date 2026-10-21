@@ -17,6 +17,7 @@ lucerna-service = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev 
 lucerna-cli = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
 lucerna-ipc = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
 lucerna-manifest = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
+lucerna-paths = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev = "f55ba66dc18b62fab075b20691ad9edb7ca22a1c" }
 lucernad-core = { path = "crates/lucernad-core" }
 lucernad-system = { path = "crates/lucernad-system" }
 lucernad-spectrum = { path = "crates/lucernad-spectrum" }
@@ -31,6 +32,8 @@ pipewire = "0.10"
 rustfft = "6"
 unicode-normalization = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.10"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [workspace.lints.rust]

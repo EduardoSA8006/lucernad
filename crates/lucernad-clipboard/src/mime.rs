@@ -150,11 +150,7 @@ pub fn offers_for(
         }
         Kind::Files => {
             let text = String::from_utf8_lossy(data);
-            let uris: Vec<&str> = text
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .collect();
+            let uris = uri_lines(&text);
             let gnome = format!("copy\n{}", uris.join("\n"));
             offers.push((URI_LIST.to_string(), data.into()));
             offers.push((GNOME_FILES.to_string(), gnome.into_bytes().into()));
@@ -162,4 +158,13 @@ pub fn offers_for(
     }
     offers.push((OWN_MIME.to_string(), id.to_string().into_bytes().into()));
     offers
+}
+
+/// As URIs de uma `text/uri-list`: as linhas sem espaços nas pontas, sem as
+/// vazias e sem os comentários (`#`).
+pub fn uri_lines(list: &str) -> Vec<&str> {
+    list.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
 }
