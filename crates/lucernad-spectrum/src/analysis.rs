@@ -1,9 +1,11 @@
 //! A análise como função pura: amostras → 40 bandas de 0 a 1.
 //!
-//! Janela de Hann, FFT, o maior bin de cada banda logarítmica, inclinação,
-//! ganho automático e suavização.
+//! Janela de Hann, FFT (uma de `FFT_SIZE` e, para os graves, uma de
+//! `LOW_FFT_SIZE`), o maior bin de cada banda logarítmica, inclinação, ganho
+//! automático e suavização.
 
 use std::f32::consts::TAU;
+use std::ops::Range;
 use std::sync::Arc;
 
 use rustfft::num_complex::Complex;
@@ -13,12 +15,18 @@ use rustfft::{Fft, FftPlanner};
 pub const BANDS: usize = 40;
 /// O tamanho da FFT, em amostras.
 pub const FFT_SIZE: usize = 4096;
+/// O tamanho da FFT dos graves (as bandas com centro abaixo de
+/// `LOW_SPLIT_HZ`), em amostras: o dobro, para cada banda grave ter bin
+/// próprio (5,9 Hz por bin a 48 kHz). É também o tamanho da janela guardada.
+pub const LOW_FFT_SIZE: usize = 2 * FFT_SIZE;
+/// As bandas com centro abaixo disto usam a FFT dos graves.
+pub const LOW_SPLIT_HZ: f32 = 100.0;
 /// Os quadros por segundo.
 pub const FPS: u32 = 60;
 /// A frequência da borda de baixo da primeira banda.
 pub const LOW_HZ: f32 = 45.0;
 /// A frequência da borda de cima da última banda.
-pub const HIGH_HZ: f32 = 16_000.0;
+pub const HIGH_HZ: f32 = 14_000.0;
 /// A faixa mostrada, em dB abaixo da referência.
 pub const RANGE_DB: f32 = 54.0;
 /// A inclinação em volta de 1 kHz, em dB por oitava.
@@ -26,7 +34,7 @@ pub const TILT_DB_PER_OCTAVE: f32 = 1.5;
 /// A parte do caminho até o alvo que o valor sobe por quadro.
 pub const ATTACK: f32 = 0.6;
 /// A gravidade da queda, em unidades por segundo ao quadrado.
-pub const GRAVITY: f32 = 6.0;
+pub const GRAVITY: f32 = 12.0;
 /// A constante de tempo da subida da referência, em segundos.
 pub const REF_RISE_S: f32 = 0.25;
 /// A descida da referência, em dB por segundo.
@@ -66,27 +74,55 @@ pub fn magnitudes_db(window: &[f32]) -> Vec<f32> {
     spectrum_db(fft.as_ref(), window)
 }
 
+/// Os módulos em dBFS dos `len/2 + 1` bins de uma FFT do tamanho de `fft`,
+/// sobre as primeiras amostras de `window` (zeros se faltarem).
 fn spectrum_db(fft: &dyn Fft<f32>, window: &[f32]) -> Vec<f32> {
-    let mut buf: Vec<Complex<f32>> = (0..FFT_SIZE)
+    let size = fft.len();
+    let mut buf: Vec<Complex<f32>> = (0..size)
         .map(|n| {
-            let hann = 0.5 * (1.0 - (TAU * n as f32 / FFT_SIZE as f32).cos());
+            let hann = 0.5 * (1.0 - (TAU * n as f32 / size as f32).cos());
             Complex::new(window.get(n).copied().unwrap_or(0.0) * hann, 0.0)
         })
         .collect();
     fft.process(&mut buf);
-    buf[..=FFT_SIZE / 2]
+    buf[..=size / 2]
         .iter()
-        .map(|x| 20.0 * (x.norm() * 4.0 / FFT_SIZE as f32).max(1e-6).log10())
+        .map(|x| 20.0 * (x.norm() * 4.0 / size as f32).max(1e-6).log10())
         .collect()
 }
 
-/// O nível de cada banda, em dB, com a inclinação de `TILT_DB_PER_OCTAVE`.
+/// O tamanho da FFT que mede a banda `b`: `LOW_FFT_SIZE` para as bandas com
+/// centro abaixo de `LOW_SPLIT_HZ`, `FFT_SIZE` para as outras.
+pub fn fft_size_of(b: usize) -> usize {
+    let edges = band_edges();
+    if (edges[b] * edges[b + 1]).sqrt() < LOW_SPLIT_HZ {
+        LOW_FFT_SIZE
+    } else {
+        FFT_SIZE
+    }
+}
+
+/// Os bins da banda `b` numa FFT de `size` amostras a `rate`; vazio quando
+/// nenhum bin cai dentro dela.
+pub fn band_bins(b: usize, size: usize, rate: u32) -> Range<usize> {
+    let edges = band_edges();
+    let bin_hz = rate as f32 / size as f32;
+    let first = (edges[b] / bin_hz).ceil() as usize;
+    let end = (first..=size / 2)
+        .find(|&k| k as f32 * bin_hz >= edges[b + 1])
+        .unwrap_or(size / 2 + 1);
+    first..end.max(first)
+}
+
+/// O nível de cada banda, em dB, com a inclinação de `TILT_DB_PER_OCTAVE`,
+/// sobre os bins `mags_db` de uma única FFT (o tamanho sai do número de
+/// bins: `(mags_db.len() - 1) * 2`).
 ///
 /// O valor é o maior bin dentro da banda; sem bin, a interpolação linear no
 /// centro geométrico; acima de Nyquist, `MIN_DB`.
 pub fn bands_db(mags_db: &[f32], rate: u32) -> [f32; BANDS] {
     let edges = band_edges();
-    let bin_hz = rate as f32 / FFT_SIZE as f32;
+    let bin_hz = rate as f32 / ((mags_db.len().max(2) - 1) * 2) as f32;
     std::array::from_fn(|b| {
         let (lo, hi) = (edges[b], edges[b + 1]);
         let center = (lo * hi).sqrt();
@@ -107,6 +143,20 @@ pub fn bands_db(mags_db: &[f32], rate: u32) -> [f32; BANDS] {
             }
         };
         level + TILT_DB_PER_OCTAVE * (center / 1000.0).log2()
+    })
+}
+
+/// As bandas pelas duas FFTs: as de [`fft_size_of`] `LOW_FFT_SIZE` saem de
+/// `low_mags_db`, as outras de `mags_db`.
+pub fn bands_db_split(low_mags_db: &[f32], mags_db: &[f32], rate: u32) -> [f32; BANDS] {
+    let low = bands_db(low_mags_db, rate);
+    let high = bands_db(mags_db, rate);
+    std::array::from_fn(|b| {
+        if fft_size_of(b) == LOW_FFT_SIZE {
+            low[b]
+        } else {
+            high[b]
+        }
     })
 }
 
@@ -190,27 +240,35 @@ impl Default for Smoother {
 pub struct Analyzer {
     rate: u32,
     fft: Arc<dyn Fft<f32>>,
+    low_fft: Arc<dyn Fft<f32>>,
     gain: AutoGain,
     smoother: Smoother,
 }
 
 impl Analyzer {
     pub fn new(rate: u32) -> Analyzer {
+        let mut planner = FftPlanner::<f32>::new();
         Analyzer {
             rate,
-            fft: FftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE),
+            fft: planner.plan_fft_forward(FFT_SIZE),
+            low_fft: planner.plan_fft_forward(LOW_FFT_SIZE),
             gain: AutoGain::new(),
             smoother: Smoother::new(),
         }
     }
 
-    /// Um quadro, sobre as últimas `FFT_SIZE` amostras de `window`; com
-    /// menos que isso, zeros à esquerda.
+    /// Um quadro, sobre as últimas `LOW_FFT_SIZE` amostras de `window` (os
+    /// graves) e as últimas `FFT_SIZE` (o resto); com menos que isso, zeros à
+    /// esquerda.
     pub fn frame(&mut self, window: &[f32]) -> [f32; BANDS] {
-        let tail = &window[window.len().saturating_sub(FFT_SIZE)..];
-        let mut padded = vec![0.0; FFT_SIZE - tail.len()];
+        let tail = &window[window.len().saturating_sub(LOW_FFT_SIZE)..];
+        let mut padded = vec![0.0; LOW_FFT_SIZE - tail.len()];
         padded.extend_from_slice(tail);
-        let db = bands_db(&spectrum_db(self.fft.as_ref(), &padded), self.rate);
+        let db = bands_db_split(
+            &spectrum_db(self.low_fft.as_ref(), &padded),
+            &spectrum_db(self.fft.as_ref(), &padded[LOW_FFT_SIZE - FFT_SIZE..]),
+            self.rate,
+        );
         let max = db.iter().copied().fold(MIN_DB, f32::max);
         self.gain.step(max, FRAME_DT);
         self.smoother

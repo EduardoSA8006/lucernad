@@ -1,6 +1,7 @@
 use lucernad_spectrum::analysis::{
-    Analyzer, AutoGain, BANDS, FFT_SIZE, FPS, HIGH_HZ, LOW_HZ, MIN_DB, RANGE_DB, Smoother,
-    TILT_DB_PER_OCTAVE, band_edges, band_of, bands_db, levels,
+    Analyzer, AutoGain, BANDS, FFT_SIZE, FPS, GRAVITY, HIGH_HZ, LOW_FFT_SIZE, LOW_HZ, LOW_SPLIT_HZ,
+    MIN_DB, RANGE_DB, Smoother, TILT_DB_PER_OCTAVE, band_bins, band_edges, band_of, bands_db,
+    bands_db_split, fft_size_of, levels,
 };
 use lucernad_spectrum::testing::{noise, sine};
 
@@ -20,8 +21,8 @@ fn argmax(values: &[f32]) -> usize {
 fn run(analyzer: &mut Analyzer, signal: &[f32], hop: usize, frames: usize) -> Vec<[f32; BANDS]> {
     (0..frames)
         .map(|f| {
-            let end = FFT_SIZE + f * hop;
-            analyzer.frame(&signal[end - FFT_SIZE..end])
+            let end = LOW_FFT_SIZE + f * hop;
+            analyzer.frame(&signal[end - LOW_FFT_SIZE..end])
         })
         .collect()
 }
@@ -49,7 +50,7 @@ fn band_of_maps_frequencies() {
 #[test]
 fn sine_lights_its_band() {
     for (rate, hop) in [(48_000, 800), (44_100, 735)] {
-        let signal = sine(1000.0, rate, 0.5, FFT_SIZE + 120 * hop);
+        let signal = sine(1000.0, rate, 0.5, LOW_FFT_SIZE + 120 * hop);
         let mut analyzer = Analyzer::new(rate);
         let last = *run(&mut analyzer, &signal, hop, 120).last().unwrap();
         assert_eq!(argmax(&last), 21, "rate {rate}");
@@ -68,13 +69,13 @@ fn sine_lights_its_band() {
 fn silence_is_zero() {
     let mut analyzer = Analyzer::new(48_000);
     for _ in 0..60 {
-        assert_eq!(analyzer.frame(&[0.0; FFT_SIZE]), [0.0; BANDS]);
+        assert_eq!(analyzer.frame(&[0.0; LOW_FFT_SIZE]), [0.0; BANDS]);
     }
 }
 
 #[test]
 fn white_noise_spreads() {
-    let signal: Vec<f32> = noise(1, FFT_SIZE + 120 * 800)
+    let signal: Vec<f32> = noise(1, LOW_FFT_SIZE + 120 * 800)
         .iter()
         .map(|s| s * 0.3)
         .collect();
@@ -132,11 +133,11 @@ fn steady_sine_does_not_pump() {
     let hop = 800;
     let total = 600;
     let cut = 300;
-    let signal: Vec<f32> = sine(1000.0, 48_000, 0.5, FFT_SIZE + total * hop)
+    let signal: Vec<f32> = sine(1000.0, 48_000, 0.5, LOW_FFT_SIZE + total * hop)
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            if i < FFT_SIZE + cut * hop {
+            if i < LOW_FFT_SIZE + cut * hop {
                 *s
             } else {
                 s / 2.0
@@ -170,17 +171,23 @@ fn attack_and_gravity() {
     assert!((smoother.step(&up, DT)[0] - 0.6).abs() < 1e-6);
     assert!((smoother.step(&up, DT)[0] - 0.84).abs() < 1e-6);
 
+    // A queda: depois de k quadros, 1 − GRAVITY·dt²·k(k+1)/2; de 1 a 0 em
+    // ~0,4 s (24 quadros com GRAVITY 12).
     let down = [0.0; BANDS];
     let mut smoother = Smoother::from_values([1.0; BANDS]);
     let mut y = [1.0; BANDS];
-    for _ in 0..30 {
+    for _ in 0..15 {
         y = smoother.step(&down, DT);
     }
-    assert!((y[0] - 0.225).abs() < 1e-4, "{}", y[0]);
-    for _ in 30..35 {
+    let expected = 1.0 - GRAVITY * DT * DT * (15.0 * 16.0) / 2.0;
+    assert!((y[0] - expected).abs() < 1e-4, "{} vs {expected}", y[0]);
+    let mut frames = 15;
+    while y[0] > 0.0 {
         y = smoother.step(&down, DT);
+        frames += 1;
     }
-    assert_eq!(y[0], 0.0);
+    let fall = frames as f32 * DT;
+    assert!((0.35..=0.45).contains(&fall), "queda em {fall} s");
 
     // Um alvo acima do valor zera a velocidade da queda.
     let mut smoother = Smoother::from_values([1.0; BANDS]);
@@ -191,7 +198,7 @@ fn attack_and_gravity() {
     let lifted = smoother.step(&[1.0; BANDS], DT)[0];
     assert!(lifted > before);
     let after = smoother.step(&[0.0; BANDS], DT)[0];
-    assert!((lifted - after - 6.0 * DT * DT).abs() < 1e-6);
+    assert!((lifted - after - GRAVITY * DT * DT).abs() < 1e-6);
 }
 
 #[test]
@@ -209,7 +216,7 @@ fn short_window_is_padded() {
     let out = analyzer.frame(&[0.1; 100]);
     assert_eq!(out.len(), BANDS);
     // As 100 amostras ficam na ponta da janela, onde o Hann é ~0: o pico é
-    // 1,9e-5 (−94,2 dBFS, no bin 0, abaixo da primeira banda). Sob a
+    // ínfimo (no bin 0, abaixo da primeira banda). Sob a
     // referência de −45 dBFS o piso é −99 dBFS: o vazamento mal passa dele
     // em umas bandas graves, e o quadro fica praticamente apagado.
     assert!(out.iter().all(|&v| v < 0.01), "{out:?}");
@@ -234,16 +241,17 @@ fn tilt_follows_the_octaves() {
     }
     // Duas bandas separadas por uma oitava (razão 2 entre os centros)
     // diferem TILT_DB_PER_OCTAVE: entre os centros da primeira e da última
-    // banda (45 Hz a 16 kHz) são 8,26 oitavas.
+    // banda (45 Hz a 14 kHz) são 8,07 oitavas.
     let last = BANDS - 1;
     let octaves = (center(&edges, last) / center(&edges, 0)).log2();
     assert!((out[last] - out[0] - TILT_DB_PER_OCTAVE * octaves).abs() < 0.05);
-    assert!((octaves - 8.26).abs() < 0.01, "{octaves}");
+    assert!((octaves - 8.07).abs() < 0.01, "{octaves}");
 }
 
 #[test]
 fn band_without_bin_interpolates_at_the_geometric_center() {
-    // A banda 2 (60,4 a 69,9 Hz) fica entre os bins 5 e 6 (58,6 e 70,3 Hz).
+    // Numa FFT de FFT_SIZE, a banda 2 (60,0 a 69,2 Hz) fica entre os bins 5
+    // e 6 (58,6 e 70,3 Hz).
     let edges = band_edges();
     let mut mags = flat(0.0);
     mags[6] = 100.0;
@@ -256,7 +264,8 @@ fn band_without_bin_interpolates_at_the_geometric_center() {
 
 #[test]
 fn bands_above_nyquist_are_silent() {
-    // A 24 kHz, Nyquist é 12 kHz: a banda a 16 kHz não tem o que medir.
+    // A 24 kHz, Nyquist é 12 kHz: a última banda (12,1 a 14 kHz) não tem o
+    // que medir.
     let out = bands_db(&flat(-20.0), 24_000);
     let edges = band_edges();
     let expected = MIN_DB + TILT_DB_PER_OCTAVE * (center(&edges, BANDS - 1) / 1000.0).log2();
@@ -266,4 +275,61 @@ fn bands_above_nyquist_are_silent() {
         out[BANDS - 1]
     );
     assert!(out[21] > -30.0, "{}", out[21]);
+}
+
+#[test]
+fn every_band_has_its_own_bin() {
+    // Os graves pela FFT maior: nenhuma banda interpola, a 48 e a 44,1 kHz.
+    for rate in [48_000, 44_100] {
+        for b in 0..BANDS {
+            let bins = band_bins(b, fft_size_of(b), rate);
+            assert!(!bins.is_empty(), "banda {b} sem bin a {rate} Hz");
+        }
+    }
+    // Só as bandas com centro abaixo de LOW_SPLIT_HZ usam a FFT maior: as 6
+    // primeiras (45 a 106 Hz).
+    let edges = band_edges();
+    for b in 0..BANDS {
+        let low = (edges[b] * edges[b + 1]).sqrt() < LOW_SPLIT_HZ;
+        assert_eq!(fft_size_of(b) == LOW_FFT_SIZE, low, "banda {b}");
+    }
+    assert_eq!(
+        (0..BANDS)
+            .filter(|&b| fft_size_of(b) == LOW_FFT_SIZE)
+            .count(),
+        6
+    );
+    // Com a FFT de FFT_SIZE só, a banda 2 ficaria sem bin.
+    assert!(band_bins(2, FFT_SIZE, 48_000).is_empty());
+}
+
+#[test]
+fn split_takes_the_bass_from_the_bigger_fft() {
+    let low = vec![-10.0; LOW_FFT_SIZE / 2 + 1];
+    let high = flat(-30.0);
+    let out = bands_db_split(&low, &high, 48_000);
+    let edges = band_edges();
+    for (b, level) in out.iter().enumerate() {
+        let base = if fft_size_of(b) == LOW_FFT_SIZE {
+            -10.0
+        } else {
+            -30.0
+        };
+        let expected = base + TILT_DB_PER_OCTAVE * (center(&edges, b) / 1000.0).log2();
+        assert!((level - expected).abs() < 0.05, "banda {b}: {level}");
+    }
+}
+
+#[test]
+fn low_sine_lights_its_band() {
+    // Um seno no bin 8 da FFT dos graves (46,9 Hz, na banda 0, de 45 a
+    // 51,9 Hz) acende a banda 0; o vizinho (52,7 Hz, banda 1) fica 6 dB
+    // abaixo pelo Hann.
+    let hop = 800;
+    let freq = 8.0 * 48_000.0 / LOW_FFT_SIZE as f32;
+    let signal = sine(freq, 48_000, 0.5, LOW_FFT_SIZE + 120 * hop);
+    let mut analyzer = Analyzer::new(48_000);
+    let last = *run(&mut analyzer, &signal, hop, 120).last().unwrap();
+    assert_eq!(argmax(&last), 0, "{last:?}");
+    assert!(last[0] > 0.9, "{}", last[0]);
 }

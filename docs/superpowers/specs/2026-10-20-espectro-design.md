@@ -53,7 +53,7 @@ As barras e ondas em volta da capa (card de mídia da aba Painel e aba Mídia) v
 ### Análise
 
 - **FFT própria** (por exemplo `rustfft`), janela de Hann, tamanho e sobreposição escolhidos pelo construtor para dar resolução nos graves e **60 quadros por segundo** de saída.
-- **40 bandas** (ajustado olhando o anel com o usuário em 2026-10-20: eram 48) de ~45 Hz (eram ~30 Hz, no mesmo ajuste) a ~16 kHz em escala que segue o ouvido (logarítmica ou mel; escolha do construtor), juntando os bins de cada banda.
+- **40 bandas** (ajustado olhando o anel com o usuário em 2026-10-20: eram 48) de ~45 Hz (eram ~30 Hz, no mesmo ajuste) a ~14 kHz (eram ~16 kHz) em escala que segue o ouvido (logarítmica ou mel; escolha do construtor), juntando os bins de cada banda; as bandas abaixo de 100 Hz usam uma FFT de 8192 amostras (bin próprio para cada uma, como o cava), as outras uma de 4096.
 - **Suavização no daemon:** subida rápida (ataque) e queda suave com aceleração (gravidade); valores finais em 0..1. As constantes são do construtor, ajustadas olhando o anel com música real.
 - **Ganho automático lento**, para uma música baixa ainda mexer bem e uma alta não colar no teto; sem bombear entre faixas.
 - **Separação para o equalizador:** captura, análise e publicação em partes separadas, com a análise como função pura (amostras → bandas) testável sem PipeWire.

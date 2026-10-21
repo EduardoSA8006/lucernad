@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use lucernad_spectrum::analysis::FFT_SIZE;
+use lucernad_spectrum::analysis::LOW_FFT_SIZE as FFT_SIZE;
 use lucernad_spectrum::mix::Rings;
 
 #[test]
@@ -16,12 +16,13 @@ fn rings_sum_fresh_nodes() {
 fn window_keeps_the_last_samples() {
     let t0 = Instant::now();
     let mut rings = Rings::new();
-    let ramp: Vec<f32> = (0..5000).map(|i| i as f32).collect();
+    let total = FFT_SIZE + 904;
+    let ramp: Vec<f32> = (0..total).map(|i| i as f32).collect();
     rings.push(1, &ramp, t0);
     let window = rings.window(t0);
     assert_eq!(window.len(), FFT_SIZE);
     assert_eq!(window[0], 904.0);
-    assert_eq!(window[FFT_SIZE - 1], 4999.0);
+    assert_eq!(window[FFT_SIZE - 1], (total - 1) as f32);
 
     let mut rings = Rings::new();
     rings.push(1, &[1.0; 10], t0);
