@@ -1,13 +1,13 @@
 //! O protocolo do `lucernad`, em processo: o `system` sobre a máquina de
-//! exemplo e o `spectrum` com os dublês.
-#![cfg(any(feature = "system", feature = "spectrum"))]
+//! exemplo, o `spectrum` e o `clipboard` com os dublês.
+#![cfg(any(feature = "system", feature = "spectrum", feature = "clipboard"))]
 
 mod common;
 
 use common::start;
 #[cfg(feature = "system")]
 use serde_json::Value;
-#[cfg(feature = "spectrum")]
+#[cfg(any(feature = "spectrum", feature = "clipboard"))]
 use serde_json::json;
 
 #[cfg(feature = "system")]
@@ -44,9 +44,8 @@ async fn the_daemon_serves_the_spectrum_module() {
     let r = start().await;
     let c = r.client().await;
     assert_eq!(c.hello().streams, ["spectrum.bands"]);
-    assert_eq!(
-        c.hello().topics.last().map(String::as_str),
-        Some("spectrum.status"),
+    assert!(
+        c.hello().topics.iter().any(|t| t == "spectrum.status"),
         "{:?}",
         c.hello().topics
     );
@@ -55,5 +54,33 @@ async fn the_daemon_serves_the_spectrum_module() {
         .await
         .unwrap();
     assert_eq!(v, json!({}));
+    r.stop().await;
+}
+
+#[cfg(feature = "clipboard")]
+#[tokio::test]
+async fn the_daemon_serves_the_clipboard_module() {
+    let r = start().await;
+    let c = r.client().await;
+    for t in ["clipboard.history", "clipboard.status"] {
+        assert!(c.hello().topics.iter().any(|x| x == t), "falta {t}");
+    }
+    assert!(
+        c.hello().methods.iter().any(|m| m == "clipboard.list"),
+        "falta o clipboard.list"
+    );
+    let v = c
+        .call(
+            "clipboard.configure",
+            Some(json!({"limit": 100, "persist": false})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v, json!({}));
+    let v = c
+        .call("clipboard.list", Some(json!({"offset": 0, "limit": 5})))
+        .await
+        .unwrap();
+    assert_eq!(v, json!({"items": [], "total": 0}));
     r.stop().await;
 }

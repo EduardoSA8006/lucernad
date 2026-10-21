@@ -1,0 +1,1039 @@
+//! O histórico: SQLite com busca trigram e as imagens em arquivos.
+//!
+//! O trabalho pesado de cada cópia (hash, normalização, miniatura e gravação
+//! dos arquivos) fica no [`prepare`], que não precisa do [`Store`]; o
+//! [`Store::insert`] só faz a transação. Assim o lock do `Store` nunca espera
+//! uma imagem grande.
+
+use std::fmt::Display;
+use std::fs::{self, OpenOptions, Permissions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use lucerna_paths::create_private_dir;
+use rusqlite::types::Value as Sql;
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+
+use crate::mime::{Kind, uri_lines};
+use crate::search::{SHORT_QUERY, file_names, normalize, preview_for};
+use crate::thumb::{extension_for, thumbnail};
+
+/// O arquivo do banco no disco.
+const DB_FILE: &str = "history.db";
+/// A pasta das imagens e das miniaturas.
+const IMAGES_DIR: &str = "images";
+/// A versão do esquema.
+const SCHEMA_VERSION: i64 = 1;
+/// O maior texto (ou lista de URIs) devolvido pelo [`Store::get`], em bytes
+/// do JSON já escapado: a resposta inteira cabe numa mensagem do protocolo
+/// (1 MiB).
+pub const GET_TEXT_MAX: usize = 256 << 10;
+/// Quantas URIs de um item de arquivos vão numa página do [`Store::list`], no
+/// máximo.
+pub const LIST_URIS: usize = 50;
+/// O orçamento (JSON escapado) das URIs de um item numa página do
+/// [`Store::list`]: 200 itens com caminhos longos ainda cabem numa mensagem.
+pub const LIST_URIS_BYTES: usize = 2 << 10;
+
+/// Quantos bytes `c` ocupa numa string JSON (o `serde_json` escreve os
+/// controles como `\n` ou `\u00XX`).
+fn escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Quantos bytes `s` ocupa como string JSON, com as aspas.
+fn escaped_str_len(s: &str) -> usize {
+    s.chars().map(escaped_len).sum::<usize>() + 2
+}
+
+/// O começo de `text` que, escapado em JSON (com as aspas), cabe em `budget`.
+fn cut_escaped(text: &str, budget: usize) -> &str {
+    let mut used = 2;
+    for (at, c) in text.char_indices() {
+        used += escaped_len(c);
+        if used > budget {
+            return &text[..at];
+        }
+    }
+    text
+}
+
+/// Quantas das primeiras `uris` cabem num array JSON de até `budget` bytes
+/// (e no máximo `max`).
+fn uris_within(uris: &[&str], budget: usize, max: usize) -> usize {
+    let mut used = 2;
+    uris.iter()
+        .take(max)
+        .take_while(|uri| {
+            used += escaped_str_len(uri) + 1;
+            used <= budget
+        })
+        .count()
+}
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS items(
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    hash TEXT NOT NULL UNIQUE,
+    text TEXT,
+    norm TEXT,
+    mime TEXT,
+    width INT,
+    height INT,
+    size INT NOT NULL,
+    lines INT,
+    file TEXT,
+    created INT NOT NULL,
+    used INT NOT NULL,
+    pinned INT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS items_order ON items(pinned DESC, used DESC);
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts
+    USING fts5(norm, content='items', content_rowid='id', tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN
+    INSERT INTO items_fts(rowid, norm) VALUES (new.id, new.norm);
+END;
+CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, norm) VALUES ('delete', old.id, old.norm);
+END;
+CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE OF norm ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, norm) VALUES ('delete', old.id, old.norm);
+    INSERT INTO items_fts(rowid, norm) VALUES (new.id, new.norm);
+END;
+";
+
+const COLUMNS: &str =
+    "id, kind, hash, text, mime, width, height, size, lines, file, created, used, pinned";
+
+fn err(e: impl Display) -> String {
+    e.to_string()
+}
+
+/// Uma cópia nova, como chegou da área de transferência.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewClip {
+    Text(String),
+    /// A `text/uri-list` crua.
+    Files(String),
+    Image {
+        mime: String,
+        bytes: Vec<u8>,
+    },
+}
+
+/// Onde o histórico mora.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// A pasta do banco no disco (`history.db` e `images/`).
+    Disk(PathBuf),
+    /// Sem persistência: o banco em memória, os arquivos em `files/images/`,
+    /// e `disk`, a pasta do disco, que é apagada.
+    Memory { files: PathBuf, disk: PathBuf },
+}
+
+/// Uma cópia já preparada para o [`Store::insert`].
+#[derive(Debug)]
+pub struct Prepared {
+    kind: Kind,
+    hash: String,
+    text: Option<String>,
+    norm: Option<String>,
+    mime: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    size: usize,
+    lines: Option<usize>,
+    /// O nome do arquivo da imagem, dentro de `images/`.
+    file: Option<String>,
+    /// Os bytes da imagem e da miniatura, para regravar o que faltar.
+    image: Option<(Vec<u8>, Option<Vec<u8>>)>,
+    /// A pasta `images/` onde o [`prepare`] gravou.
+    written_in: Option<PathBuf>,
+}
+
+impl Prepared {
+    /// Os bytes da imagem (para servir a seleção sem copiá-los de novo).
+    pub fn into_image(self) -> Option<Vec<u8>> {
+        self.image.map(|(bytes, _)| bytes)
+    }
+
+    /// Os arquivos da imagem, dentro de `images/`.
+    fn files(&self) -> Vec<String> {
+        let mut files: Vec<String> = self.file.iter().cloned().collect();
+        if let Some((_, Some(_))) = &self.image {
+            files.push(thumb_name(&self.hash));
+        }
+        files
+    }
+}
+
+/// O hash do conteúdo, com o tipo na frente: SHA-256 em hex.
+fn hash_of(kind: Kind, content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(content);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn thumb_name(hash: &str) -> String {
+    format!("{hash}.thumb.png")
+}
+
+/// O modo dos arquivos do histórico: só o dono lê.
+const PRIVATE_FILE: u32 = 0o600;
+
+/// Grava em `path` pelo que `fill` escreve num arquivo temporário (modo
+/// `0600`) na mesma pasta e um `rename`.
+fn write_private(
+    path: &Path,
+    fill: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> Result<(), String> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE_FILE)
+        .open(&tmp)
+        .and_then(|mut file| fill(&mut file).and_then(|()| file.sync_all()))
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Grava `bytes` em `path` (modo `0600`, por temporário e `rename`); se
+/// `path` já existe, não faz nada.
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+    write_private(path, |file| file.write_all(bytes))
+}
+
+/// Copia `from` para `to` com modo `0600` (por temporário e `rename`: entre
+/// sistemas de arquivos diferentes, o `rename` direto daria `EXDEV`).
+fn copy_private(from: &Path, to: &Path) -> Result<(), String> {
+    let mut source = fs::File::open(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    write_private(to, |file| io::copy(&mut source, file).map(|_| ()))
+}
+
+/// Cria `path` vazio com modo `0600` se não existe e corrige o modo se existe.
+fn private_file(path: &Path) -> Result<(), String> {
+    let fix = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(PRIVATE_FILE)
+        .open(path)
+        .and_then(|_| fs::set_permissions(path, Permissions::from_mode(PRIVATE_FILE)));
+    fix.map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn remove_quietly(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+fn remove_dir_quietly(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+fn private_dir(dir: &Path) -> Result<(), String> {
+    create_private_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))
+}
+
+/// Os arquivos das imagens ficam em `files_dir/images/`.
+fn images_in(files_dir: &Path) -> PathBuf {
+    files_dir.join(IMAGES_DIR)
+}
+
+/// Grava os arquivos da imagem que ainda não existirem em `images`.
+fn write_image_files(images: &Path, p: &Prepared) -> Result<(), String> {
+    let (Some(file), Some((bytes, thumb))) = (&p.file, &p.image) else {
+        return Ok(());
+    };
+    private_dir(images)?;
+    write_new(&images.join(file), bytes)?;
+    if let Some(thumb) = thumb {
+        write_new(&images.join(thumb_name(&p.hash)), thumb)?;
+    }
+    Ok(())
+}
+
+/// Prepara uma cópia sem o [`Store`]: hash, normalização, miniatura e, para
+/// imagem, a gravação de `<hash>.<ext>` e `<hash>.thumb.png` em
+/// `files_dir/images/` (pulando o que já existe). Uma imagem cuja miniatura
+/// falha (tipo sem decodificador, bomba de pixels, arquivo quebrado) entra sem
+/// miniatura e sem dimensões.
+pub fn prepare(clip: NewClip, files_dir: &Path) -> Result<Prepared, String> {
+    let empty = |kind, hash, size| Prepared {
+        kind,
+        hash,
+        text: None,
+        norm: None,
+        mime: None,
+        width: None,
+        height: None,
+        size,
+        lines: None,
+        file: None,
+        image: None,
+        written_in: None,
+    };
+    match clip {
+        NewClip::Text(text) => {
+            let base = empty(Kind::Text, hash_of(Kind::Text, text.as_bytes()), 0);
+            Ok(Prepared {
+                norm: Some(normalize(&text)),
+                size: text.chars().count(),
+                lines: Some(text.lines().count().max(1)),
+                text: Some(text),
+                ..base
+            })
+        }
+        NewClip::Files(list) => {
+            let uris: Vec<String> = uri_lines(&list).into_iter().map(String::from).collect();
+            let base = empty(
+                Kind::Files,
+                hash_of(Kind::Files, list.as_bytes()),
+                list.len(),
+            );
+            Ok(Prepared {
+                norm: Some(normalize(&file_names(&uris))),
+                text: Some(list),
+                ..base
+            })
+        }
+        NewClip::Image { mime, bytes } => {
+            let hash = hash_of(Kind::Image, &bytes);
+            let file = format!("{hash}.{}", extension_for(&mime.to_ascii_lowercase()));
+            let thumb = thumbnail(&bytes, &mime).ok();
+            let prepared = Prepared {
+                width: thumb.as_ref().map(|t| t.width),
+                height: thumb.as_ref().map(|t| t.height),
+                mime: Some(mime),
+                file: Some(file),
+                ..empty(Kind::Image, hash, bytes.len())
+            };
+            let images = images_in(files_dir);
+            let prepared = Prepared {
+                image: Some((bytes, thumb.map(|t| t.png))),
+                written_in: Some(images.clone()),
+                ..prepared
+            };
+            write_image_files(&images, &prepared)?;
+            Ok(prepared)
+        }
+    }
+}
+
+/// Apaga o histórico do disco em `dir`: `history.db`, `-wal`, `-shm` e
+/// `images/`.
+pub fn wipe(dir: &Path) -> Result<(), String> {
+    for name in [
+        DB_FILE.to_string(),
+        format!("{DB_FILE}-wal"),
+        format!("{DB_FILE}-shm"),
+        format!("{DB_FILE}.tmp"),
+    ] {
+        let path = dir.join(name);
+        remove_quietly(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    let images = images_in(dir);
+    remove_dir_quietly(&images).map_err(|e| format!("{}: {e}", images.display()))
+}
+
+/// O conteúdo de um item para servir a seleção: o tipo, o mime (imagem) e os
+/// bytes.
+pub type Content = (Kind, Option<String>, Vec<u8>);
+
+/// Os bytes de um item: já na mão (texto, arquivos) ou num arquivo (imagem).
+#[derive(Debug)]
+pub enum Data {
+    Bytes(Vec<u8>),
+    File(PathBuf),
+}
+
+impl Data {
+    /// Os bytes; o arquivo é lido agora (bloqueia).
+    pub fn read(self) -> Result<Vec<u8>, String> {
+        match self {
+            Data::Bytes(bytes) => Ok(bytes),
+            Data::File(path) => fs::read(&path).map_err(|e| format!("{}: {e}", path.display())),
+        }
+    }
+}
+
+/// Uma página do `clipboard.list`.
+#[derive(Debug, Clone, Default)]
+pub struct ListQuery {
+    pub kind: Option<Kind>,
+    pub query: Option<String>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+/// Os itens já no JSON do protocolo e o total que casa com a consulta.
+#[derive(Debug, Clone)]
+pub struct Page {
+    pub items: Vec<Value>,
+    pub total: usize,
+}
+
+/// Uma linha da tabela `items`.
+struct Record {
+    id: i64,
+    kind: Kind,
+    hash: String,
+    text: Option<String>,
+    mime: Option<String>,
+    width: Option<i64>,
+    height: Option<i64>,
+    size: i64,
+    lines: Option<i64>,
+    file: Option<String>,
+    created: i64,
+    used: i64,
+    pinned: bool,
+}
+
+impl Record {
+    fn from_row(row: &Row) -> rusqlite::Result<Record> {
+        let kind: String = row.get(1)?;
+        Ok(Record {
+            id: row.get(0)?,
+            kind: Kind::parse(&kind).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    format!("tipo de item desconhecido no histórico: {kind}").into(),
+                )
+            })?,
+            hash: row.get(2)?,
+            text: row.get(3)?,
+            mime: row.get(4)?,
+            width: row.get(5)?,
+            height: row.get(6)?,
+            size: row.get(7)?,
+            lines: row.get(8)?,
+            file: row.get(9)?,
+            created: row.get(10)?,
+            used: row.get(11)?,
+            pinned: row.get(12)?,
+        })
+    }
+
+    /// Os arquivos do item, dentro de `images/`.
+    fn files(&self) -> Vec<String> {
+        match &self.file {
+            Some(file) => vec![file.clone(), thumb_name(&self.hash)],
+            None => Vec::new(),
+        }
+    }
+
+    /// O item no JSON do protocolo; com `query`, a prévia vem com os trechos
+    /// marcados; com `full`, o texto inteiro.
+    fn to_json(&self, images: &Path, query: Option<&str>, full: bool) -> Value {
+        let mut out = Map::new();
+        out.insert("id".into(), json!(self.id));
+        out.insert("kind".into(), json!(self.kind.as_str()));
+        let text = self.text.as_deref().unwrap_or("");
+        let shown = match self.kind {
+            Kind::Text => Some(text.to_string()),
+            Kind::Files => {
+                let uris = uri_lines(text);
+                let names: Vec<String> = uris
+                    .iter()
+                    .map(|uri| file_names(&[uri.to_string()]))
+                    .collect();
+                // A página e o `get` cabem numa mensagem: a página leva as
+                // primeiras URIs (até `LIST_URIS_BYTES`) e o total; o `get`,
+                // até `GET_TEXT_MAX` bytes, contados já escapados.
+                let kept = if full {
+                    uris_within(&uris, GET_TEXT_MAX, usize::MAX)
+                } else {
+                    uris_within(&uris, LIST_URIS_BYTES, LIST_URIS)
+                };
+                out.insert("uris".into(), json!(uris[..kept]));
+                if kept < uris.len() {
+                    if full {
+                        out.insert("truncated".into(), json!(true));
+                    } else {
+                        out.insert("urisTotal".into(), json!(uris.len()));
+                    }
+                }
+                Some(names.join(", "))
+            }
+            Kind::Image => None,
+        };
+        if let Some(shown) = shown {
+            let (preview, matches) = preview_for(&shown, query);
+            out.insert("preview".into(), json!(preview));
+            if query.is_some() {
+                out.insert("matches".into(), json!(matches));
+            }
+        }
+        if full && self.kind == Kind::Text {
+            let kept = cut_escaped(text, GET_TEXT_MAX);
+            out.insert("text".into(), json!(kept));
+            if kept.len() < text.len() {
+                out.insert("truncated".into(), json!(true));
+            }
+        }
+        if let Some(file) = &self.file {
+            out.insert("image".into(), json!(images.join(file)));
+            if self.width.is_some() {
+                out.insert("thumb".into(), json!(images.join(thumb_name(&self.hash))));
+            }
+        }
+        let optional = [
+            ("mime", self.mime.as_ref().map(|m| json!(m))),
+            ("width", self.width.map(|w| json!(w))),
+            ("height", self.height.map(|h| json!(h))),
+        ];
+        for (key, value) in optional {
+            if let Some(value) = value {
+                out.insert(key.into(), value);
+            }
+        }
+        out.insert("size".into(), json!(self.size));
+        if let Some(lines) = self.lines {
+            out.insert("lines".into(), json!(lines));
+        }
+        out.insert("created".into(), json!(self.created));
+        out.insert("used".into(), json!(self.used));
+        out.insert("pinned".into(), json!(self.pinned));
+        Value::Object(out)
+    }
+}
+
+/// O histórico aberto.
+pub struct Store {
+    conn: Connection,
+    origin: Origin,
+    limit: usize,
+}
+
+impl Store {
+    /// Abre o histórico. No disco: `history.db` e `images/` (criados com modo
+    /// `0700`), com os órfãos de `images/` apagados. Na memória: apaga antes o
+    /// histórico do disco e o que houver em `files/images/`.
+    pub fn open(origin: Origin, limit: usize) -> Result<Store, String> {
+        if let Origin::Memory { disk, .. } = &origin {
+            wipe(disk)?;
+        }
+        Store::open_here(origin, limit)
+    }
+
+    /// O [`Store::open`] sem apagar o disco na memória.
+    fn open_here(origin: Origin, limit: usize) -> Result<Store, String> {
+        let conn = match &origin {
+            Origin::Disk(dir) => {
+                private_dir(dir)?;
+                private_dir(&images_in(dir))?;
+                let db = dir.join(DB_FILE);
+                // O SQLite cria o `-wal` e o `-shm` com o modo do banco.
+                private_file(&db)?;
+                let conn = Connection::open(&db).map_err(err)?;
+                conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+                    .map_err(err)?;
+                conn.pragma_update(None, "synchronous", "NORMAL")
+                    .map_err(err)?;
+                conn
+            }
+            Origin::Memory { files, .. } => {
+                private_dir(files)?;
+                let images = images_in(files);
+                remove_dir_quietly(&images).map_err(|e| format!("{}: {e}", images.display()))?;
+                private_dir(&images)?;
+                Connection::open_in_memory().map_err(err)?
+            }
+        };
+        // O apagado é zerado nas páginas, não só desligado da árvore.
+        conn.pragma_update(None, "secure_delete", "ON")
+            .map_err(err)?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(err)?;
+        if version > SCHEMA_VERSION {
+            return Err(format!(
+                "o histórico é da versão {version}, mais nova que a {SCHEMA_VERSION}"
+            ));
+        }
+        conn.execute_batch(SCHEMA).map_err(err)?;
+        // O índice também esquece de verdade o que sai (SQLite 3.42+).
+        conn.execute(
+            "INSERT INTO items_fts(items_fts, rank) VALUES ('secure-delete', 1)",
+            [],
+        )
+        .map_err(err)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(err)?;
+        let mut store = Store {
+            conn,
+            origin,
+            limit,
+        };
+        store.remove_orphans()?;
+        store.set_limit(limit)?;
+        Ok(store)
+    }
+
+    /// A pasta onde o [`prepare`] grava (a pasta pai de `images/`).
+    pub fn files_dir(&self) -> PathBuf {
+        match &self.origin {
+            Origin::Disk(dir) => dir.clone(),
+            Origin::Memory { files, .. } => files.clone(),
+        }
+    }
+
+    /// Onde o histórico mora agora.
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    fn images(&self) -> PathBuf {
+        images_in(&self.files_dir())
+    }
+
+    fn remove_orphans(&self) -> Result<(), String> {
+        let mut known = std::collections::HashSet::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash, file FROM items WHERE file IS NOT NULL")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(err)?;
+        for row in rows {
+            let (hash, file) = row.map_err(err)?;
+            known.insert(file);
+            known.insert(thumb_name(&hash));
+        }
+        let images = self.images();
+        for entry in fs::read_dir(&images).map_err(|e| format!("{}: {e}", images.display()))? {
+            let entry = entry.map_err(err)?;
+            if !known.contains(&*entry.file_name().to_string_lossy()) {
+                let _ = remove_quietly(&entry.path());
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_files(&self, files: &[String]) {
+        let images = self.images();
+        for file in files {
+            let _ = remove_quietly(&images.join(file));
+        }
+    }
+
+    /// Os não fixados acima do limite saem, por `used` mais antigo; devolve os
+    /// arquivos deles para apagar depois do `COMMIT`.
+    fn evict(tx: &Transaction, limit: usize) -> Result<Vec<String>, String> {
+        let mut stmt = tx
+            .prepare(&format!(
+                "SELECT {COLUMNS} FROM items WHERE pinned = 0
+                 ORDER BY used DESC, id DESC LIMIT -1 OFFSET ?1"
+            ))
+            .map_err(err)?;
+        let old: Vec<Record> = stmt
+            .query_map([limit as i64], Record::from_row)
+            .map_err(err)?
+            .collect::<Result<_, _>>()
+            .map_err(err)?;
+        let mut files = Vec::new();
+        for record in old {
+            tx.execute("DELETE FROM items WHERE id = ?1", [record.id])
+                .map_err(err)?;
+            files.extend(record.files());
+        }
+        Ok(files)
+    }
+
+    /// Grava a cópia preparada: o id e se é nova. A repetida (mesmo hash) só
+    /// ganha `used = now_ms`, com o mesmo id e o mesmo `pinned`. Aplica o
+    /// limite na mesma transação.
+    pub fn insert(&mut self, p: Prepared, now_ms: i64) -> Result<(i64, bool), String> {
+        self.insert_ref(&p, now_ms)
+    }
+
+    /// O [`Store::insert`] sem consumir a cópia (quem chama ainda usa os
+    /// bytes, pelo [`Prepared::into_image`]).
+    pub fn insert_ref(&mut self, p: &Prepared, now_ms: i64) -> Result<(i64, bool), String> {
+        let images = self.images();
+        let inserted = self.insert_here(&images, p, now_ms);
+        // Preparada para outra pasta (a persistência trocou no meio): o que
+        // ficou lá sai, e a pasta também, se vazia, deu certo ou não; senão a
+        // imagem sobraria no disco depois de desligar a persistência.
+        if let Some(old) = p.written_in.as_ref().filter(|old| **old != images) {
+            for file in p.files() {
+                let _ = remove_quietly(&old.join(file));
+            }
+            let _ = fs::remove_dir(old);
+        }
+        inserted
+    }
+
+    fn insert_here(
+        &mut self,
+        images: &Path,
+        p: &Prepared,
+        now_ms: i64,
+    ) -> Result<(i64, bool), String> {
+        // Antes do `COMMIT`, para o item nunca ficar sem arquivo. Normalmente o
+        // `prepare` já gravou e nada muda; só falta algo se a persistência
+        // trocou no meio ou se o mesmo item saiu pelo limite enquanto esta
+        // cópia era preparada.
+        write_image_files(images, p)?;
+        let tx = self.conn.transaction().map_err(err)?;
+        let existing: Option<i64> = tx
+            .query_row("SELECT id FROM items WHERE hash = ?1", [&p.hash], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(err)?;
+        let (id, new) = match existing {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE items SET used = ?1 WHERE id = ?2",
+                    params![now_ms, id],
+                )
+                .map_err(err)?;
+                (id, false)
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO items
+                     (kind, hash, text, norm, mime, width, height, size, lines, file, created, used)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                    params![
+                        p.kind.as_str(),
+                        p.hash,
+                        p.text,
+                        p.norm,
+                        p.mime,
+                        p.width,
+                        p.height,
+                        p.size as i64,
+                        p.lines.map(|l| l as i64),
+                        p.file,
+                        now_ms,
+                    ],
+                )
+                .map_err(err)?;
+                (tx.last_insert_rowid(), true)
+            }
+        };
+        let evicted = Self::evict(&tx, self.limit)?;
+        tx.commit().map_err(err)?;
+        self.delete_files(&evicted);
+        Ok((id, new))
+    }
+
+    /// Sobe o item ao topo; `false` se ele não existe.
+    pub fn touch(&mut self, id: i64, now_ms: i64) -> Result<bool, String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE items SET used = ?1 WHERE id = ?2",
+                params![now_ms, id],
+            )
+            .map_err(err)?;
+        Ok(changed > 0)
+    }
+
+    /// Apaga o item e os arquivos dele; `false` se ele não existe.
+    pub fn remove(&mut self, id: i64) -> Result<bool, String> {
+        let Some(record) = self.record(id)? else {
+            return Ok(false);
+        };
+        self.conn
+            .execute("DELETE FROM items WHERE id = ?1", [id])
+            .map_err(err)?;
+        self.delete_files(&record.files());
+        self.forget()?;
+        Ok(true)
+    }
+
+    /// Passa o `-wal` para o banco e o zera: as versões antigas das páginas
+    /// (com o que foi apagado) não ficam no disco.
+    fn forget(&self) -> Result<(), String> {
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .map_err(err)
+    }
+
+    /// Fixa ou solta o item; `false` se ele não existe. Soltar pode tirar
+    /// itens pelo limite.
+    pub fn pin(&mut self, id: i64, pinned: bool) -> Result<bool, String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE items SET pinned = ?1 WHERE id = ?2",
+                params![pinned, id],
+            )
+            .map_err(err)?;
+        if changed > 0 && !pinned {
+            self.set_limit(self.limit)?;
+        }
+        Ok(changed > 0)
+    }
+
+    /// Apaga os não fixados (ou todos, com `all`) e os arquivos deles; devolve
+    /// quantos saíram.
+    pub fn clear(&mut self, all: bool) -> Result<usize, String> {
+        let tx = self.conn.transaction().map_err(err)?;
+        let filter = if all { "" } else { " WHERE pinned = 0" };
+        let records: Vec<Record> = {
+            let mut stmt = tx
+                .prepare(&format!("SELECT {COLUMNS} FROM items{filter}"))
+                .map_err(err)?;
+            stmt.query_map([], Record::from_row)
+                .map_err(err)?
+                .collect::<Result<_, _>>()
+                .map_err(err)?
+        };
+        tx.execute(&format!("DELETE FROM items{filter}"), [])
+            .map_err(err)?;
+        tx.commit().map_err(err)?;
+        let files: Vec<String> = records.iter().flat_map(Record::files).collect();
+        self.delete_files(&files);
+        self.forget()?;
+        Ok(records.len())
+    }
+
+    /// Troca o limite e já o aplica.
+    pub fn set_limit(&mut self, limit: usize) -> Result<(), String> {
+        self.limit = limit;
+        let tx = self.conn.transaction().map_err(err)?;
+        let evicted = Self::evict(&tx, limit)?;
+        tx.commit().map_err(err)?;
+        self.delete_files(&evicted);
+        Ok(())
+    }
+
+    /// O total de itens e quantos estão fixados.
+    pub fn counts(&self) -> Result<(usize, usize), String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(pinned), 0) FROM items",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as usize,
+                        row.get::<_, i64>(1)? as usize,
+                    ))
+                },
+            )
+            .map_err(err)
+    }
+
+    /// Uma página: fixados primeiro, depois por uso mais recente. Com
+    /// consulta, imagens nunca casam; de 3 caracteres (normalizados) para
+    /// cima, pelo índice trigram, com a consulta entre aspas (sem a sintaxe
+    /// do FTS5); com 1 ou 2, pela comparação direta no texto normalizado.
+    pub fn list(&self, q: &ListQuery) -> Result<Page, String> {
+        let query = q.query.as_deref().filter(|raw| !normalize(raw).is_empty());
+        let mut conds: Vec<&str> = Vec::new();
+        let mut args: Vec<Sql> = Vec::new();
+        if let Some(kind) = q.kind {
+            conds.push("kind = ?");
+            args.push(Sql::Text(kind.as_str().into()));
+        }
+        if let Some(raw) = query {
+            let norm = normalize(raw);
+            conds.push("kind != 'image'");
+            if norm.chars().count() > SHORT_QUERY {
+                conds.push("id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)");
+                args.push(Sql::Text(format!("\"{}\"", norm.replace('"', "\"\""))));
+            } else {
+                conds.push("instr(norm, ?) > 0");
+                args.push(Sql::Text(norm));
+            }
+        }
+        let filter = if conds.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conds.join(" AND "))
+        };
+        let total: i64 = self
+            .conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM items{filter}"),
+                params_from_iter(&args),
+                |row| row.get(0),
+            )
+            .map_err(err)?;
+        let mut page_args = args.clone();
+        page_args.push(Sql::Integer(q.limit as i64));
+        page_args.push(Sql::Integer(q.offset as i64));
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {COLUMNS} FROM items{filter}
+                 ORDER BY pinned DESC, used DESC, id DESC LIMIT ? OFFSET ?"
+            ))
+            .map_err(err)?;
+        let images = self.images();
+        let items = stmt
+            .query_map(params_from_iter(&page_args), Record::from_row)
+            .map_err(err)?
+            .map(|record| record.map(|r| r.to_json(&images, query, false)))
+            .collect::<Result<_, _>>()
+            .map_err(err)?;
+        Ok(Page {
+            items,
+            total: total as usize,
+        })
+    }
+
+    fn record(&self, id: i64) -> Result<Option<Record>, String> {
+        self.conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM items WHERE id = ?1"),
+                [id],
+                Record::from_row,
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// O item com o texto inteiro (texto) ou as `uris` (arquivos).
+    pub fn get(&self, id: i64) -> Result<Option<Value>, String> {
+        Ok(self
+            .record(id)?
+            .map(|r| r.to_json(&self.images(), None, true)))
+    }
+
+    /// O que o `offers_for` precisa: o tipo, o mime (imagem) e os bytes (o
+    /// texto, a `text/uri-list` crua ou o arquivo da imagem).
+    pub fn content(&self, id: i64) -> Result<Option<Content>, String> {
+        let Some((kind, mime, data)) = self.locate(id)? else {
+            return Ok(None);
+        };
+        Ok(Some((kind, mime, data.read()?)))
+    }
+
+    /// O [`Store::content`] sem ler o arquivo da imagem: quem chama o lê com
+    /// o [`Data::read`] depois de soltar o lock.
+    pub fn locate(&self, id: i64) -> Result<Option<(Kind, Option<String>, Data)>, String> {
+        let Some(record) = self.record(id)? else {
+            return Ok(None);
+        };
+        let data = match &record.file {
+            Some(file) => Data::File(self.images().join(file)),
+            None => Data::Bytes(record.text.clone().unwrap_or_default().into_bytes()),
+        };
+        Ok(Some((record.kind, record.mime, data)))
+    }
+
+    /// Troca onde o histórico mora. Memória → disco: apaga o destino, copia o
+    /// banco (`VACUUM INTO`) e os arquivos (copiados, não renomeados: o tmpfs
+    /// e o disco são sistemas de arquivos diferentes); se algo falha, o
+    /// destino parcial é apagado e o histórico em memória fica como estava.
+    /// Disco → memória: começa vazio e apaga o disco; se falha ao abrir a
+    /// memória, nada muda; se falha só ao apagar o disco, o histórico já está
+    /// na memória e o erro diz o que sobrou.
+    pub fn move_to(&mut self, origin: Origin) -> Result<(), String> {
+        if self.origin == origin {
+            return Ok(());
+        }
+        let limit = self.limit;
+        match (self.origin.clone(), origin.clone()) {
+            (Origin::Memory { files, .. }, Origin::Disk(dir)) => {
+                let moved = self
+                    .copy_to_disk(&files, &dir)
+                    .and_then(|()| Store::open_here(origin, limit));
+                match moved {
+                    Ok(store) => {
+                        // A memória antiga sai e leva os arquivos dela.
+                        drop(std::mem::replace(self, store));
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = wipe(&dir);
+                        Err(e)
+                    }
+                }
+            }
+            (Origin::Disk(old), Origin::Memory { disk, .. }) => {
+                let store = Store::open_here(origin, limit)?;
+                // Fecha o banco do disco antes de apagar.
+                drop(std::mem::replace(self, store));
+                wipe(&old)?;
+                if disk != old {
+                    wipe(&disk)?;
+                }
+                Ok(())
+            }
+            (Origin::Memory { files: a, .. }, Origin::Memory { files: b, disk }) if a == b => {
+                wipe(&disk)?;
+                self.origin = origin;
+                Ok(())
+            }
+            _ => {
+                let store = Store::open(origin, limit)?;
+                drop(std::mem::replace(self, store));
+                Ok(())
+            }
+        }
+    }
+
+    /// O banco e os arquivos da memória em `dir`, por cima do que houver.
+    fn copy_to_disk(&self, files: &Path, dir: &Path) -> Result<(), String> {
+        wipe(dir)?;
+        private_dir(dir)?;
+        let target = images_in(dir);
+        private_dir(&target)?;
+        let tmp = dir.join(format!("{DB_FILE}.tmp"));
+        self.conn
+            .execute("VACUUM INTO ?1", [tmp.to_string_lossy()])
+            .map_err(err)?;
+        fs::set_permissions(&tmp, Permissions::from_mode(PRIVATE_FILE)).map_err(err)?;
+        let source = images_in(files);
+        for entry in fs::read_dir(&source).map_err(|e| format!("{}: {e}", source.display()))? {
+            let entry = entry.map_err(err)?;
+            copy_private(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        fs::rename(&tmp, dir.join(DB_FILE)).map_err(err)
+    }
+}
+
+impl Drop for Store {
+    /// Sem persistência, os arquivos somem junto (também quando o módulo é
+    /// abortado sem passar por código de saída).
+    fn drop(&mut self) {
+        if let Origin::Memory { files, .. } = &self.origin {
+            let _ = remove_dir_quietly(&images_in(files));
+            let _ = fs::remove_dir(files);
+        }
+    }
+}

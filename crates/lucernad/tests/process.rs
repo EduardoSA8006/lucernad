@@ -6,8 +6,10 @@
 //! O `serve` daqui lê a máquina de verdade. Nenhum teste assina o
 //! `system.gpus` (nem pelo `status`, que assina todos os tópicos): com uma
 //! NVIDIA em uso na máquina, isso chamaria a NVML de verdade. O ambiente
-//! limpo também deixa o `spectrum` sem o PipeWire e o D-Bus do usuário.
-#![cfg(any(feature = "system", feature = "spectrum"))]
+//! limpo também deixa o `spectrum` sem o PipeWire e o D-Bus do usuário e o
+//! `clipboard` sem `WAYLAND_DISPLAY`: nenhum teste fala com a sessão Wayland
+//! do usuário (a área de transferência dele nunca é tocada).
+#![cfg(any(feature = "system", feature = "spectrum", feature = "clipboard"))]
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -189,6 +191,35 @@ fn cli_help_status_and_exit_codes() {
         assert_ne!(out.status.code(), Some(0));
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("player precisa ser"), "stderr: {err}");
+    }
+    #[cfg(feature = "clipboard")]
+    {
+        let (_w, _rx, v) = watch_json(t.path(), "clipboard.status");
+        assert_eq!(
+            v["data"]["available"], false,
+            "sem Wayland no ambiente: {v}"
+        );
+        // Sem `configure`, o módulo espera 2 s e aplica o padrão.
+        let out = lucernad(t.path()).arg("historico").output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Nada no histórico."),
+            "stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let out = lucernad(t.path()).args(["copiar", "abc"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(64), "uso errado");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("ID precisa ser um número"), "stderr: {err}");
+        let out = lucernad(t.path()).args(["copiar", "99"]).output().unwrap();
+        assert_ne!(out.status.code(), Some(0));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("não existe mais"), "stderr: {err}");
     }
 }
 

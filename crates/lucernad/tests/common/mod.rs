@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use lucerna_ipc::Client;
 use lucernad::{Modules, lucernad};
+#[cfg(feature = "clipboard")]
+use lucernad_clipboard::testing::quiet_config as clipboard_config;
 use lucernad_core::ModuleTask;
 #[cfg(feature = "spectrum")]
 use lucernad_spectrum::testing::quiet_config;
@@ -26,8 +28,8 @@ pub struct Running {
     task: JoinHandle<()>,
 }
 
-/// Sobe o `lucernad` (o `system` na máquina de exemplo, o `spectrum` com os
-/// dublês) num socket temporário, sem shell.
+/// Sobe o `lucernad` (o `system` na máquina de exemplo, o `spectrum` e o
+/// `clipboard` com os dublês) num socket temporário, sem shell.
 pub async fn start() -> Running {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("lucernad.sock");
@@ -37,6 +39,8 @@ pub async fn start() -> Running {
         system: machine_config(),
         #[cfg(feature = "spectrum")]
         spectrum: quiet_config(),
+        #[cfg(feature = "clipboard")]
+        clipboard: clipboard_config(dir.path()),
     });
     d.service.idle_timeout(Duration::from_secs(60));
     let service = d.service;
@@ -51,6 +55,8 @@ pub async fn start() -> Running {
             d.system_task,
             #[cfg(feature = "spectrum")]
             d.spectrum_task,
+            #[cfg(feature = "clipboard")]
+            d.clipboard_task,
         ],
         task,
     }

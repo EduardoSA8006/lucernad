@@ -1,0 +1,40 @@
+[package]
+name = "lucernad-clipboard"
+description = "Módulo clipboard do lucernad: o histórico da área de transferência do Wayland."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+# Os dublês e os dados de teste, para os testes.
+testing = []
+
+[dependencies]
+rustix.workspace = true
+unicode-normalization.workspace = true
+image.workspace = true
+lucerna-paths.workspace = true
+lucerna-service.workspace = true
+lucernad-core.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+wayland-protocols-wlr.workspace = true
+
+[dev-dependencies]
+# Os testes deste crate usam o módulo `testing`.
+lucernad-clipboard = { path = ".", features = ["testing"] }
+lucerna-ipc.workspace = true
+rusqlite.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

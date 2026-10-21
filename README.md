@@ -4,7 +4,7 @@
 
 Daemon em Rust com a lógica do shell Lucerna (espectro de áudio, sistema, área de transferência, energia e mais); o shell fica só com a interface.
 
-**Situação:** dois módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs) e o `spectrum` (o espectro do som do player exibido, pelo PipeWire).
+**Situação:** três módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs), o `spectrum` (o espectro do som do player exibido, pelo PipeWire) e o `clipboard` (o histórico da área de transferência do Wayland).
 
 ## Módulos
 
@@ -39,9 +39,29 @@ Como o player (nome MPRIS) casa com os nós de saída do PipeWire:
 2. Sem o dono no `/proc` (ou com o proxy do Flatpak), a reserva compara o executável do client com o nome do player (o fim do nome D-Bus, sem o `.instance…`, ou o `DesktopEntry`), só com igualdade exata e só se todos os nós que casam vierem de um mesmo processo.
 3. Vários nós casando somam (as abas do navegador tocando juntas); em dúvida, nenhum: o anel parado é melhor que as barras de outro app.
 
+### `clipboard`
+
+Observa a área de transferência pelo protocolo de controle de dados do Wayland (`ext-data-control-v1`, com o `wlr-data-control` de reserva) e guarda o histórico em SQLite, com busca por trechos (sem distinguir maiúsculas nem acentos). Imagens (`png`, `jpeg`, `webp`) ganham miniatura. Roda **depois do primeiro `clipboard.configure` (ou 2 s sem ele, com o padrão) e só com assinante de `clipboard.history`**, ou enquanto segura a seleção que o próprio daemon pôs (um `clipboard.copy`): a conexão e o trabalho em andamento ficam até outro app copiar. Cópia que anuncia o tipo `x-kde-passwordManagerHint` (gerenciadores de senha) **nunca entra** no histórico: nem é lida.
+
+| Tópico | O que traz | Quando muda |
+| --- | --- | --- |
+| `clipboard.history` | `{"revision","count","pinned"}`; `null` até o histórico abrir | a cada item novo, remoção, fixação ou limpeza |
+| `clipboard.status` | `{"available","error"}`: `available` diz que a última abertura da sessão deu certo e o banco abriu; `false` com o motivo em `error` (sem sessão Wayland, compositor sem o controle, banco que não abriu); `false` com `error` `null` enquanto ainda não foi tentado | quando o estado muda |
+
+Métodos:
+
+- `clipboard.list {kind?, query?, offset, limit}` → `{"items":[…],"total"}`: uma página (`limit` de 1 a 200), com a prévia e os trechos marcados (`matches`, em unidades UTF-16); `kind` é `text`, `image` ou `files`.
+- `clipboard.get {id}` → o item (texto até 256 KiB, com `truncated`; ou as `uris`).
+- `clipboard.copy {id}` → `{}`: o daemon vira dono da seleção com o item.
+- `clipboard.copyImage {path, store?}` → `{id}`: copia uma imagem do disco (com `store: false`, sem guardar no histórico; `id` `0`).
+- `clipboard.remove {id}`, `clipboard.pin {id, pinned}` e `clipboard.clear {all?}` → `{}`.
+- `clipboard.configure {limit, persist, waylandDisplay?}` → `{}`: o limite de itens (1 a 1000) e a persistência.
+
+O histórico mora em `$XDG_DATA_HOME/lucerna/clipboard/` (`history.db` e `images/`); sem persistência, só em memória e as imagens em `$XDG_RUNTIME_DIR/lucerna/clipboard/images/`, apagadas ao parar. O `WAYLAND_DISPLAY` do ambiente do daemon vence o do `configure`.
+
 ## Instalação
 
-Para compilar: `libpipewire`, `clang` e `pkgconf` (Arch) ou `libpipewire-0.3-dev`, `libclang-dev` e `pkg-config` (Debian/Ubuntu). O espectro precisa do PipeWire com o WirePlumber rodando.
+Para compilar: o `gcc` (o SQLite do histórico é compilado junto), `libpipewire`, `clang` e `pkgconf` (Arch) ou `libpipewire-0.3-dev`, `libclang-dev` e `pkg-config` (Debian/Ubuntu). O espectro precisa do PipeWire com o WirePlumber rodando.
 
 ```sh
 cargo build --release --locked -p lucernad
@@ -58,6 +78,8 @@ O socket fica em `$XDG_RUNTIME_DIR/lucerna/lucernad.sock`; o systemd sobe o daem
 - `lucernad status`: o estado de todos os tópicos.
 - `lucernad watch system.stats`: cada mudança de um tópico, até o Ctrl+C.
 - `lucernad player org.mpris.MediaPlayer2.spotify`: escolhe o player cujo som o espectro mostra (sem nome, nenhum); `lucernad watch spectrum.bands` mostra as bandas.
+- `lucernad historico [busca]`: os 20 itens mais recentes da área de transferência (com busca, só os que casam).
+- `lucernad copiar ID`: põe um item do histórico na área de transferência.
 - `--json` (antes do subcomando): a saída em JSON, uma linha por estado.
 
 ## Desenvolvimento
@@ -70,10 +92,19 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy -p lucernad --no-default-features --all-targets --locked -- -D warnings
 cargo clippy -p lucernad --no-default-features --features system --all-targets --locked -- -D warnings
 cargo clippy -p lucernad --no-default-features --features spectrum --all-targets --locked -- -D warnings
+cargo clippy -p lucernad --no-default-features --features clipboard --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
 Para rodar o daemon sem o systemd: `cargo run -p lucernad -- serve`.
+
+A sonda do backend Wayland (`crates/lucernad-clipboard/tests/sonda.rs`) só roda num compositor isolado, nunca na sessão do usuário: o `tests/isolado.sh` sobe um sway headless dentro de um container (o cabeçalho do script traz o `docker run`).
+
+```sh
+docker run --rm -v "$PWD:/src:ro" -v <toolchain>:/tc:ro archlinux:latest \
+  bash -c 'pacman -Syu --noconfirm --needed sway wl-clipboard libcap gcc > /dev/null && setcap -r /usr/bin/sway \
+    && useradd -m t && runuser -u t -- env PATH=/tc/bin:$PATH bash /src/crates/lucernad-clipboard/tests/isolado.sh'
+```
 
 ## Ligação com o Lucerna
 
