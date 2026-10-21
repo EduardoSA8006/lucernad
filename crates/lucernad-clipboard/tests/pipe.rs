@@ -1,4 +1,4 @@
-use std::io::{Write, pipe};
+use std::io::{Read, Write, pipe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -32,6 +32,19 @@ fn over_limit_is_refused() {
     assert_eq!(got, Err(ReadError::TooBig));
     assert!(start.elapsed() < Duration::from_secs(1));
     handle.join().unwrap();
+}
+
+#[test]
+fn reads_at_most_one_byte_past_the_limit() {
+    let (reader, mut writer) = pipe().unwrap();
+    writer.write_all(&[b'z'; 100]).unwrap();
+    drop(writer);
+    let mut rest = reader.try_clone().unwrap();
+    let got = read_pipe(reader, 10, Instant::now() + Duration::from_secs(5));
+    assert_eq!(got, Err(ReadError::TooBig));
+    let mut left = Vec::new();
+    rest.read_to_end(&mut left).unwrap();
+    assert_eq!(left.len(), 100 - 11);
 }
 
 #[test]

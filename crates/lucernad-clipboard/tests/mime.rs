@@ -24,6 +24,14 @@ fn secret_wins_over_everything() {
         choose(&m(&["image/png", "application/x-kde-passwordManagerHint"])),
         Choice::Secret
     );
+    assert_eq!(
+        choose(&m(&["text/plain", "X-KDE-PasswordManagerHint"])),
+        Choice::Secret
+    );
+    assert_eq!(
+        choose(&m(&["text/plain", "x-kde-passwordmanagerhint"])),
+        Choice::Secret
+    );
 }
 
 #[test]
@@ -48,6 +56,18 @@ fn image_before_files_before_text() {
     assert_eq!(
         choose(&m(&["STRING", "text/plain", "UTF8_STRING"])),
         read(Kind::Text, "text/plain")
+    );
+}
+
+#[test]
+fn mimes_ignore_case_but_keep_the_offered_spelling() {
+    assert_eq!(
+        choose(&m(&["text/html", "text/plain;charset=UTF-8"])),
+        read(Kind::Text, "text/plain;charset=UTF-8")
+    );
+    assert_eq!(
+        choose(&m(&["text/plain", "Image/JPEG", "IMAGE/PNG"])),
+        read(Kind::Image, "IMAGE/PNG")
     );
 }
 

@@ -85,23 +85,28 @@ pub enum Choice {
 
 /// Escolhe o que ler de uma cópia: o sensível primeiro, depois a cópia nossa,
 /// `image/png`, outra `image/*` na ordem oferecida, `text/uri-list` e os
-/// [`TEXT_MIMES`] na ordem deles.
+/// [`TEXT_MIMES`] na ordem deles. Os tipos se comparam sem diferenciar
+/// maiúsculas (RFC 2045); o `mime` escolhido sai como foi oferecido, para
+/// pedir o pipe com ele.
 pub fn choose(mimes: &[String]) -> Choice {
-    let has = |wanted: &str| mimes.iter().any(|mime| mime == wanted);
-    if SECRET_MIMES.iter().any(|secret| has(secret)) {
-        return Choice::Secret;
-    }
-    if has(OWN_MIME) {
-        return Choice::Own;
-    }
-    let image = if has(PNG) {
-        Some(PNG)
-    } else {
+    let find = |wanted: &str| {
         mimes
             .iter()
+            .find(|mime| mime.eq_ignore_ascii_case(wanted))
             .map(String::as_str)
-            .find(|mime| mime.starts_with("image/"))
     };
+    if SECRET_MIMES.iter().any(|secret| find(secret).is_some()) {
+        return Choice::Secret;
+    }
+    if find(OWN_MIME).is_some() {
+        return Choice::Own;
+    }
+    let image = find(PNG).or_else(|| {
+        mimes.iter().map(String::as_str).find(|mime| {
+            mime.get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+        })
+    });
     let read = |kind, mime: &str| Choice::Read {
         kind,
         mime: mime.to_string(),
@@ -109,10 +114,10 @@ pub fn choose(mimes: &[String]) -> Choice {
     if let Some(mime) = image {
         return read(Kind::Image, mime);
     }
-    if has(URI_LIST) {
-        return read(Kind::Files, URI_LIST);
+    if let Some(mime) = find(URI_LIST) {
+        return read(Kind::Files, mime);
     }
-    match TEXT_MIMES.iter().find(|mime| has(mime)) {
+    match TEXT_MIMES.iter().find_map(|wanted| find(wanted)) {
         Some(mime) => read(Kind::Text, mime),
         None => Choice::Nothing,
     }
