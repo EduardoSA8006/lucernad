@@ -56,6 +56,10 @@ pub fn band_of(freq: f32) -> Option<usize> {
 
 /// Os módulos dos `FFT_SIZE/2 + 1` bins de `window`, em dBFS, com janela de
 /// Hann: um seno de amplitude 1 no centro de um bin dá 0 dB.
+///
+/// Usa as **primeiras** `FFT_SIZE` amostras de `window` e preenche com zeros
+/// à direita se faltarem (o contrário do [`Analyzer::frame`], que usa as
+/// últimas e preenche à esquerda).
 pub fn magnitudes_db(window: &[f32]) -> Vec<f32> {
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(FFT_SIZE);
@@ -83,14 +87,11 @@ fn spectrum_db(fft: &dyn Fft<f32>, window: &[f32]) -> Vec<f32> {
 pub fn bands_db(mags_db: &[f32], rate: u32) -> [f32; BANDS] {
     let edges = band_edges();
     let bin_hz = rate as f32 / FFT_SIZE as f32;
-    let nyquist = rate as f32 / 2.0;
     std::array::from_fn(|b| {
         let (lo, hi) = (edges[b], edges[b + 1]);
         let center = (lo * hi).sqrt();
         let first = (lo / bin_hz).ceil() as usize;
-        let level = if lo >= nyquist {
-            MIN_DB
-        } else if let Some(max) = (first..mags_db.len())
+        let level = if let Some(max) = (first..mags_db.len())
             .take_while(|&k| (k as f32) * bin_hz < hi)
             .map(|k| mags_db[k])
             .reduce(f32::max)
@@ -101,6 +102,7 @@ pub fn bands_db(mags_db: &[f32], rate: u32) -> [f32; BANDS] {
             let i = pos.floor() as usize;
             match (mags_db.get(i), mags_db.get(i + 1)) {
                 (Some(a), Some(c)) => a + (c - a) * (pos - i as f32),
+                // Acima de Nyquist não há bin vizinho.
                 _ => MIN_DB,
             }
         };
