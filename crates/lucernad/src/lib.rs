@@ -171,6 +171,15 @@ fn history_command() -> lucerna_cli::CliCommand {
     }
 }
 
+/// Troca os caracteres de controle (C0, DEL e C1) por U+FFFD: um texto copiado
+/// com escapes ANSI não mexe no terminal de quem lê o histórico.
+#[cfg(feature = "clipboard")]
+fn plain(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 /// Uma linha `id  tipo  prévia` por item; imagem mostra `LxA mime`.
 #[cfg(feature = "clipboard")]
 fn render_history(v: &serde_json::Value) -> String {
@@ -181,16 +190,16 @@ fn render_history(v: &serde_json::Value) -> String {
     items
         .iter()
         .map(|i| {
-            let kind = i["kind"].as_str().unwrap_or("?");
+            let kind = plain(i["kind"].as_str().unwrap_or("?"));
             let what = if kind == "image" {
                 format!(
                     "{}×{} {}",
                     i["width"].as_u64().unwrap_or(0),
                     i["height"].as_u64().unwrap_or(0),
-                    i["mime"].as_str().unwrap_or("")
+                    plain(i["mime"].as_str().unwrap_or(""))
                 )
             } else {
-                i["preview"].as_str().unwrap_or("").to_string()
+                plain(i["preview"].as_str().unwrap_or(""))
             };
             format!("{}  {kind}  {what}", i["id"].as_u64().unwrap_or(0))
         })
@@ -224,5 +233,31 @@ fn copy_command() -> lucerna_cli::CliCommand {
             })
         },
         render: None,
+    }
+}
+
+#[cfg(all(test, feature = "clipboard"))]
+mod tests {
+    use super::render_history;
+    use serde_json::json;
+
+    #[test]
+    fn history_lines_have_no_control_characters() {
+        let v = json!({"items": [
+            {"id": 3, "kind": "text", "preview": "a\u{1b}[2Jb\u{9b}c\nd"},
+            {"id": 2, "kind": "image", "width": 640, "height": 480, "mime": "image/png"},
+            {"id": 1, "kind": "files", "preview": "x.pdf"},
+        ]});
+        let out = render_history(&v);
+        assert_eq!(
+            out,
+            "3  text  a\u{FFFD}[2Jb\u{FFFD}c\u{FFFD}d\n2  image  640×480 image/png\n1  files  x.pdf"
+        );
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'));
+    }
+
+    #[test]
+    fn empty_history_says_so() {
+        assert_eq!(render_history(&json!({"items": []})), "Nada no histórico.");
     }
 }
