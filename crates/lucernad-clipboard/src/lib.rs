@@ -6,3 +6,7 @@
 
 pub mod mime;
 pub mod pipe;
+pub mod search;
+#[cfg(feature = "testing")]
+pub mod testing;
+pub mod thumb;
