@@ -32,9 +32,10 @@ pub const RANGE_DB: f32 = 54.0;
 /// A faixa mostrada nas bandas graves (as de [`fft_size_of`] `LOW_FFT_SIZE`),
 /// em dB abaixo da referência: menor que `RANGE_DB`, para o bumbo saltar.
 pub const BASS_RANGE_DB: f32 = 36.0;
-/// Cada banda grave fica com pelo menos esta parte da vizinha de cima: sem
-/// buraco quando a música não tem sub-grave e a energia começa logo acima.
-pub const BASS_BORROW: f32 = 0.5;
+/// Cada banda grave fica com pelo menos esta parte da primeira banda que não
+/// é grave: sem buraco quando a música não tem sub-grave e a energia começa
+/// logo acima.
+pub const BASS_BORROW: f32 = 0.6;
 /// A inclinação em volta de 1 kHz, em dB por oitava.
 pub const TILT_DB_PER_OCTAVE: f32 = 1.5;
 /// A parte do caminho até o alvo que o valor sobe por quadro.
@@ -215,14 +216,18 @@ pub fn levels(bands_db: &[f32; BANDS], reference_db: f32) -> [f32; BANDS] {
     })
 }
 
-/// O empréstimo dos graves: de cima para baixo, cada banda grave fica com
-/// pelo menos `BASS_BORROW` da vizinha de cima (já emprestada).
+/// O empréstimo dos graves: cada banda grave fica com pelo menos
+/// `BASS_BORROW` da primeira banda que não é grave. Direto, sem cascata: em
+/// cascata o empréstimo cairia pela metade a cada banda e não protegeria as
+/// mais baixas.
 pub fn borrow_bass(levels: &[f32; BANDS]) -> [f32; BANDS] {
+    let Some(first) = (0..BANDS).find(|&b| fft_size_of(b) != LOW_FFT_SIZE) else {
+        return *levels;
+    };
+    let floor = BASS_BORROW * levels[first];
     let mut out = *levels;
-    for b in (0..BANDS - 1).rev() {
-        if fft_size_of(b) == LOW_FFT_SIZE {
-            out[b] = out[b].max(BASS_BORROW * out[b + 1]);
-        }
+    for level in &mut out[..first] {
+        *level = level.max(floor);
     }
     out
 }

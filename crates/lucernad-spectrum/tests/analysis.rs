@@ -233,18 +233,21 @@ fn bass_bands_have_a_shorter_range() {
 }
 
 #[test]
-fn bass_borrows_from_the_band_above() {
+fn bass_borrows_from_the_first_band_above() {
     let bass = (0..BANDS)
         .filter(|&b| fft_size_of(b) == LOW_FFT_SIZE)
         .count();
-    // Graves em zero e a primeira banda de cima em 0,8: em cascata, cada
-    // grave fica com BASS_BORROW da vizinha (0,4, 0,2, 0,1…).
+    // Graves em zero e a primeira banda de cima em 0,8: todas as graves ficam
+    // com BASS_BORROW dela, sem decair (em cascata, a banda 0 ficaria com
+    // 0,8·0,6⁶ ≈ 0,04, um pontinho).
     let mut input = [0.0; BANDS];
     input[bass] = 0.8;
     let out = borrow_bass(&input);
     for (b, level) in out.iter().enumerate().take(bass) {
-        let expected = 0.8 * BASS_BORROW.powi((bass - b) as i32);
-        assert!((level - expected).abs() < 1e-6, "banda {b}: {level}");
+        assert!(
+            (level - 0.8 * BASS_BORROW).abs() < 1e-6,
+            "banda {b}: {level}"
+        );
     }
     // Uma banda grave acima do empréstimo fica como está; as de cima não mudam.
     let mut input = [0.3; BANDS];
@@ -252,10 +255,11 @@ fn bass_borrows_from_the_band_above() {
     let out = borrow_bass(&input);
     assert_eq!(out[0], 0.9);
     assert_eq!(out[bass..], input[bass..]);
-    // As de cima nunca emprestam.
+    // Só a primeira banda de cima conta: as outras nunca emprestam.
     let mut input = [0.0; BANDS];
+    input[bass + 1] = 1.0;
     input[BANDS - 1] = 1.0;
-    assert_eq!(borrow_bass(&input)[BANDS - 2], 0.0);
+    assert_eq!(borrow_bass(&input)[..bass], [0.0; BANDS][..bass]);
 }
 
 #[test]
