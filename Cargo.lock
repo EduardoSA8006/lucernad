@@ -613,6 +613,8 @@ dependencies = [
  "lucerna-ipc",
  "lucerna-manifest",
  "lucerna-service",
+ "lucernad-core",
+ "lucernad-spectrum",
  "lucernad-system",
  "serde_json",
  "tempfile",

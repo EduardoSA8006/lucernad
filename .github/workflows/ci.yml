@@ -76,6 +76,9 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           # O lucernad sem nenhum módulo também compila limpo.
           cargo clippy -p lucernad --no-default-features --all-targets --locked -- -D warnings
+          # E com cada módulo sozinho.
+          cargo clippy -p lucernad --no-default-features --features system --all-targets --locked -- -D warnings
+          cargo clippy -p lucernad --no-default-features --features spectrum --all-targets --locked -- -D warnings
 
       - name: test
         if: matrix.job == 'test'

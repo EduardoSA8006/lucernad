@@ -5,8 +5,9 @@
 //!
 //! O `serve` daqui lê a máquina de verdade. Nenhum teste assina o
 //! `system.gpus` (nem pelo `status`, que assina todos os tópicos): com uma
-//! NVIDIA em uso na máquina, isso chamaria a NVML de verdade.
-#![cfg(feature = "system")]
+//! NVIDIA em uso na máquina, isso chamaria a NVML de verdade. O ambiente
+//! limpo também deixa o `spectrum` sem o PipeWire e o D-Bus do usuário.
+#![cfg(any(feature = "system", feature = "spectrum"))]
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -14,7 +15,9 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(feature = "system")]
+use serde_json::json;
 
 /// O binário com um ambiente limpo: só `HOME`, `XDG_RUNTIME_DIR` e `PATH`.
 fn lucernad(dir: &Path) -> Command {
@@ -148,20 +151,48 @@ fn cli_help_status_and_exit_codes() {
     assert!(String::from_utf8_lossy(&out.stdout).contains(env!("CARGO_PKG_VERSION")));
 
     let _srv = serve(t.path(), 60_000);
-    // O `watch` no lugar do `status`, que assinaria o `system.gpus`.
-    let (_w, _rx, info) = watch_json(t.path(), "system.info");
-    assert!(info["data"]["hostname"].is_string(), "{info}");
-    let (_w, _rx, status) = watch_json(t.path(), "system.status");
-    assert_eq!(
-        status["data"],
-        json!({"available": true, "error": null}),
-        "{status}"
-    );
-    let (_w, rx, stats) = watch_json(t.path(), "system.stats");
-    assert_eq!(stats["data"], Value::Null, "nada antes da primeira amostra");
-    assert!(line(&rx)["data"]["memTotal"].as_u64().unwrap() > 0);
+    #[cfg(feature = "system")]
+    {
+        // O `watch` no lugar do `status`, que assinaria o `system.gpus`.
+        let (_w, _rx, info) = watch_json(t.path(), "system.info");
+        assert!(info["data"]["hostname"].is_string(), "{info}");
+        let (_w, _rx, status) = watch_json(t.path(), "system.status");
+        assert_eq!(
+            status["data"],
+            json!({"available": true, "error": null}),
+            "{status}"
+        );
+        let (_w, rx, stats) = watch_json(t.path(), "system.stats");
+        assert_eq!(stats["data"], Value::Null, "nada antes da primeira amostra");
+        assert!(line(&rx)["data"]["memTotal"].as_u64().unwrap() > 0);
+    }
+    #[cfg(feature = "spectrum")]
+    {
+        // Também pelo `watch`: o `status` assinaria o `system.gpus`.
+        let (_w, _rx, v) = watch_json(t.path(), "spectrum.status");
+        assert_eq!(v["data"]["capturing"], false, "{v}");
+        assert!(v["data"]["available"].is_boolean(), "{v}");
+        let out = lucernad(t.path())
+            .args(["player", "org.mpris.MediaPlayer2.teste"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = lucernad(t.path())
+            .args(["player", "spotify"])
+            .output()
+            .unwrap();
+        assert_ne!(out.status.code(), Some(0));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("player precisa ser"), "stderr: {err}");
+    }
 }
 
+#[cfg(feature = "system")]
 #[test]
 fn idle_exit() {
     let t = tempfile::tempdir().unwrap();
@@ -199,6 +230,7 @@ fn sigterm_exits_clean() {
 /// Não dá para travar um `statvfs` de verdade no CI: confere só que o `serve`
 /// medindo os discos sai com 0 no `SIGTERM`. A garantia de que uma montagem
 /// travada não segura a saída vem do `detached` (thread solta, Tarefa 3).
+#[cfg(feature = "system")]
 #[test]
 fn exits_even_with_a_stuck_thread() {
     let t = tempfile::tempdir().unwrap();
