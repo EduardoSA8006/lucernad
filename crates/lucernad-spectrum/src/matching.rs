@@ -3,7 +3,7 @@
 //!
 //! As regras, na ordem: o nó é do player se o PID do client é o do dono do
 //! nome ou um descendente dele (a busca parte do pai quando o dono é uma
-//! ponte conhecida); sem casamento por PID, a reserva compara o executável do
+//! ponte conhecida); sem o dono no `/proc`, a reserva compara o executável do
 //! client com o nome do player, só com igualdade exata e só se todos os nós
 //! que casam vierem de um mesmo processo.
 
@@ -21,6 +21,9 @@ pub const BRIDGES: &[&str] = &["plasma-browser-integration-host"];
 
 /// Quantos passos o [`is_descendant`] sobe no máximo pelos `ppid`.
 pub const MAX_DEPTH: usize = 64;
+
+/// O executável das raízes genéricas, das quais a busca por PID não parte.
+const GENERIC_ROOT: &str = "systemd";
 
 /// O prefixo dos nomes D-Bus dos players MPRIS.
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
@@ -107,17 +110,21 @@ pub fn is_descendant(procs: &dyn Processes, pid: u32, ancestor: u32) -> bool {
     false
 }
 
-/// De onde a busca por PID parte: o dono do nome; o pai dele se o dono é uma
-/// ponte ([`BRIDGES`]), e `None` se esse pai for `≤ 1`. Um dono ausente do
-/// `/proc` vale como raiz, para a regra do PID igual funcionar sem o `/proc`
-/// (como no container).
+/// De onde a busca por PID parte: o dono do nome, ou o pai dele se o dono é
+/// uma ponte ([`BRIDGES`]). `None` quando essa raiz é genérica: `pid ≤ 1` ou
+/// um processo cujo executável é o `systemd` (o init ou o `systemd --user`,
+/// que adota as pontes órfãs), porque descender dela casaria quase tudo. Um
+/// dono ausente do `/proc` vale como raiz, para a regra do PID igual
+/// funcionar sem o `/proc` (como no container).
 pub fn search_root(procs: &dyn Processes, owner: u32) -> Option<u32> {
-    match procs.get(owner) {
-        Some(process) if BRIDGES.contains(&process.exe.as_str()) => {
-            (process.ppid > 1).then_some(process.ppid)
-        }
-        _ => Some(owner),
+    let root = match procs.get(owner) {
+        Some(process) if BRIDGES.contains(&process.exe.as_str()) => process.ppid,
+        _ => owner,
+    };
+    if root <= 1 || procs.get(root).is_some_and(|p| p.exe == GENERIC_ROOT) {
+        return None;
     }
+    Some(root)
 }
 
 /// Os nomes do player para a reserva: o fim do nome D-Bus depois de
@@ -154,6 +161,12 @@ pub fn match_nodes(id: &Identity, nodes: &[OutputNode], procs: &dyn Processes) -
         }
     }
 
+    // A reserva só vale quando não dá para seguir o dono pelo /proc (sem PID,
+    // ou fora dele, como num Flatpak ou no container): com o dono visível, ela
+    // casaria o nó de outra instância do mesmo app.
+    if id.owner_pid.is_some_and(|owner| procs.get(owner).is_some()) {
+        return Vec::new();
+    }
     let names = player_names(&id.name, id.desktop_entry.as_deref());
     let matched: Vec<&OutputNode> = nodes
         .iter()

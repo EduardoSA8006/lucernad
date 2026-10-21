@@ -124,8 +124,11 @@ impl Bus for SessionBus {
             let Some(conn) = self.connection().await else {
                 return id;
             };
-            id.owner_pid = self.owner_pid(&conn, &bus_name).await;
-            id.desktop_entry = self.desktop_entry(&conn, &bus_name).await;
+            // Juntos, para um prazo de fora cobrir o total sem perder o PID.
+            (id.owner_pid, id.desktop_entry) = tokio::join!(
+                self.owner_pid(&conn, &bus_name),
+                self.desktop_entry(&conn, &bus_name),
+            );
             id
         })
     }

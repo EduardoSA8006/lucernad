@@ -92,24 +92,38 @@ fn reserve_needs_one_process() {
 
 #[test]
 fn node_without_client_info_never_matches() {
-    let ids = [
-        id("org.mpris.MediaPlayer2.spotify", Some(153543)),
-        id("org.mpris.MediaPlayer2.brave.instance119549", Some(119549)),
-        id(
-            "org.mpris.MediaPlayer2.plasma-browser-integration",
-            Some(120143),
-        ),
-        id("org.mpris.MediaPlayer2.spotify", None),
-        id("org.mpris.MediaPlayer2.spotify", Some(999_999)),
-        id("org.mpris.MediaPlayer2.systemd", Some(1)),
-        id("org.mpris.MediaPlayer2.laco", Some(170000)),
-    ];
-    for id in ids {
-        assert!(
-            !match_nodes(&id, &nodes(), &procs()).contains(&210),
-            "{id:?} casou o nó sem info do client"
-        );
-    }
+    // O mpv é dono do nome e está no /proc; o único nó que poderia ser dele
+    // (o 210) ainda não tem o info do client.
+    let mpv = id("org.mpris.MediaPlayer2.mpv", Some(180000));
+    assert_eq!(match_nodes(&mpv, &nodes(), &procs()), Vec::<u64>::new());
+    let mpv = id("org.mpris.MediaPlayer2.mpv", None);
+    assert_eq!(match_nodes(&mpv, &nodes(), &procs()), Vec::<u64>::new());
+}
+
+#[test]
+fn reserve_skips_a_visible_owner() {
+    // Dois mpv: o exibido (180000, no /proc) ainda sem nó com client
+    // conhecido; o outro (180001) tocando. A reserva casaria o outro.
+    let mut nodes = nodes();
+    nodes.push(node(103, 240, Some(180001), Some("mpv")));
+    let id = id("org.mpris.MediaPlayer2.mpv", Some(180000));
+    assert_eq!(match_nodes(&id, &nodes, &procs()), Vec::<u64>::new());
+}
+
+#[test]
+fn generic_root_never_matches() {
+    assert_eq!(search_root(&procs(), 1), None);
+    assert_eq!(search_root(&procs(), 1000), None);
+    assert_eq!(search_root(&procs(), 190000), None);
+
+    let init = id("org.mpris.MediaPlayer2.systemd", Some(1));
+    assert_eq!(match_nodes(&init, &nodes(), &procs()), Vec::<u64>::new());
+    // Uma ponte órfã, adotada pelo systemd --user.
+    let orphan = id(
+        "org.mpris.MediaPlayer2.plasma-browser-integration",
+        Some(190000),
+    );
+    assert_eq!(match_nodes(&orphan, &nodes(), &procs()), Vec::<u64>::new());
 }
 
 #[test]
