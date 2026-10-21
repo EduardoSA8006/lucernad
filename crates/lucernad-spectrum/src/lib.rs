@@ -5,7 +5,9 @@
 //! player sem mexer no roteamento; nos testes, o dublê é o
 //! `testing::FakeBackend` (feature `testing`).
 
+pub mod analysis;
 pub mod backend;
+pub mod mix;
 pub mod pipewire;
 #[cfg(feature = "testing")]
 pub mod testing;

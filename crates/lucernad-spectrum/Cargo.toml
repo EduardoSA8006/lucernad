@@ -16,6 +16,7 @@ testing = []
 
 [dependencies]
 pipewire.workspace = true
+rustfft.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

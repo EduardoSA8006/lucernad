@@ -26,6 +26,7 @@ rustix = { version = "1", features = ["fs"] }
 nvml-wrapper = "0.11"
 tempfile = "3"
 pipewire = "0.10"
+rustfft = "6"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
