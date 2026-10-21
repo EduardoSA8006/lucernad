@@ -111,6 +111,14 @@ fn reserve_skips_a_visible_owner() {
 }
 
 #[test]
+fn flatpak_proxy_owner_allows_the_reserve() {
+    // No Flatpak, o dono do nome é o xdg-dbus-proxy, visível no /proc mas
+    // irmão do app: conta como dono não visível e a reserva vale.
+    let id = id("org.mpris.MediaPlayer2.spotify", Some(200000));
+    assert_eq!(match_nodes(&id, &nodes(), &procs()), vec![121]);
+}
+
+#[test]
 fn generic_root_never_matches() {
     assert_eq!(search_root(&procs(), 1), None);
     assert_eq!(search_root(&procs(), 1000), None);

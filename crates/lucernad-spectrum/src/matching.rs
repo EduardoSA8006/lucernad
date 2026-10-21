@@ -3,7 +3,7 @@
 //!
 //! As regras, na ordem: o nó é do player se o PID do client é o do dono do
 //! nome ou um descendente dele (a busca parte do pai quando o dono é uma
-//! ponte conhecida); sem o dono no `/proc`, a reserva compara o executável do
+//! ponte conhecida); sem o dono no `/proc` (ou com o proxy do Flatpak), a reserva compara o executável do
 //! client com o nome do player, só com igualdade exata e só se todos os nós
 //! que casam vierem de um mesmo processo.
 
@@ -24,6 +24,10 @@ pub const MAX_DEPTH: usize = 64;
 
 /// O executável das raízes genéricas, das quais a busca por PID não parte.
 const GENERIC_ROOT: &str = "systemd";
+
+/// O executável que é dono dos nomes D-Bus de um app Flatpak: está no
+/// `/proc` do host, mas é irmão do app, não ancestral.
+const FLATPAK_PROXY: &str = "xdg-dbus-proxy";
 
 /// O prefixo dos nomes D-Bus dos players MPRIS.
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
@@ -162,9 +166,10 @@ pub fn match_nodes(id: &Identity, nodes: &[OutputNode], procs: &dyn Processes) -
     }
 
     // A reserva só vale quando não dá para seguir o dono pelo /proc (sem PID,
-    // ou fora dele, como num Flatpak ou no container): com o dono visível, ela
-    // casaria o nó de outra instância do mesmo app.
-    if id.owner_pid.is_some_and(|owner| procs.get(owner).is_some()) {
+    // fora dele, como no container, ou o proxy do Flatpak, irmão do app): com
+    // o dono visível, ela casaria o nó de outra instância do mesmo app.
+    let visible = |owner| procs.get(owner).is_some_and(|p| p.exe != FLATPAK_PROXY);
+    if id.owner_pid.is_some_and(visible) {
         return Vec::new();
     }
     let names = player_names(&id.name, id.desktop_entry.as_deref());
