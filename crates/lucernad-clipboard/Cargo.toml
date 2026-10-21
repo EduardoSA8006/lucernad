@@ -19,6 +19,8 @@ rustix.workspace = true
 unicode-normalization.workspace = true
 image.workspace = true
 lucerna-paths.workspace = true
+lucerna-service.workspace = true
+lucernad-core.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -30,6 +32,7 @@ wayland-protocols-wlr.workspace = true
 [dev-dependencies]
 # Os testes deste crate usam o módulo `testing`.
 lucernad-clipboard = { path = ".", features = ["testing"] }
+lucerna-ipc.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true
 

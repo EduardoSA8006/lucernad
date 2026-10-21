@@ -77,6 +77,14 @@ fn fake_serves_and_cancels() {
     assert_eq!(fake.owned(), Some(vec!["text/plain".to_string()]));
     assert_eq!(fake.paste("text/plain"), Some(b"x".to_vec()));
     assert_eq!(fake.paste("image/png"), None);
+    // Como o compositor de verdade, a nossa fonte volta como seleção comum.
+    assert_eq!(
+        session.events.try_recv(),
+        Ok(Event::Selection {
+            offer: 1,
+            mimes: vec!["text/plain".to_string()],
+        })
+    );
 
     fake.cancel();
     assert_eq!(session.events.try_recv(), Ok(Event::Cancelled));

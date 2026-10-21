@@ -513,6 +513,11 @@ impl Store {
         }
     }
 
+    /// Onde o histórico mora agora.
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
     fn images(&self) -> PathBuf {
         images_in(&self.files_dir())
     }

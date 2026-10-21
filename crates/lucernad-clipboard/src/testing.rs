@@ -4,10 +4,12 @@ use std::collections::HashMap;
 use std::io::{Cursor, PipeReader, PipeWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use image::{ImageFormat, RgbImage};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
+use crate::ClipboardConfig;
 use crate::backend::{Backend, Control, Event, Session, Source};
 use crate::wayland::SELECTION_CHANGED;
 
@@ -85,6 +87,9 @@ struct FakeState {
     owned: Option<Source>,
     /// As pontas de escrita das cópias presas, que nunca fecham.
     stuck: Vec<PipeWriter>,
+    /// As cópias seguradas: a ponta de escrita e os bytes, até o
+    /// [`FakeBackend::release`].
+    held: Vec<(PipeWriter, Vec<u8>)>,
     /// A sessão aberta por último, enquanto viva.
     current: Option<FakeSession>,
 }
@@ -92,7 +97,18 @@ struct FakeState {
 struct FakeSelection {
     offer: u64,
     data: HashMap<String, Vec<u8>>,
-    stuck: bool,
+    pipe: Pipe,
+}
+
+/// Como o `receive` de uma seleção entrega os bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pipe {
+    /// Escreve tudo e fecha.
+    Normal,
+    /// Nunca escreve nem fecha.
+    Stuck,
+    /// Escreve tudo e fecha só no [`FakeBackend::release`].
+    Held,
 }
 
 struct FakeSession {
@@ -106,6 +122,21 @@ impl FakeState {
         if let Some(events) = self.current.as_ref().and_then(|s| s.events.as_ref()) {
             let _ = events.send(event);
         }
+    }
+
+    /// Troca a seleção e manda o `Selection` à sessão aberta; devolve o
+    /// número da oferta.
+    fn set_selection(
+        &mut self,
+        mimes: Vec<String>,
+        data: HashMap<String, Vec<u8>>,
+        pipe: Pipe,
+    ) -> u64 {
+        self.next += 1;
+        let offer = self.next;
+        self.selection = Some(FakeSelection { offer, data, pipe });
+        self.send(Event::Selection { offer, mimes });
+        offer
     }
 }
 
@@ -137,25 +168,37 @@ impl FakeBackend {
             .iter()
             .map(|(mime, bytes)| (mime.to_string(), bytes.to_vec()))
             .collect();
-        self.select(mimes, data, false)
+        self.select(mimes, data, Pipe::Normal)
+    }
+
+    /// Como o [`FakeBackend::copy`], mas o pipe só recebe os bytes (e fecha)
+    /// no [`FakeBackend::release`]: o teste sabe que a leitura não acabou.
+    pub fn copy_held(&self, mimes: &[&str], data: &[(&str, &[u8])]) -> u64 {
+        let data = data
+            .iter()
+            .map(|(mime, bytes)| (mime.to_string(), bytes.to_vec()))
+            .collect();
+        self.select(mimes, data, Pipe::Held)
+    }
+
+    /// Entrega os bytes das cópias seguradas e fecha os pipes delas.
+    pub fn release(&self) {
+        for (mut writer, bytes) in std::mem::take(&mut self.lock().held) {
+            std::thread::spawn(move || {
+                let _ = writer.write_all(&bytes);
+            });
+        }
     }
 
     /// Como o [`FakeBackend::copy`], mas o `receive` devolve um pipe que
     /// nunca fecha (o app que não termina de escrever).
     pub fn copy_stuck(&self, mimes: &[&str]) -> u64 {
-        self.select(mimes, HashMap::new(), true)
+        self.select(mimes, HashMap::new(), Pipe::Stuck)
     }
 
-    fn select(&self, mimes: &[&str], data: HashMap<String, Vec<u8>>, stuck: bool) -> u64 {
-        let mut state = self.lock();
-        state.next += 1;
-        let offer = state.next;
-        state.selection = Some(FakeSelection { offer, data, stuck });
-        state.send(Event::Selection {
-            offer,
-            mimes: mimes.iter().map(|m| m.to_string()).collect(),
-        });
-        offer
+    fn select(&self, mimes: &[&str], data: HashMap<String, Vec<u8>>, pipe: Pipe) -> u64 {
+        let mimes = mimes.iter().map(|m| m.to_string()).collect();
+        self.lock().set_selection(mimes, data, pipe)
     }
 
     /// Outro app copiou por cima da nossa fonte: `Cancelled`, se havia uma.
@@ -268,21 +311,32 @@ impl Control for FakeControl {
             return Err(SELECTION_CHANGED.to_string());
         };
         let (reader, mut writer) = std::io::pipe().map_err(|e| e.to_string())?;
-        if selection.stuck {
-            state.stuck.push(writer);
-        } else {
-            let bytes = selection.data.get(mime).cloned().unwrap_or_default();
-            std::thread::spawn(move || {
-                let _ = writer.write_all(&bytes);
-            });
+        let bytes = selection.data.get(mime).cloned().unwrap_or_default();
+        match selection.pipe {
+            Pipe::Stuck => state.stuck.push(writer),
+            Pipe::Held => state.held.push((writer, bytes)),
+            Pipe::Normal => {
+                std::thread::spawn(move || {
+                    let _ = writer.write_all(&bytes);
+                });
+            }
         }
         Ok(reader)
     }
 
+    /// Como o compositor de verdade, a nossa fonte volta (eco) como uma
+    /// seleção comum, com os tipos dela.
     fn offer(&self, source: Source) {
         let mut state = self.lock();
         if state.current.as_ref().is_some_and(|s| s.id == self.id) {
+            let mimes = source.offers.iter().map(|(m, _)| m.clone()).collect();
+            let data = source
+                .offers
+                .iter()
+                .map(|(m, bytes)| (m.clone(), bytes.to_vec()))
+                .collect();
             state.owned = Some(source);
+            state.set_selection(mimes, data, Pipe::Normal);
         }
     }
 }
@@ -297,4 +351,23 @@ impl Drop for FakeControl {
             state.owned = None;
         }
     }
+}
+
+/// O módulo com o `backend` dublê e tudo dentro de `dir`: o histórico em
+/// `dir/data`, o `XDG_RUNTIME_DIR` em `dir/run`, a exibição `wayland-teste`
+/// e prazos curtos.
+pub fn fake_config(backend: FakeBackend, dir: &Path) -> ClipboardConfig {
+    ClipboardConfig {
+        backend: Arc::new(backend),
+        data_dir: Some(dir.join("data")),
+        runtime_dir: Some(dir.join("run")),
+        display_env: Some("wayland-teste".to_string()),
+        configure_wait: Duration::from_millis(200),
+        retry: Duration::from_millis(100),
+    }
+}
+
+/// O módulo sem Wayland de verdade, para os testes do binário.
+pub fn quiet_config(dir: &Path) -> ClipboardConfig {
+    fake_config(FakeBackend::new(), dir)
 }

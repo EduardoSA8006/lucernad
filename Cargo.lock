@@ -797,8 +797,11 @@ name = "lucernad-clipboard"
 version = "0.1.0"
 dependencies = [
  "image",
+ "lucerna-ipc",
  "lucerna-paths",
+ "lucerna-service",
  "lucernad-clipboard",
+ "lucernad-core",
  "rusqlite",
  "rustix",
  "serde_json",
