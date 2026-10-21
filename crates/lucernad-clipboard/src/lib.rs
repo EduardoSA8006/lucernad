@@ -15,9 +15,10 @@
 //! (depois de um `clipboard.copy`), com um `WorkGuard` segurando o daemon.
 
 use std::collections::VecDeque;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use lucerna_paths::{AppPaths, Env};
 use lucerna_service::{RpcError, ServerBuilder, Topic, WorkGuard, WorkTracker};
 use lucernad_core::{Detached, ModuleTask, detached, publish_changed};
+use rustix::fs::OFlags;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -209,6 +211,8 @@ struct Shared {
     revision: AtomicU64,
     status: Mutex<Status>,
     copies: mpsc::UnboundedSender<CopyRequest>,
+    /// A vez de preparar uma imagem (uma por vez).
+    images: Mutex<()>,
 }
 
 impl Shared {
@@ -454,6 +458,10 @@ impl Ctx {
             return Ok(None);
         };
         drop(db);
+        // Uma imagem por vez: a decodificação da miniatura pode pedir centenas
+        // de MiB, e uma rajada de cópias não multiplica isso.
+        let _one = matches!(clip, NewClip::Image { .. })
+            .then(|| self.shared.images.lock().unwrap_or_else(|e| e.into_inner()));
         prepare(clip, &files_dir).map(Some)
     }
 
@@ -685,7 +693,20 @@ fn optional_flag(p: &Value, key: &str, text: &str) -> Result<Option<bool>, RpcEr
 /// dos bytes (a extensão pode mentir).
 fn read_image(path: &Path) -> Result<(String, Vec<u8>), String> {
     let shown = path.display();
-    let file = File::open(path).map_err(|e| format!("{shown}: {e}"))?;
+    // Sem bloquear na abertura (um FIFO prenderia a chamada); só o arquivo
+    // comum é lido.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(OFlags::NONBLOCK.bits() as i32)
+        .open(path)
+        .map_err(|e| format!("{shown}: {e}"))?;
+    let regular = file
+        .metadata()
+        .map_err(|e| format!("{shown}: {e}"))?
+        .is_file();
+    if !regular {
+        return Err(format!("{shown} não é um arquivo comum"));
+    }
     let mut bytes = Vec::new();
     file.take(IMAGE_MAX as u64 + 1)
         .read_to_end(&mut bytes)
@@ -728,6 +749,7 @@ pub fn register(server: &mut ServerBuilder, cfg: ClipboardConfig, work: WorkTrac
         revision: AtomicU64::new(0),
         status: Mutex::new(Status::default()),
         copies: copies_tx,
+        images: Mutex::new(()),
     });
     let db = Arc::new(Mutex::new(None));
     let ctx = Ctx {
@@ -770,6 +792,7 @@ impl Clipboard {
             copies: self.copies,
             parked: None,
             owned: None,
+            defaulting: false,
             echoes: VecDeque::new(),
             last_read: None,
         };
@@ -810,6 +833,8 @@ struct Module {
     /// Um pedido de cópia recebido fora da sessão, para a próxima.
     parked: Option<CopyRequest>,
     owned: Option<Owned>,
+    /// O padrão já foi pedido (uma vez na vida do módulo).
+    defaulting: bool,
     /// Os tipos (em ordem) de cada fonte nossa ainda sem eco, da mais velha
     /// para a mais nova; só valem enquanto a seleção for nossa.
     echoes: VecDeque<Vec<String>>,
@@ -858,17 +883,7 @@ impl Module {
             self.settings.borrow_and_update();
             let subscribed = history.subscribers() > 0;
             if subscribed {
-                // Sem `configure`, o padrão depois da espera; uma cópia pedida
-                // no meio (o `copyImage` sem guardar) não espera.
-                let ctx = self.ctx.clone();
-                tokio::select! {
-                    _ = ctx.ensure_configured() => {}
-                    request = self.copies.recv() => {
-                        if request.is_some() {
-                            return request;
-                        }
-                    }
-                }
+                self.start_default();
                 if self.store_open() {
                     return None;
                 }
@@ -879,6 +894,20 @@ impl Module {
                 request = self.copies.recv() => self.parked = request,
             }
         }
+    }
+
+    /// Sem `configure`, o padrão depois da espera, numa tarefa própria: uma
+    /// cópia pedida no meio (o `copyImage` sem guardar) é atendida já, e a
+    /// espera não é largada por isso.
+    fn start_default(&mut self) {
+        if self.defaulting || self.settings.borrow().is_some() {
+            return;
+        }
+        self.defaulting = true;
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            let _ = ctx.ensure_configured().await;
+        });
     }
 
     /// Espera uma mudança da configuração, um pedido de cópia ou o `retry`.
@@ -955,6 +984,10 @@ impl Module {
                     }
                 }
                 _ = history.wait_unsubscribed(), if self.owned.is_none() => return Exit::Idle,
+                // Um assinante chegou numa sessão aberta só pela seleção nossa.
+                _ = history.wait_subscribed(), if !self.defaulting && self.settings.borrow().is_none() => {
+                    self.start_default();
+                }
             }
         }
     }

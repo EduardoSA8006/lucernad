@@ -881,6 +881,91 @@ async fn copy_image_from_disk() {
 }
 
 #[tokio::test]
+async fn early_copy_does_not_cancel_the_default_configuration() {
+    let r = rig();
+    let c = client(&r.path).await;
+    subscribed(&c).await;
+    // Uma captura sem guardar nos primeiros 200 ms (o `configure_wait`).
+    let capture = r.dir.path().join("captura.png");
+    std::fs::write(&capture, png_bytes(16, 16)).unwrap();
+    let copied_back = call(
+        &c,
+        "clipboard.copyImage",
+        json!({"path": capture, "store": false}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(copied_back, json!({"id": 0}));
+    assert_eq!(history(&r.t), Value::Null, "ainda sem configuração");
+    // O padrão vale depois da espera, e a cópia de outro app entra.
+    wait_until(Duration::from_secs(1), "o padrão", || count(&r.t) == 0).await;
+    copied(&r, "alheio", 1).await;
+}
+
+#[tokio::test]
+async fn copy_image_refuses_what_is_not_a_regular_file() {
+    let r = rig();
+    let c = ready(&r).await;
+    let fifo = r.dir.path().join("fila.png");
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )
+    .unwrap();
+    for path in [fifo, r.dir.path().to_path_buf()] {
+        let start = Instant::now();
+        let (code, message) =
+            rpc_error(call(&c, "clipboard.copyImage", json!({"path": path})).await);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{path:?} prendeu a chamada"
+        );
+        assert_eq!(
+            (code, message),
+            (
+                1002,
+                format!(
+                    "Não consegui ler a imagem: {} não é um arquivo comum.",
+                    path.display()
+                )
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn escaped_items_fit_in_a_message() {
+    let r = rig();
+    let c = ready(&r).await;
+    // Um texto só de controles: cada um vira \u00XX (6 bytes) no JSON.
+    let controls = "\u{1}".repeat(1 << 20);
+    copied(&r, &controls, 1).await;
+    let id = ids(&list_all(&c).await)[0];
+    let item = call(&c, "clipboard.get", json!({"id": id})).await.unwrap();
+    assert_eq!(item["truncated"], true);
+    let escaped = serde_json::to_string(item["text"].as_str().unwrap()).unwrap();
+    assert!(escaped.len() <= (256 << 10) + 2, "{}", escaped.len());
+
+    // Caminhos longos: as uris da página cabem em ~2 KiB por item.
+    let uris: Vec<String> = (0..40)
+        .map(|i| format!("file:///{}/{i}.txt", "d".repeat(400)))
+        .collect();
+    let list_bytes = uris.join("\r\n");
+    r.fake.copy(
+        &["text/uri-list"],
+        &[("text/uri-list", list_bytes.as_bytes())],
+    );
+    wait_count(&r.t, 2).await;
+    let page = list(&c, json!({"kind": "files", "offset": 0, "limit": 10})).await;
+    let files = &items(&page)[0];
+    let kept = files["uris"].as_array().unwrap();
+    assert!(!kept.is_empty() && kept.len() < 40, "{}", kept.len());
+    assert!(serde_json::to_string(kept).unwrap().len() <= 2 << 10);
+    assert_eq!(files["urisTotal"], 40);
+}
+
+#[tokio::test]
 async fn panic_marks_the_module_unavailable() {
     let r = rig_with(FakeBackend::panicking(), |_| {});
     let c = client(&r.path).await;
@@ -918,7 +1003,8 @@ async fn big_items_fit_in_a_message() {
 
     let page = list_all(&c).await;
     let files = &items(&page)[0];
-    assert_eq!(files["uris"].as_array().unwrap().len(), 50);
+    let listed = files["uris"].as_array().unwrap().len();
+    assert!((1..50).contains(&listed), "{listed}");
     assert_eq!(files["urisTotal"], 5000);
     let text_id = ids(&page)[1];
 

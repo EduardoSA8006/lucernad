@@ -28,11 +28,56 @@ const DB_FILE: &str = "history.db";
 const IMAGES_DIR: &str = "images";
 /// A versão do esquema.
 const SCHEMA_VERSION: i64 = 1;
-/// O maior texto (ou lista de URIs, em bytes) devolvido pelo [`Store::get`]:
-/// a resposta inteira cabe numa mensagem do protocolo (1 MiB).
+/// O maior texto (ou lista de URIs) devolvido pelo [`Store::get`], em bytes
+/// do JSON já escapado: a resposta inteira cabe numa mensagem do protocolo
+/// (1 MiB).
 pub const GET_TEXT_MAX: usize = 256 << 10;
-/// Quantas URIs de um item de arquivos vão numa página do [`Store::list`].
+/// Quantas URIs de um item de arquivos vão numa página do [`Store::list`], no
+/// máximo.
 pub const LIST_URIS: usize = 50;
+/// O orçamento (JSON escapado) das URIs de um item numa página do
+/// [`Store::list`]: 200 itens com caminhos longos ainda cabem numa mensagem.
+pub const LIST_URIS_BYTES: usize = 2 << 10;
+
+/// Quantos bytes `c` ocupa numa string JSON (o `serde_json` escreve os
+/// controles como `\n` ou `\u00XX`).
+fn escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Quantos bytes `s` ocupa como string JSON, com as aspas.
+fn escaped_str_len(s: &str) -> usize {
+    s.chars().map(escaped_len).sum::<usize>() + 2
+}
+
+/// O começo de `text` que, escapado em JSON (com as aspas), cabe em `budget`.
+fn cut_escaped(text: &str, budget: usize) -> &str {
+    let mut used = 2;
+    for (at, c) in text.char_indices() {
+        used += escaped_len(c);
+        if used > budget {
+            return &text[..at];
+        }
+    }
+    text
+}
+
+/// Quantas das primeiras `uris` cabem num array JSON de até `budget` bytes
+/// (e no máximo `max`).
+fn uris_within(uris: &[&str], budget: usize, max: usize) -> usize {
+    let mut used = 2;
+    uris.iter()
+        .take(max)
+        .take_while(|uri| {
+            used += escaped_str_len(uri) + 1;
+            used <= budget
+        })
+        .count()
+}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS items(
@@ -428,17 +473,12 @@ impl Record {
                     .map(|uri| file_names(&[uri.to_string()]))
                     .collect();
                 // A página e o `get` cabem numa mensagem: a página leva as
-                // primeiras URIs e o total; o `get`, até `GET_TEXT_MAX` bytes.
+                // primeiras URIs (até `LIST_URIS_BYTES`) e o total; o `get`,
+                // até `GET_TEXT_MAX` bytes, contados já escapados.
                 let kept = if full {
-                    let mut bytes = 0;
-                    uris.iter()
-                        .take_while(|uri| {
-                            bytes += uri.len();
-                            bytes <= GET_TEXT_MAX
-                        })
-                        .count()
+                    uris_within(&uris, GET_TEXT_MAX, usize::MAX)
                 } else {
-                    uris.len().min(LIST_URIS)
+                    uris_within(&uris, LIST_URIS_BYTES, LIST_URIS)
                 };
                 out.insert("uris".into(), json!(uris[..kept]));
                 if kept < uris.len() {
@@ -460,12 +500,9 @@ impl Record {
             }
         }
         if full && self.kind == Kind::Text {
-            let mut end = text.len().min(GET_TEXT_MAX);
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            out.insert("text".into(), json!(text[..end]));
-            if end < text.len() {
+            let kept = cut_escaped(text, GET_TEXT_MAX);
+            out.insert("text".into(), json!(kept));
+            if kept.len() < text.len() {
                 out.insert("truncated".into(), json!(true));
             }
         }
@@ -538,6 +575,9 @@ impl Store {
                 Connection::open_in_memory().map_err(err)?
             }
         };
+        // O apagado é zerado nas páginas, não só desligado da árvore.
+        conn.pragma_update(None, "secure_delete", "ON")
+            .map_err(err)?;
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(err)?;
@@ -547,6 +587,12 @@ impl Store {
             ));
         }
         conn.execute_batch(SCHEMA).map_err(err)?;
+        // O índice também esquece de verdade o que sai (SQLite 3.42+).
+        conn.execute(
+            "INSERT INTO items_fts(items_fts, rank) VALUES ('secure-delete', 1)",
+            [],
+        )
+        .map_err(err)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(err)?;
         let mut store = Store {
@@ -733,7 +779,16 @@ impl Store {
             .execute("DELETE FROM items WHERE id = ?1", [id])
             .map_err(err)?;
         self.delete_files(&record.files());
+        self.forget()?;
         Ok(true)
+    }
+
+    /// Passa o `-wal` para o banco e o zera: as versões antigas das páginas
+    /// (com o que foi apagado) não ficam no disco.
+    fn forget(&self) -> Result<(), String> {
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .map_err(err)
     }
 
     /// Fixa ou solta o item; `false` se ele não existe. Soltar pode tirar
@@ -771,6 +826,7 @@ impl Store {
         tx.commit().map_err(err)?;
         let files: Vec<String> = records.iter().flat_map(Record::files).collect();
         self.delete_files(&files);
+        self.forget()?;
         Ok(records.len())
     }
 

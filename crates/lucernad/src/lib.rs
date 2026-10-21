@@ -171,12 +171,21 @@ fn history_command() -> lucerna_cli::CliCommand {
     }
 }
 
-/// Troca os caracteres de controle (C0, DEL e C1) por U+FFFD: um texto copiado
-/// com escapes ANSI não mexe no terminal de quem lê o histórico.
+/// Troca os caracteres de controle (C0, DEL e C1) e as marcas de direção
+/// (U+200E/F, U+202A–202E, U+2066–2069) por U+FFFD: um texto copiado com
+/// escapes ANSI ou com a direção invertida não mexe no terminal de quem lê o
+/// histórico.
 #[cfg(feature = "clipboard")]
 fn plain(s: &str) -> String {
+    let direction = |c: char| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
     s.chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .map(|c| {
+            if c.is_control() || direction(c) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -254,6 +263,17 @@ mod tests {
             "3  text  a\u{FFFD}[2Jb\u{FFFD}c\u{FFFD}d\n2  image  640×480 image/png\n1  files  x.pdf"
         );
         assert!(!out.chars().any(|c| c.is_control() && c != '\n'));
+    }
+
+    #[test]
+    fn history_lines_have_no_direction_marks() {
+        let v = json!({"items": [
+            {"id": 1, "kind": "text", "preview": "a\u{200E}b\u{200F}c\u{202A}d\u{202E}e\u{2066}f\u{2069}g"},
+        ]});
+        assert_eq!(
+            render_history(&v),
+            "1  text  a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}e\u{FFFD}f\u{FFFD}g"
+        );
     }
 
     #[test]

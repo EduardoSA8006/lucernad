@@ -72,7 +72,7 @@ O histórico da área de transferência do shell (painel `Super+V`) hoje roda o 
 ### Tópicos e métodos
 
 - `clipboard.history` — tópico comum, `{revision, count}`: muda a cada inclusão, remoção, fixação ou limpeza (o shell repagina ao ver `revision` novo).
-- `clipboard.status` — `{available, error}`: protocolo alcançável, banco aberto.
+- `clipboard.status` — `{available, error}`: `available` diz que a última abertura da sessão deu certo e o banco abriu; `false` com `error` diz o motivo; `false` com `error` `null` quer dizer que ainda não foi tentado (antes do primeiro `configure` e do primeiro assinante ou cópia).
 - `clipboard.list {kind?, query?, offset, limit}` → `{items: [{id, kind, text?, preview?, uris?, image?, thumb?, mime?, width?, height?, size, created, used, pinned, matches?}], total}`; `text`/`preview` truncados para a prévia (o texto inteiro vem por `clipboard.get {id}`).
 - `clipboard.copy {id}`, `clipboard.remove {id}`, `clipboard.pin {id, pinned}`, `clipboard.clear {all}` (sem `all`, mantém os fixados) → `{}`.
 - `clipboard.configure {limit, persist, waylandDisplay?}` → `{}` (faixa do limite 1–1000; `waylandDisplay` só se o ambiente não tiver).

@@ -697,3 +697,41 @@ fn image_files_are_written_before_the_commit() {
     assert!(store.insert(prepared, 1).is_err());
     assert_eq!(store.counts().unwrap(), (0, 0));
 }
+
+/// Se `needle` aparece em algum arquivo do banco em `dir`.
+fn on_disk(dir: &Path, needle: &[u8]) -> Vec<String> {
+    ["history.db", "history.db-wal"]
+        .iter()
+        .filter(|name| {
+            let bytes = fs::read(dir.join(name)).unwrap_or_default();
+            bytes.windows(needle.len()).any(|w| w == needle)
+        })
+        .map(|name| name.to_string())
+        .collect()
+}
+
+#[test]
+fn removed_items_leave_no_bytes_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("clipboard");
+    let mut store = disk_at(&dir);
+    let gone = "senha-apagada-123 que não pode sobrar";
+    let cleared = "outra-apagada-456 que também não";
+    let (id, _) = add(&mut store, t(gone), 1);
+    add(&mut store, t(cleared), 2);
+    add(&mut store, t("fica no histórico"), 3);
+    let (kept, _) = add(&mut store, t("fixado e mantido"), 4);
+    store.pin(kept, true).unwrap();
+    assert!(
+        !on_disk(&dir, b"senha-apagada-123").is_empty(),
+        "o teste enxerga o texto"
+    );
+
+    store.remove(id).unwrap();
+    assert_eq!(on_disk(&dir, b"senha-apagada-123"), Vec::<String>::new());
+    store.clear(false).unwrap();
+    assert_eq!(on_disk(&dir, b"outra-apagada-456"), Vec::<String>::new());
+    assert_eq!(on_disk(&dir, b"fica no hist"), Vec::<String>::new());
+    assert_eq!(ids(&all(&store)), [kept]);
+    assert_eq!(search(&store, "senha").total, 0);
+}

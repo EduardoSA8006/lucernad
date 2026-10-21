@@ -46,7 +46,7 @@ Observa a área de transferência pelo protocolo de controle de dados do Wayland
 | Tópico | O que traz | Quando muda |
 | --- | --- | --- |
 | `clipboard.history` | `{"revision","count","pinned"}`; `null` até o histórico abrir | a cada item novo, remoção, fixação ou limpeza |
-| `clipboard.status` | `{"available","error"}`: `false` com o motivo se não há sessão Wayland ou o compositor não oferece o controle | quando o estado muda |
+| `clipboard.status` | `{"available","error"}`: `available` diz que a última abertura da sessão deu certo e o banco abriu; `false` com o motivo em `error` (sem sessão Wayland, compositor sem o controle, banco que não abriu); `false` com `error` `null` enquanto ainda não foi tentado | quando o estado muda |
 
 Métodos:
 
