@@ -620,6 +620,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucernad-core"
+version = "0.1.0"
+dependencies = [
+ "lucerna-service",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lucernad-spectrum"
 version = "0.1.0"
 dependencies = [
@@ -636,6 +645,7 @@ version = "0.1.0"
 dependencies = [
  "lucerna-ipc",
  "lucerna-service",
+ "lucernad-core",
  "lucernad-system",
  "nvml-wrapper",
  "rustix",

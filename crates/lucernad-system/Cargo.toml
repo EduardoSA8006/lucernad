@@ -16,6 +16,7 @@ testing = []
 
 [dependencies]
 lucerna-service.workspace = true
+lucernad-core.workspace = true
 nvml-wrapper.workspace = true
 rustix.workspace = true
 serde.workspace = true
