@@ -59,7 +59,8 @@ fn huge_dimensions_are_refused() {
 fn declared_allocation_over_the_limit_is_refused() {
     // 16 000 x 16 000 cabe no limite de lado, mas são 768 MB de saída (> 512 MiB).
     let start = Instant::now();
-    assert!(thumbnail(&png_declaring(16_000, 16_000), "image/png").is_err());
+    let err = thumbnail(&png_declaring(16_000, 16_000), "image/png").unwrap_err();
+    assert!(err.to_lowercase().contains("limit"), "{err}");
     assert!(start.elapsed() < Duration::from_secs(1));
 }
 

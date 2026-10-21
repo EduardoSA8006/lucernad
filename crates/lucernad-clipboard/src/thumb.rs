@@ -44,14 +44,22 @@ pub fn thumbnail(bytes: &[u8], mime: &str) -> Result<Thumb, String> {
         .reserve(decoder.total_bytes())
         .map_err(|e| e.to_string())?;
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
-    img.apply_orientation(orientation);
-    // As dimensões "vistas": já com a orientação aplicada.
-    let (width, height) = (img.width(), img.height());
-    let small = if width > THUMB_SIDE || height > THUMB_SIDE {
+    let img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    let (raw_w, raw_h) = (img.width(), img.height());
+    // Primeiro a miniatura; a orientação só gira a imagem pequena.
+    let mut small = if raw_w > THUMB_SIDE || raw_h > THUMB_SIDE {
         img.thumbnail(THUMB_SIDE, THUMB_SIDE)
     } else {
         img
+    };
+    small.apply_orientation(orientation);
+    // As dimensões "vistas": as 4 orientações com giro de 90° trocam os lados.
+    let (width, height) = match orientation {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Rotate90FlipH
+        | Orientation::Rotate270FlipH => (raw_h, raw_w),
+        _ => (raw_w, raw_h),
     };
     let mut png = Vec::new();
     small
