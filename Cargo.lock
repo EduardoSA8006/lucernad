@@ -622,6 +622,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucernad-clipboard"
+version = "0.1.0"
+dependencies = [
+ "lucernad-clipboard",
+ "rustix",
+]
+
+[[package]]
 name = "lucernad-core"
 version = "0.1.0"
 dependencies = [

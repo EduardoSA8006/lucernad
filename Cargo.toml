@@ -20,10 +20,11 @@ lucerna-manifest = { git = "https://github.com/lucerna-desktop/lucerna-sdk", rev
 lucernad-core = { path = "crates/lucernad-core" }
 lucernad-system = { path = "crates/lucernad-system" }
 lucernad-spectrum = { path = "crates/lucernad-spectrum" }
+lucernad-clipboard = { path = "crates/lucernad-clipboard" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "event"] }
 nvml-wrapper = "0.11"
 tempfile = "3"
 pipewire = "0.10"
