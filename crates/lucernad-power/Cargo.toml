@@ -16,13 +16,17 @@ testing = []
 
 [dependencies]
 i2cdev.workspace = true
+lucerna-service.workspace = true
+lucernad-core.workspace = true
 rustix.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]
 # Os testes deste crate usam o módulo `testing`.
 lucernad-power = { path = ".", features = ["testing"] }
+lucerna-ipc.workspace = true
 tempfile.workspace = true
 
 [lints]

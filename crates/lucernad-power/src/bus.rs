@@ -162,6 +162,12 @@ pub trait BacklightWriter: Send + Sync + 'static {
     /// o módulo pôr no texto do Formato (salvo o [`NO_SESSION`], que já é o
     /// texto inteiro).
     fn write<'a>(&'a self, device: &'a str, value: u32) -> BoxFuture<'a, Result<(), String>>;
+
+    /// Por onde a escrita vai, para o texto do erro ("Não consegui ajustar o
+    /// brilho <target>: <causa>."): o logind, salvo a árvore de teste.
+    fn target(&self) -> &'static str {
+        "pelo logind"
+    }
 }
 
 /// O histórico e os perfis.
@@ -656,6 +662,10 @@ impl TreeWriter {
 impl BacklightWriter for TreeWriter {
     fn write<'a>(&'a self, device: &'a str, value: u32) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move { self.write_now(device, value) })
+    }
+
+    fn target(&self) -> &'static str {
+        "na árvore de teste"
     }
 }
 

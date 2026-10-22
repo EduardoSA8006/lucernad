@@ -853,8 +853,12 @@ name = "lucernad-power"
 version = "0.1.0"
 dependencies = [
  "i2cdev",
+ "lucerna-ipc",
+ "lucerna-service",
+ "lucernad-core",
  "lucernad-power",
  "rustix",
+ "serde_json",
  "tempfile",
  "tokio",
  "zbus",

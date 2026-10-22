@@ -20,10 +20,13 @@ use crate::ddc::{DDC_ADDR, DdcTiming, EDID_ADDR, VCP_BRIGHTNESS};
 use crate::i2c::{I2cBus, I2cOpener};
 use crate::roots::Roots;
 use crate::uevent::{Uevent, Uevents};
+use crate::{HISTORY_INTERVAL, HOTPLUG_DELAY, OP_TIMEOUT, PowerConfig, STALE};
 
 /// Monta uma árvore falsa do sysfs sobre um diretório, com os links
 /// simbólicos de verdade (`class/drm/<card>` → `devices/<pci>/drm/<card>`,
 /// `class/i2c-dev/i2c-N/device` → o adaptador, o `ddc` dos conectores).
+/// Clonar dá outra alça para a mesma árvore.
+#[derive(Clone)]
 pub struct Tree {
     base: PathBuf,
 }
@@ -710,5 +713,101 @@ impl BacklightWriter for FakeWriter {
             lock(&self.state).writes.push((device.to_owned(), value));
             Ok(())
         })
+    }
+}
+
+/// O EDID do LG da sonda (c): 256 bytes (o bloco base e uma extensão).
+pub fn lg_edid() -> Vec<u8> {
+    let mut edid = edid("LG ULTRAWIDE", 1);
+    edid.extend([0u8; 128]);
+    edid
+}
+
+/// O LG da sonda (c), em 70 de 100.
+pub fn lg() -> FakeMonitor {
+    FakeMonitor {
+        edid: lg_edid(),
+        current: 70,
+        max: 100,
+        off_by: 0,
+    }
+}
+
+/// Os dublês de um [`fake_config`], para o teste mexer.
+pub struct Fakes {
+    pub tree: Tree,
+    pub i2c: FakeI2c,
+    pub bus: FakeBus,
+    pub uevents: FakeUevents,
+    pub writer: FakeWriter,
+}
+
+/// A máquina da sonda (c) numa árvore falsa em `dir`: a `intel_backlight`
+/// (`raw`, 9600 de 19200, do `card2-eDP-1`), a NVIDIA com os barramentos 0 e
+/// 1 e o LG no `card1-HDMI-A-1` (sem o link `ddc`) e no barramento 1 do
+/// [`FakeI2c`]. Os prazos curtos: [`fast_timing`], `op_timeout` 300 ms,
+/// `stale` 100 ms, `hotplug_delay` 100 ms, `history_interval` 200 ms.
+pub fn fake_config(dir: &Path) -> (PowerConfig, Fakes) {
+    let tree = Tree::new(dir);
+    tree.gpu("0000:01:00.0", "0x030000", "card1");
+    tree.bus(0, "0000:01:00.0");
+    tree.bus(1, "0000:01:00.0");
+    tree.connector("card1", "HDMI-A-1", "connected", &lg_edid(), None);
+    tree.gpu("0000:00:02.0", "0x030000", "card2");
+    tree.connector("card2", "eDP-1", "connected", &edid("Painel", 9), Some(13));
+    tree.backlight(
+        "intel_backlight",
+        "raw",
+        19200,
+        9600,
+        9600,
+        Some("card2-eDP-1"),
+    );
+
+    let i2c = FakeI2c::new().monitor(1, lg());
+    let bus = FakeBus::new();
+    let uevents = FakeUevents::new();
+    let writer = FakeWriter::new(tree.clone());
+    let cfg = PowerConfig {
+        roots: tree.roots(),
+        root_error: None,
+        writer: Arc::new(writer.clone()),
+        i2c: Some(Arc::new(i2c.clone())),
+        bus: Arc::new(bus.clone()),
+        uevents: Arc::new(uevents.clone()),
+        timing: fast_timing(),
+        op_timeout: Duration::from_millis(300),
+        stale: Duration::from_millis(100),
+        hotplug_delay: Duration::from_millis(100),
+        history_interval: Duration::from_millis(200),
+    };
+    let fakes = Fakes {
+        tree,
+        i2c,
+        bus,
+        uevents,
+        writer,
+    };
+    (cfg, fakes)
+}
+
+/// Uma configuração quieta para o binário: árvore vazia em `dir`, sem DDC,
+/// o D-Bus e o uevent falsos e os prazos de verdade.
+pub fn quiet_config(dir: &Path) -> PowerConfig {
+    let tree = Tree::new(dir);
+    PowerConfig {
+        roots: tree.roots(),
+        root_error: None,
+        writer: Arc::new(TreeWriter {
+            roots: tree.roots(),
+        }),
+        i2c: None,
+        bus: Arc::new(FakeBus::new()),
+        uevents: Arc::new(FakeUevents::new()),
+        timing: DdcTiming::standard(),
+        op_timeout: OP_TIMEOUT,
+        stale: STALE,
+        hotplug_delay: HOTPLUG_DELAY,
+        history_interval: HISTORY_INTERVAL,
     }
 }
