@@ -124,7 +124,8 @@ impl DdcError {
             DdcError::Unsupported => {
                 "O monitor não deixa ajustar o brilho pelo DDC/CI.".to_string()
             }
-            DdcError::Io(e) => format!("O monitor não respondeu ao DDC/CI: {e}."),
+            // O detalhe do errno fica para o log de quem chama.
+            DdcError::Io(_) => "O monitor não respondeu ao DDC/CI.".to_string(),
         }
     }
 
@@ -169,6 +170,9 @@ pub fn set_request(code: u8, value: u16) -> Vec<u8> {
 /// byte (`& 0x7F`) e os bytes além dele são ignorados, então a "null message"
 /// (`[0x6E, 0x80, 0xBE]`, o monitor ocupado) é reconhecida no buffer de 11.
 pub fn parse_reply(code: u8, bytes: &[u8]) -> Result<Vcp, DdcError> {
+    if bytes.is_empty() {
+        return Err(DdcError::BadReply);
+    }
     // Só zeros: ninguém respondeu no barramento.
     if bytes.iter().all(|&b| b == 0) {
         return Err(DdcError::NoAnswer);
@@ -208,15 +212,24 @@ pub fn parse_reply(code: u8, bytes: &[u8]) -> Result<Vcp, DdcError> {
     Ok(Vcp { current, max })
 }
 
-/// Roda `attempt` entre `lock` e `unlock`.
+/// Roda `attempt` entre `lock` e `unlock` (o `unlock` por guarda, que solta
+/// a trava mesmo se `attempt` entrar em pânico).
 fn locked<T>(
     bus: &mut dyn I2cBus,
     attempt: impl FnOnce(&mut dyn I2cBus) -> Result<T, DdcError>,
 ) -> Result<T, DdcError> {
     bus.lock().map_err(|e| DdcError::from_transfer(&e))?;
-    let result = attempt(bus);
-    bus.unlock();
-    result
+    let guard = Unlock(bus);
+    attempt(&mut *guard.0)
+}
+
+/// Destrava o barramento ao sair do escopo, mesmo num pânico.
+struct Unlock<'a>(&'a mut dyn I2cBus);
+
+impl Drop for Unlock<'_> {
+    fn drop(&mut self) {
+        self.0.unlock();
+    }
 }
 
 /// Tenta `attempt` uma vez e mais [`RETRIES`] vezes, com `retry_delay` entre

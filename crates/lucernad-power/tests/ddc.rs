@@ -69,7 +69,8 @@ fn reply_parsing() {
     null11[..3].copy_from_slice(&[0x6E, 0x80, 0xBE]);
     assert_eq!(parse_reply(0x10, &null11), Err(DdcError::NoAnswer));
 
-    // Curta demais.
+    // Vazia e curta demais.
+    assert_eq!(parse_reply(0x10, &[]), Err(DdcError::BadReply));
     assert_eq!(parse_reply(0x10, &good[..5]), Err(DdcError::BadReply));
 
     // Resultado 1: o monitor não tem esse VCP.
@@ -204,6 +205,11 @@ fn access_errors_are_not_retried() {
         DdcError::NoAnswer.message(),
         "O monitor não respondeu ao DDC/CI."
     );
+    // O detalhe do errno não vai para a tela (só para o log).
+    assert_eq!(
+        DdcError::Io("errno 16".to_string()).message(),
+        "O monitor não respondeu ao DDC/CI."
+    );
     assert_eq!(
         DdcError::BadReply.message(),
         "O monitor respondeu fora do padrão DDC/CI."
@@ -289,6 +295,34 @@ fn every_transaction_is_locked() {
     i2c.busy_times(1, 2);
     get_brightness(open(&i2c, 1).as_mut(), &t).unwrap();
     assert_eq!(i2c.locks(1), (3, 3));
+
+    // Um pânico no meio da transação ainda destrava o barramento.
+    #[derive(Default)]
+    struct Panics {
+        locks: usize,
+        unlocks: usize,
+    }
+    impl I2cBus for Panics {
+        fn write(&mut self, _addr: u16, _data: &[u8]) -> io::Result<()> {
+            panic!("o driver caiu");
+        }
+        fn read(&mut self, _addr: u16, _buf: &mut [u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn lock(&mut self) -> io::Result<()> {
+            self.locks += 1;
+            Ok(())
+        }
+        fn unlock(&mut self) {
+            self.unlocks += 1;
+        }
+    }
+    let mut bus = Panics::default();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        get_brightness(&mut bus, &t)
+    }));
+    assert!(caught.is_err());
+    assert_eq!((bus.locks, bus.unlocks), (1, 1));
 }
 
 #[test]

@@ -8,10 +8,13 @@
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use i2cdev::core::I2CDevice;
 use i2cdev::linux::LinuxI2CDevice;
 use rustix::fs::{FlockOperation, flock};
+use rustix::io::Errno;
 
 use crate::ddc::DDC_ADDR;
 
@@ -31,6 +34,28 @@ pub trait I2cBus: Send {
 /// Abre o barramento `i2c-<bus>`.
 pub trait I2cOpener: Send + Sync + 'static {
     fn open(&self, bus: u32) -> io::Result<Box<dyn I2cBus>>;
+}
+
+/// Quantas vezes tentar o `flock` antes de desistir (como o libddcutil, que
+/// não espera para sempre por outro processo no barramento).
+const LOCK_TRIES: usize = 10;
+/// A espera entre duas tentativas do `flock`.
+const LOCK_WAIT: Duration = Duration::from_millis(50);
+
+/// O `flock(LOCK_EX | LOCK_NB)` com até `tries` tentativas, `wait` entre
+/// elas; ocupado até o fim → `WouldBlock` (o DDC trata como sem resposta).
+fn try_flock(file: &File, tries: usize, wait: Duration) -> io::Result<()> {
+    let mut left = tries.max(1);
+    loop {
+        match flock(file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(()),
+            Err(Errno::WOULDBLOCK | Errno::INTR) if left > 1 => {
+                left -= 1;
+                thread::sleep(wait);
+            }
+            Err(e) => return Err(io::Error::from(e)),
+        }
+    }
 }
 
 /// Os barramentos de verdade, em `<dev>/i2c-<n>`.
@@ -86,12 +111,44 @@ impl I2cBus for LinuxBus {
     }
 
     fn lock(&mut self) -> io::Result<()> {
-        flock(&self.lock, FlockOperation::LockExclusive).map_err(io::Error::from)
+        try_flock(&self.lock, LOCK_TRIES, LOCK_WAIT)
     }
 
     fn unlock(&mut self) {
         // Destravar não falha num descritor válido; e fechar o arquivo
         // destrava de qualquer jeito.
         let _ = flock(&self.lock, FlockOperation::Unlock);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    use rustix::fs::{FlockOperation, flock};
+
+    use super::try_flock;
+
+    /// Só um arquivo temporário: nenhum `/dev/i2c-N`.
+    #[test]
+    fn flock_gives_up_instead_of_blocking() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("i2c-falso");
+        std::fs::write(&path, b"").unwrap();
+        let other = File::open(&path).unwrap();
+        let ours = File::open(&path).unwrap();
+
+        flock(&other, FlockOperation::LockExclusive).unwrap();
+        let start = Instant::now();
+        let err = try_flock(&ours, 3, Duration::from_millis(10)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        // Duas esperas de 10 ms; bem abaixo de 3 s.
+        assert!(start.elapsed() >= Duration::from_millis(20));
+        assert!(start.elapsed() < Duration::from_secs(3));
+
+        flock(&other, FlockOperation::Unlock).unwrap();
+        try_flock(&ours, 3, Duration::from_millis(10)).unwrap();
     }
 }
