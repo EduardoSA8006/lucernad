@@ -1,0 +1,25 @@
+[package]
+name = "lucernad-power"
+description = "Módulo power do lucernad: o brilho das telas, o histórico de consumo e os perfis de energia."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+# O montador de árvores falsas e os dublês, para os testes.
+testing = []
+
+[dependencies]
+
+[dev-dependencies]
+# Os testes deste crate usam o módulo `testing`.
+lucernad-power = { path = ".", features = ["testing"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
