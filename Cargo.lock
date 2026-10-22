@@ -856,6 +856,7 @@ dependencies = [
  "lucernad-power",
  "rustix",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

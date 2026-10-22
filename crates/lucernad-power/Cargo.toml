@@ -17,6 +17,7 @@ testing = []
 [dependencies]
 i2cdev.workspace = true
 rustix.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 # Os testes deste crate usam o módulo `testing`.

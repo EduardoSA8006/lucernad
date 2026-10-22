@@ -1,8 +1,10 @@
 //! Ajudantes para os testes (feature `testing`): o montador de árvores falsas
-//! do sysfs, um EDID de exemplo e os barramentos i2c falsos do DDC/CI.
+//! do sysfs, um EDID de exemplo, os barramentos i2c falsos do DDC/CI e os
+//! uevents falsos.
 //!
 //! Nada aqui toca o `/sys` ou o `/dev` de verdade: tudo fica sob a pasta dada
-//! ao [`Tree::new`], e o [`FakeI2c`] nunca abre um `/dev/i2c-N`.
+//! ao [`Tree::new`], o [`FakeI2c`] nunca abre um `/dev/i2c-N` e o
+//! [`FakeUevents`] nunca abre o socket netlink.
 
 use std::collections::HashMap;
 use std::io;
@@ -14,6 +16,7 @@ use std::time::Duration;
 use crate::ddc::{DDC_ADDR, DdcTiming, EDID_ADDR, VCP_BRIGHTNESS};
 use crate::i2c::{I2cBus, I2cOpener};
 use crate::roots::Roots;
+use crate::uevent::{Uevent, Uevents};
 
 /// Monta uma árvore falsa do sysfs sobre um diretório, com os links
 /// simbólicos de verdade (`class/drm/<card>` → `devices/<pci>/drm/<card>`,
@@ -477,4 +480,58 @@ impl I2cBus for FakeBus {
     fn unlock(&mut self) {
         self.i2c.with(self.bus, |b| b.unlocks += 1);
     }
+}
+
+/// Uevents falsos: o teste manda eventos e perdas para quem estiver
+/// escutando, sem socket nem thread.
+#[derive(Clone, Default)]
+pub struct FakeUevents {
+    senders: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<Uevent>>>>,
+}
+
+impl FakeUevents {
+    /// Sem ninguém escutando.
+    pub fn new() -> FakeUevents {
+        FakeUevents::default()
+    }
+
+    /// Manda um evento a todos os receptores vivos.
+    pub fn send(&self, action: &str, subsystem: &str, devpath: &str) {
+        self.deliver(Uevent::Event {
+            action: action.to_owned(),
+            subsystem: subsystem.to_owned(),
+            devpath: devpath.to_owned(),
+        });
+    }
+
+    /// Manda um [`Uevent::Lost`] (o `ENOBUFS` do socket).
+    pub fn lose(&self) {
+        self.deliver(Uevent::Lost);
+    }
+
+    /// Quantos receptores estão vivos.
+    pub fn watching(&self) -> usize {
+        let mut senders = lock(&self.senders);
+        senders.retain(|tx| !tx.is_closed());
+        senders.len()
+    }
+
+    fn deliver(&self, event: Uevent) {
+        let mut senders = lock(&self.senders);
+        senders.retain(|tx| tx.send(event.clone()).is_ok());
+    }
+}
+
+impl Uevents for FakeUevents {
+    fn watch(&self) -> Result<tokio::sync::mpsc::UnboundedReceiver<Uevent>, String> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        lock(&self.senders).push(tx);
+        Ok(rx)
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

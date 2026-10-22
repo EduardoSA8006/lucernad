@@ -6,13 +6,17 @@
 //! testes, a fumaça e o `LUCERNAD_POWER_ROOT`). A escolha da tela integrada
 //! fica no [`backlight`]; a descoberta dos monitores externos (os conectores,
 //! os barramentos candidatos e o casamento pelo EDID), no [`drm`]; o
-//! protocolo DDC/CI, no [`ddc`], sobre o barramento do [`i2c`].
+//! protocolo DDC/CI, no [`ddc`], sobre o barramento do [`i2c`]; o juntar de
+//! ajustes de cada tela, no [`adjust`]; as mudanças de fora e o plugar e
+//! tirar, pelo [`uevent`] do kernel.
 
+pub mod adjust;
 pub mod backlight;
 pub mod ddc;
 pub mod drm;
 pub mod i2c;
 pub mod roots;
+pub mod uevent;
 
 #[cfg(feature = "testing")]
 pub mod testing;
