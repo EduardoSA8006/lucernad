@@ -1,13 +1,18 @@
 //! O protocolo do `lucernad`, em processo: o `system` sobre a máquina de
 //! exemplo, o `spectrum` e o `clipboard` com os dublês.
-#![cfg(any(feature = "system", feature = "spectrum", feature = "clipboard"))]
+#![cfg(any(
+    feature = "system",
+    feature = "spectrum",
+    feature = "clipboard",
+    feature = "power"
+))]
 
 mod common;
 
 use common::start;
 #[cfg(feature = "system")]
 use serde_json::Value;
-#[cfg(any(feature = "spectrum", feature = "clipboard"))]
+#[cfg(any(feature = "spectrum", feature = "clipboard", feature = "power"))]
 use serde_json::json;
 
 #[cfg(feature = "system")]
@@ -82,5 +87,27 @@ async fn the_daemon_serves_the_clipboard_module() {
         .await
         .unwrap();
     assert_eq!(v, json!({"items": [], "total": 0}));
+    r.stop().await;
+}
+
+#[cfg(feature = "power")]
+#[tokio::test]
+async fn the_daemon_serves_the_power_module() {
+    let r = start().await;
+    let c = r.client().await;
+    for t in [
+        "power.screens",
+        "power.history",
+        "power.profiles",
+        "power.status",
+    ] {
+        assert!(c.hello().topics.iter().any(|x| x == t), "falta {t}");
+    }
+    assert!(
+        c.hello().methods.iter().any(|m| m == "power.list"),
+        "falta o power.list"
+    );
+    let v = c.call("power.list", Some(json!({}))).await.unwrap();
+    assert_eq!(v, json!({"screens": []}));
     r.stop().await;
 }

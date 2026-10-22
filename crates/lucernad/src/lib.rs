@@ -1,10 +1,10 @@
 //! O `lucernad`: o daemon do Lucerna, um binário com um módulo por área.
 //!
-//! Cada módulo é um crate ligado por uma feature (`system`, `spectrum` e
-//! `clipboard`, as três padrão) e se registra no mesmo serviço. [`lucernad`] monta o serviço
+//! Cada módulo é um crate ligado por uma feature (`system`, `spectrum`,
+//! `clipboard` e `power`, as quatro padrão) e se registra no mesmo serviço. [`lucernad`] monta o serviço
 //! com os módulos ligados; [`cli`] é a linha de comando: os subcomandos comuns
 //! do SDK (`status` e `watch`) e, com o `spectrum`, o `player`; com o
-//! `clipboard`, o `historico` e o `copiar`.
+//! `clipboard`, o `historico` e o `copiar`; com o `power`, o `brilho`.
 
 use lucerna_cli::CliApp;
 use lucerna_service::ServiceBuilder;
@@ -23,6 +23,9 @@ pub struct Modules {
     /// O módulo `clipboard`.
     #[cfg(feature = "clipboard")]
     pub clipboard: lucernad_clipboard::ClipboardConfig,
+    /// O módulo `power`.
+    #[cfg(feature = "power")]
+    pub power: lucernad_power::PowerConfig,
 }
 
 impl Modules {
@@ -35,6 +38,8 @@ impl Modules {
             spectrum: lucernad_spectrum::SpectrumConfig::system(),
             #[cfg(feature = "clipboard")]
             clipboard: lucernad_clipboard::ClipboardConfig::system(),
+            #[cfg(feature = "power")]
+            power: lucernad_power::PowerConfig::system(),
         }
     }
 }
@@ -65,6 +70,12 @@ pub struct Lucernad {
     /// seleção segurada.
     #[cfg(feature = "clipboard")]
     pub clipboard_task: lucernad_core::ModuleTask,
+    /// Os tópicos do módulo `power`.
+    #[cfg(feature = "power")]
+    pub power: lucernad_power::PowerTopics,
+    /// O laço do módulo `power`; soltá-lo encerra a observação das telas.
+    #[cfg(feature = "power")]
+    pub power_task: lucernad_core::ModuleTask,
 }
 
 /// Monta o serviço com os módulos ligados. Chame dentro do runtime: começa as
@@ -72,7 +83,12 @@ pub struct Lucernad {
 pub fn lucernad(modules: Modules) -> Lucernad {
     // Sem nenhum módulo, ninguém registra nada no servidor.
     #[cfg_attr(
-        not(any(feature = "system", feature = "spectrum", feature = "clipboard")),
+        not(any(
+            feature = "system",
+            feature = "spectrum",
+            feature = "clipboard",
+            feature = "power"
+        )),
         allow(unused_mut)
     )]
     let mut service = ServiceBuilder::new(APP, env!("CARGO_PKG_VERSION"));
@@ -80,11 +96,18 @@ pub fn lucernad(modules: Modules) -> Lucernad {
     let system = lucernad_system::register(service.server(), modules.system);
     #[cfg(feature = "spectrum")]
     let spectrum = lucernad_spectrum::register(service.server(), modules.spectrum);
-    #[cfg(feature = "clipboard")]
+    #[cfg(any(feature = "clipboard", feature = "power"))]
     let work = service.work();
     #[cfg(feature = "clipboard")]
-    let clipboard = lucernad_clipboard::register(service.server(), modules.clipboard, work);
-    #[cfg(not(any(feature = "system", feature = "spectrum", feature = "clipboard")))]
+    let clipboard = lucernad_clipboard::register(service.server(), modules.clipboard, work.clone());
+    #[cfg(feature = "power")]
+    let power = lucernad_power::register(service.server(), modules.power, work);
+    #[cfg(not(any(
+        feature = "system",
+        feature = "spectrum",
+        feature = "clipboard",
+        feature = "power"
+    )))]
     let Modules {} = modules;
     Lucernad {
         service,
@@ -100,6 +123,10 @@ pub fn lucernad(modules: Modules) -> Lucernad {
         clipboard: clipboard.topics.clone(),
         #[cfg(feature = "clipboard")]
         clipboard_task: clipboard.spawn(),
+        #[cfg(feature = "power")]
+        power: power.topics.clone(),
+        #[cfg(feature = "power")]
+        power_task: power.spawn(),
     }
 }
 
@@ -109,12 +136,14 @@ pub fn cli() -> CliApp {
         APP,
         "lucernad",
         env!("CARGO_PKG_VERSION"),
-        "O daemon do Lucerna: os dados do sistema, o espectro do som e o histórico da área de transferência para o shell.",
+        "O daemon do Lucerna: os dados do sistema, o espectro do som, o histórico da área de transferência e o brilho das telas para o shell.",
     );
     #[cfg(feature = "spectrum")]
     let app = app.command(player_command());
     #[cfg(feature = "clipboard")]
     let app = app.command(history_command()).command(copy_command());
+    #[cfg(feature = "power")]
+    let app = app.command(brightness_command());
     app
 }
 
@@ -175,7 +204,7 @@ fn history_command() -> lucerna_cli::CliCommand {
 /// (U+200E/F, U+202A–202E, U+2066–2069) por U+FFFD: um texto copiado com
 /// escapes ANSI ou com a direção invertida não mexe no terminal de quem lê o
 /// histórico.
-#[cfg(feature = "clipboard")]
+#[cfg(any(feature = "clipboard", feature = "power"))]
 fn plain(s: &str) -> String {
     let direction = |c: char| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
     s.chars()
@@ -242,6 +271,149 @@ fn copy_command() -> lucerna_cli::CliCommand {
             })
         },
         render: None,
+    }
+}
+
+/// `lucernad brilho [ID PERCENT|+N|-N]`: o `power.list`, o `power.set` ou o
+/// `power.change`.
+#[cfg(feature = "power")]
+fn brightness_command() -> lucerna_cli::CliCommand {
+    use lucerna_cli::clap::{Arg, Command};
+    use lucerna_cli::{Call, CliCommand};
+
+    CliCommand {
+        command: Command::new("brilho")
+            .about("Mostra as telas com brilho ajustável; com ID e PERCENT, ajusta uma (+N e -N somam ao valor atual).")
+            .arg(
+                Arg::new("id")
+                    .value_name("ID")
+                    .help("A tela, como o `brilho` mostra (backlight ou o id do monitor)."),
+            )
+            .arg(
+                Arg::new("percent")
+                    .value_name("PERCENT")
+                    .allow_hyphen_values(true)
+                    .help("De 1 a 100, ou +N/-N para somar ao valor atual."),
+            ),
+        to_call: |m| {
+            let id = m.get_one::<String>("id");
+            let percent = m.get_one::<String>("percent");
+            let (id, percent) = match (id, percent) {
+                (None, None) => {
+                    return Ok(Call {
+                        method: "power.list".into(),
+                        params: Some(serde_json::json!({})),
+                    });
+                }
+                (Some(id), Some(percent)) => (id, percent),
+                _ => return Err("Passe o ID e o PERCENT juntos".to_string()),
+            };
+            let bad = || "PERCENT precisa ser um inteiro entre 1 e 100, ou +N/-N com N até 100".to_string();
+            let number = |s: &str| -> Result<i64, String> {
+                if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(bad());
+                }
+                s.parse::<i64>()
+                    .ok()
+                    .filter(|n| (1..=100).contains(n))
+                    .ok_or_else(bad)
+            };
+            if let Some(n) = percent.strip_prefix('+') {
+                let delta = number(n)?;
+                Ok(Call {
+                    method: "power.change".into(),
+                    params: Some(serde_json::json!({ "id": id, "delta": delta })),
+                })
+            } else if let Some(n) = percent.strip_prefix('-') {
+                let delta = number(n)?;
+                Ok(Call {
+                    method: "power.change".into(),
+                    params: Some(serde_json::json!({ "id": id, "delta": -delta })),
+                })
+            } else {
+                let percent = number(percent)?;
+                Ok(Call {
+                    method: "power.set".into(),
+                    params: Some(serde_json::json!({ "id": id, "percent": percent })),
+                })
+            }
+        },
+        render: Some(render_screens),
+    }
+}
+
+/// Uma linha `id  N%  nome` por tela (`—` no lugar do percentual quando a
+/// tela não tem valor lido, e `  (erro)` quando houver); só o
+/// `power.list` traz `screens`: o `{}` do `set` não imprime nada.
+#[cfg(feature = "power")]
+fn render_screens(v: &serde_json::Value) -> String {
+    let Some(screens) = v["screens"].as_array() else {
+        return String::new();
+    };
+    if screens.is_empty() {
+        return "Nenhuma tela com brilho ajustável.".to_string();
+    }
+    screens
+        .iter()
+        .map(|s| {
+            let percent = match s["percent"].as_u64() {
+                Some(p) => format!("{p}%"),
+                None => "—".to_string(),
+            };
+            let mut line = format!(
+                "{}  {percent}  {}",
+                plain(s["id"].as_str().unwrap_or_default()),
+                plain(s["name"].as_str().unwrap_or_default())
+            );
+            if let Some(e) = s["error"].as_str() {
+                line.push_str(&format!("  ({})", plain(e)));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(all(test, feature = "power"))]
+mod power_tests {
+    use super::render_screens;
+    use serde_json::json;
+
+    #[test]
+    fn brilho_lines_have_no_control_characters() {
+        let v = json!({"screens": [
+            {"id": "backlight", "kind": "backlight", "name": "a\u{1b}[2Jb", "value": 5, "max": 10,
+             "percent": 50, "error": "x\u{202E}y"},
+            {"id": "ddc", "kind": "ddc", "name": "LG", "value": 1, "max": 100, "percent": 1},
+        ]});
+        let out = render_screens(&v);
+        assert_eq!(
+            out,
+            "backlight  50%  a\u{FFFD}[2Jb  (x\u{FFFD}y)\nddc  1%  LG"
+        );
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'));
+    }
+
+    #[test]
+    fn screen_without_value_shows_a_dash() {
+        let v = json!({"screens": [
+            {"id": "ddc:DP-1", "kind": "ddc", "output": "DP-1", "name": "Monitor DP-1",
+             "value": null, "max": null, "percent": null,
+             "error": "Não achei o barramento deste monitor."},
+        ]});
+        assert_eq!(
+            render_screens(&v),
+            "ddc:DP-1  —  Monitor DP-1  (Não achei o barramento deste monitor.)"
+        );
+    }
+
+    #[test]
+    fn no_screens_says_so_and_set_prints_nothing() {
+        assert_eq!(
+            render_screens(&json!({"screens": []})),
+            "Nenhuma tela com brilho ajustável."
+        );
+        assert_eq!(render_screens(&json!({})), "");
     }
 }
 
