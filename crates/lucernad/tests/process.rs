@@ -8,8 +8,15 @@
 //! NVIDIA em uso na máquina, isso chamaria a NVML de verdade. O ambiente
 //! limpo também deixa o `spectrum` sem o PipeWire e o D-Bus do usuário e o
 //! `clipboard` sem `WAYLAND_DISPLAY`: nenhum teste fala com a sessão Wayland
-//! do usuário (a área de transferência dele nunca é tocada).
-#![cfg(any(feature = "system", feature = "spectrum", feature = "clipboard"))]
+//! do usuário (a área de transferência dele nunca é tocada). O `power` roda
+//! sobre uma árvore falsa (`LUCERNAD_POWER_ROOT`) e sem o D-Bus do sistema:
+//! o brilho, o logind e o i2c da máquina nunca são tocados.
+#![cfg(any(
+    feature = "system",
+    feature = "spectrum",
+    feature = "clipboard",
+    feature = "power"
+))]
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -18,17 +25,59 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-#[cfg(feature = "system")]
+#[cfg(any(feature = "system", feature = "power"))]
 use serde_json::json;
 
-/// O binário com um ambiente limpo: só `HOME`, `XDG_RUNTIME_DIR` e `PATH`.
+/// O binário com um ambiente limpo: `HOME`, `XDG_RUNTIME_DIR`, `PATH` e, para
+/// o `power`, a árvore falsa em `dir/power` e um D-Bus do sistema que não existe.
 fn lucernad(dir: &Path) -> Command {
+    // A raiz falsa precisa existir (vazia, sem telas) em todo processo.
+    let _ = std::fs::create_dir_all(dir.join("power"));
     let mut c = Command::new(env!("CARGO_BIN_EXE_lucernad"));
     c.env_clear()
         .env("HOME", dir)
         .env("XDG_RUNTIME_DIR", dir.join("run"))
+        .env("LUCERNAD_POWER_ROOT", dir.join("power"))
+        .env(
+            "DBUS_SYSTEM_BUS_ADDRESS",
+            format!("unix:path={}", dir.join("sem-barramento").display()),
+        )
         .env("PATH", std::env::var_os("PATH").unwrap_or_default());
     c
+}
+
+/// A tela integrada falsa `lucerna_teste` (máx. 1000, valor 500) em `dir/power`.
+#[cfg(feature = "power")]
+fn fake_panel(dir: &Path) -> std::path::PathBuf {
+    let power = dir.join("power");
+    std::fs::create_dir_all(&power).unwrap();
+    lucernad_power::testing::Tree::new(&power).backlight(
+        "lucerna_teste",
+        "raw",
+        1000,
+        500,
+        500,
+        None,
+    );
+    power.join("sys/class/backlight/lucerna_teste/brightness")
+}
+
+/// Espera o arquivo ter `want`, até 2 s.
+#[cfg(feature = "power")]
+fn wait_file(path: &Path, want: &str) {
+    let start = Instant::now();
+    loop {
+        let got = std::fs::read_to_string(path).unwrap_or_default();
+        if got.trim() == want {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{}: queria {want}, tem {got:?}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Um processo filho que é morto e esperado ao cair.
@@ -152,6 +201,8 @@ fn cli_help_status_and_exit_codes() {
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stdout).contains(env!("CARGO_PKG_VERSION")));
 
+    #[cfg(feature = "power")]
+    let brightness = fake_panel(t.path());
     let _srv = serve(t.path(), 60_000);
     #[cfg(feature = "system")]
     {
@@ -220,6 +271,70 @@ fn cli_help_status_and_exit_codes() {
         assert_ne!(out.status.code(), Some(0));
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("não existe mais"), "stderr: {err}");
+    }
+    #[cfg(feature = "power")]
+    {
+        // Só o status: a raiz é a falsa e o D-Bus não existe.
+        let (_w, _rx, v) = watch_json(t.path(), "power.status");
+        assert_eq!(v["data"], json!({"available": true, "error": null}), "{v}");
+        let out = lucernad(t.path()).arg("brilho").output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("backlight  50%  Tela integrada"),
+            "stdout: {stdout}"
+        );
+        let out = lucernad(t.path())
+            .args(["brilho", "backlight", "80"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        wait_file(&brightness, "800");
+        let out = lucernad(t.path())
+            .args(["brilho", "backlight"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(64), "uso errado");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("Passe o ID e o PERCENT juntos"),
+            "stderr: {err}"
+        );
+        let out = lucernad(t.path())
+            .args(["brilho", "backlight", "-10"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        wait_file(&brightness, "700");
+        let out = lucernad(t.path())
+            .args(["brilho", "backlight", "0"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(64), "uso errado");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("PERCENT precisa ser"), "stderr: {err}");
+        let out = lucernad(t.path())
+            .args(["brilho", "x", "50"])
+            .output()
+            .unwrap();
+        assert_ne!(out.status.code(), Some(0));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("Essa tela não existe."), "stderr: {err}");
     }
 }
 

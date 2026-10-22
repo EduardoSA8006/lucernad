@@ -12,6 +12,8 @@ use lucernad::{Modules, lucernad};
 #[cfg(feature = "clipboard")]
 use lucernad_clipboard::testing::quiet_config as clipboard_config;
 use lucernad_core::ModuleTask;
+#[cfg(feature = "power")]
+use lucernad_power::testing::quiet_config as power_config;
 #[cfg(feature = "spectrum")]
 use lucernad_spectrum::testing::quiet_config;
 #[cfg(feature = "system")]
@@ -41,6 +43,8 @@ pub async fn start() -> Running {
         spectrum: quiet_config(),
         #[cfg(feature = "clipboard")]
         clipboard: clipboard_config(dir.path()),
+        #[cfg(feature = "power")]
+        power: power_config(dir.path()),
     });
     d.service.idle_timeout(Duration::from_secs(60));
     let service = d.service;
@@ -57,6 +61,8 @@ pub async fn start() -> Running {
             d.spectrum_task,
             #[cfg(feature = "clipboard")]
             d.clipboard_task,
+            #[cfg(feature = "power")]
+            d.power_task,
         ],
         task,
     }

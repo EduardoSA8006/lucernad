@@ -810,6 +810,7 @@ dependencies = [
  "lucerna-service",
  "lucernad-clipboard",
  "lucernad-core",
+ "lucernad-power",
  "lucernad-spectrum",
  "lucernad-system",
  "serde_json",

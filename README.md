@@ -4,7 +4,7 @@
 
 Daemon em Rust com a lógica do shell Lucerna (espectro de áudio, sistema, área de transferência, energia e mais); o shell fica só com a interface.
 
-**Situação:** três módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs), o `spectrum` (o espectro do som do player exibido, pelo PipeWire) e o `clipboard` (o histórico da área de transferência do Wayland).
+**Situação:** quatro módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs), o `spectrum` (o espectro do som do player exibido, pelo PipeWire), o `clipboard` (o histórico da área de transferência do Wayland) e o `power` (o brilho das telas, o histórico de consumo e os perfis de energia).
 
 ## Módulos
 
@@ -59,6 +59,27 @@ Métodos:
 
 O histórico mora em `$XDG_DATA_HOME/lucerna/clipboard/` (`history.db` e `images/`); sem persistência, só em memória e as imagens em `$XDG_RUNTIME_DIR/lucerna/clipboard/images/`, apagadas ao parar. O `WAYLAND_DISPLAY` do ambiente do daemon vence o do `configure`.
 
+### `power`
+
+Ajusta o brilho das telas, lê o histórico de consumo da bateria e os perfis de energia, sem nenhum processo externo (nada de `brightnessctl`, `ddcutil` nem `busctl`). A tela integrada é lida pelo `/sys/class/backlight` e ajustada pelo logind (`SetBrightness`, sem root); os monitores externos, por DDC/CI em código próprio (o `/dev/i2c-N`, só os barramentos das placas de vídeo, falando só com o endereço 0x37 e 0x50 e gravando só o brilho). Ajustes em sequência (segurar a tecla) são juntados numa escrita só. Mudanças de fora e monitor plugado ou tirado chegam pelo uevent do kernel. Roda **só com assinante** dos tópicos (o histórico e os perfis, só com assinante deles); os métodos funcionam sozinhos, sem assinante.
+
+| Tópico | O que traz | Quando muda |
+| --- | --- | --- |
+| `power.screens` | `{"screens":[{"id","kind","output"?,"name","value","max","percent","error"?}]}`: as telas com brilho ajustável (`kind` `backlight` ou `ddc`), com o valor real; `null` até a primeira descoberta | a cada ajuste, mudança de fora ou monitor plugado/tirado |
+| `power.history` | `{"points":[{"time","rate","state"}]}`: o histórico de consumo do UPower (vazio sem bateria); `null` até a primeira leitura | a cada leitura (a cada minuto) |
+| `power.profiles` | `{"available","performance"}`: o serviço de perfis existe e tem o perfil de desempenho; `null` até a primeira leitura | quando o serviço muda |
+| `power.status` | `{"available","error"}`; `false` com o motivo se o módulo não puder rodar | quando o módulo para |
+
+Métodos:
+
+- `power.set {id, percent}` → `{}`: ajusta o brilho de uma tela (`percent` de 1 a 100).
+- `power.change {id, delta}` → `{}`: soma `delta` ao valor atual (para as teclas de brilho).
+- `power.list {}` → `{"screens":[…]}`: o mesmo do tópico, com a descoberta refeita (para a linha de comando).
+
+Erros: `-32602` para parâmetro inválido, `1001` para tela que não existe, `1002` com o módulo indisponível e `1003` para uma tela sem barramento (a linha dela diz por quê).
+
+O i2c só abre barramentos de placa de vídeo (classe PCI `0x03*`): SMBus, sensores e touchpad nunca são tocados. O `LUCERNAD_POWER_ROOT` é **só de teste**: aponta o módulo para uma árvore falsa (fora do `/sys`, do `/dev` e do `/proc`), sem logind nem DDC; em container, sem ele, o módulo fica indisponível.
+
 ## Instalação
 
 Para compilar: o `gcc` (o SQLite do histórico é compilado junto), `libpipewire`, `clang` e `pkgconf` (Arch) ou `libpipewire-0.3-dev`, `libclang-dev` e `pkg-config` (Debian/Ubuntu). O espectro precisa do PipeWire com o WirePlumber rodando.
@@ -68,8 +89,14 @@ cargo build --release --locked -p lucernad
 sudo install -Dm755 target/release/lucernad /usr/bin/lucernad
 sudo install -Dm644 -t /usr/lib/systemd/user/ crates/lucernad/systemd/lucerna-lucernad.socket crates/lucernad/systemd/lucerna-lucernad.service
 sudo install -Dm644 crates/lucernad/data/lucernad.json /usr/share/lucerna/apps/lucernad.json
+sudo install -Dm644 crates/lucernad/data/60-lucernad-i2c.rules /usr/lib/udev/rules.d/60-lucernad-i2c.rules
+sudo install -Dm644 crates/lucernad/data/lucernad-i2c.conf /usr/lib/modules-load.d/lucernad-i2c.conf
+sudo modprobe i2c-dev
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=i2c-dev
 systemctl --user daemon-reload && systemctl --user enable --now lucerna-lucernad.socket
 ```
+
+A regra udev e o `modules-load` são só para o brilho dos monitores externos: carregam o `i2c-dev` e dão acesso ao `/dev/i2c-N` das placas de vídeo ao usuário da sessão (equivale à regra do `ddcutil`, e basta uma das duas). A tela integrada não precisa deles.
 
 O socket fica em `$XDG_RUNTIME_DIR/lucerna/lucernad.sock`; o systemd sobe o daemon na primeira conexão, e ele sai sozinho depois de 60 s sem cliente (`LUCERNA_IDLE_TIMEOUT_MS` muda).
 
@@ -80,6 +107,7 @@ O socket fica em `$XDG_RUNTIME_DIR/lucerna/lucernad.sock`; o systemd sobe o daem
 - `lucernad player org.mpris.MediaPlayer2.spotify`: escolhe o player cujo som o espectro mostra (sem nome, nenhum); `lucernad watch spectrum.bands` mostra as bandas.
 - `lucernad historico [busca]`: os 20 itens mais recentes da área de transferência (com busca, só os que casam).
 - `lucernad copiar ID`: põe um item do histórico na área de transferência.
+- `lucernad brilho [ID PERCENT|+N|-N]`: as telas com brilho ajustável (com ID e PERCENT, ajusta uma; `+N` e `-N` somam ao valor atual).
 - `--json` (antes do subcomando): a saída em JSON, uma linha por estado.
 
 ## Desenvolvimento
@@ -93,10 +121,19 @@ cargo clippy -p lucernad --no-default-features --all-targets --locked -- -D warn
 cargo clippy -p lucernad --no-default-features --features system --all-targets --locked -- -D warnings
 cargo clippy -p lucernad --no-default-features --features spectrum --all-targets --locked -- -D warnings
 cargo clippy -p lucernad --no-default-features --features clipboard --all-targets --locked -- -D warnings
+cargo clippy -p lucernad --no-default-features --features power --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
 Para rodar o daemon sem o systemd: `cargo run -p lucernad -- serve`.
+
+A sonda do D-Bus do `power` (`crates/lucernad-power/tests/sonda.rs`) também só roda num container, num D-Bus do sistema de mentira, nunca no logind, no UPower nem nos perfis da máquina:
+
+```sh
+docker run --rm -v "$PWD:/src:ro" -v <toolchain>:/tc:ro archlinux:latest \
+  bash -c 'pacman -Syu --noconfirm --needed dbus gcc > /dev/null \
+    && useradd -m t && runuser -u t -- env PATH=/tc/bin:$PATH bash /src/crates/lucernad-power/tests/isolado.sh'
+```
 
 A sonda do backend Wayland (`crates/lucernad-clipboard/tests/sonda.rs`) só roda num compositor isolado, nunca na sessão do usuário: o `tests/isolado.sh` sobe um sway headless dentro de um container (o cabeçalho do script traz o `docker run`).
 

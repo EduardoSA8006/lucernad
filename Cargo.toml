@@ -22,6 +22,7 @@ lucernad-core = { path = "crates/lucernad-core" }
 lucernad-system = { path = "crates/lucernad-system" }
 lucernad-spectrum = { path = "crates/lucernad-spectrum" }
 lucernad-clipboard = { path = "crates/lucernad-clipboard" }
+lucernad-power = { path = "crates/lucernad-power" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
