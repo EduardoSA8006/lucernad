@@ -10,11 +10,14 @@ use std::time::Duration;
 
 use lucerna_ipc::{Client, ClientError};
 use lucerna_service::{ServerBuilder, WorkTracker};
+use lucernad_power::bus::{BacklightWriter, BoxFuture};
 use lucernad_power::bus::{Point, Profiles};
 use lucernad_power::ddc::set_request;
 use lucernad_power::roots::ROOT_INVALID;
 use lucernad_power::testing::{FakeBus, FakeMonitor, Fakes, Tree, edid, fake_config, lg};
-use lucernad_power::{PowerConfig, PowerTopics, register};
+use lucernad_power::{
+    Discoveries, HISTORY_RESOLUTION, HISTORY_SPAN, PowerConfig, PowerTopics, register,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -39,11 +42,12 @@ fn serve(
     dir: &Path,
     cfg: PowerConfig,
     work: WorkTracker,
-) -> (PathBuf, PowerTopics, JoinHandle<()>) {
+) -> (PathBuf, PowerTopics, Discoveries, JoinHandle<()>) {
     let path = dir.join("lucernad.sock");
     let mut builder = ServerBuilder::new("lucernad", "0.1.0");
     let power = register(&mut builder, cfg, work);
     let topics = power.topics.clone();
+    let discoveries = power.discoveries();
     let server = builder.build();
     let listener = UnixListener::bind(&path).unwrap();
     let task = power.spawn();
@@ -51,7 +55,7 @@ fn serve(
         let _task = task;
         let _ = server.serve(listener).await;
     });
-    (path, topics, handle)
+    (path, topics, discoveries, handle)
 }
 
 /// Os dublês, o diretório, o servidor e o contador de trabalho de um teste.
@@ -61,6 +65,7 @@ struct Rig {
     work: WorkTracker,
     path: PathBuf,
     t: PowerTopics,
+    discoveries: Discoveries,
     _server: JoinHandle<()>,
 }
 
@@ -74,13 +79,14 @@ fn rig_with(tweak: impl FnOnce(&mut PowerConfig)) -> Rig {
     let (mut cfg, f) = fake_config(dir.path());
     tweak(&mut cfg);
     let work = WorkTracker::new();
-    let (path, t, server) = serve(dir.path(), cfg, work.clone());
+    let (path, t, discoveries, server) = serve(dir.path(), cfg, work.clone());
     Rig {
         _dir: dir,
         f,
         work,
         path,
         t,
+        discoveries,
         _server: server,
     }
 }
@@ -221,6 +227,7 @@ async fn handshake_lists_topics_and_methods() {
         r.t.status.current().data,
         json!({"available": true, "error": null})
     );
+    assert_eq!((HISTORY_SPAN, HISTORY_RESOLUTION), (3600, 120));
 }
 
 #[tokio::test]
@@ -503,6 +510,7 @@ async fn hotplug_burst_rediscovers_once() {
     let r = rig();
     let _c = watching(&r).await;
     let (reads0, reads1, opens) = (r.f.i2c.reads(0), r.f.i2c.reads(1), r.f.i2c.opened());
+    let discoveries = r.discoveries.get();
     let drm = "/devices/pci0000:00/0000:01:00.0/drm/card1";
     for _ in 0..10 {
         r.f.uevents.send("change", "drm", drm);
@@ -512,6 +520,11 @@ async fn hotplug_burst_rediscovers_once() {
     assert_eq!(r.f.i2c.reads(0), reads0, "nenhuma leitura de i2c");
     assert_eq!(r.f.i2c.reads(1), reads1, "nenhuma leitura de i2c");
     assert_eq!(r.f.i2c.opened(), opens);
+    assert_eq!(
+        r.discoveries.get(),
+        discoveries + 1,
+        "a rajada vira uma descoberta"
+    );
 
     // Um conector novo: só o barramento 0 (o 1 já é do LG) é lido.
     plug_dell(&r);
@@ -799,7 +812,7 @@ async fn missing_i2c_dev_is_a_row_error() {
     );
     cfg.roots = tree.roots();
     let work = WorkTracker::new();
-    let (path, t, _server) = serve(dir.path(), cfg, work);
+    let (path, t, _discoveries, _server) = serve(dir.path(), cfg, work);
     let c = client(&path).await;
     let list = call(&c, "power.list", json!({})).await.unwrap();
     assert_eq!(
@@ -812,4 +825,164 @@ async fn missing_i2c_dev_is_a_row_error() {
     );
     assert_eq!(t.screens.current().data, list);
     assert!(f.i2c.opened().is_empty());
+}
+
+#[tokio::test]
+async fn panel_is_reread_without_subscriber() {
+    let r = rig();
+    let c = client(&r.path).await;
+    call(&c, "power.list", json!({})).await.unwrap();
+    // Sem assinante não há uevent: a mudança de fora só se vê relendo.
+    r.f.tree.set_value("intel_backlight", 4800);
+    c.subscribe(&["power.screens"]).await.unwrap();
+    wait_pct(&r.t, "backlight", 25).await;
+    c.unsubscribe(&["power.screens"]).await.unwrap();
+    wait_until(LONG, "o uevent largado", || r.f.uevents.watching() == 0).await;
+
+    // Um ajuste sem assinante soma sobre o valor de agora.
+    r.f.tree.set_value("intel_backlight", 1920);
+    change(&c, "backlight", 5).await;
+    wait_until(LONG, "a escrita de 15%", || {
+        r.f.writer.writes() == [("intel_backlight".to_string(), 2880)]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn error_rows_retry_on_explicit_requests() {
+    let r = rig();
+    r.f.i2c.clone().denied(1);
+    let c = client(&r.path).await;
+    let list = call(&c, "power.list", json!({})).await.unwrap();
+    assert_eq!(list["screens"][1]["error"], NO_ACCESS);
+    // Ainda sem acesso: o ajuste diz o erro da linha.
+    assert_eq!(
+        rpc_error(call(&c, "power.set", json!({"id": LG, "percent": 50})).await),
+        (1003, NO_ACCESS.to_string())
+    );
+    // A regra instalada: o próximo ajuste acha o monitor.
+    r.f.i2c.allow(1);
+    set(&c, LG, 50).await;
+    wait_pct(&r.t, LG, 50).await;
+    assert!(screen(&r.t, LG).unwrap().get("error").is_none());
+}
+
+/// Um defeito posto nos dublês antes da descoberta.
+type Breaker = fn(&Fakes);
+
+#[tokio::test]
+async fn ddc_errors_reach_the_row() {
+    let cases: [(Breaker, &str); 3] = [
+        (
+            |f| drop(f.i2c.clone().missing(1)),
+            "Sem o /dev/i2c-1: carregue o módulo i2c-dev (veja o README).",
+        ),
+        (
+            |f| f.i2c.corrupt_times(1, 4),
+            "O monitor respondeu fora do padrão DDC/CI.",
+        ),
+        (
+            |f| drop(f.i2c.clone().unsupported(1)),
+            "O monitor não deixa ajustar o brilho pelo DDC/CI.",
+        ),
+    ];
+    for (break_it, error) in cases {
+        let r = rig();
+        break_it(&r.f);
+        let c = client(&r.path).await;
+        let list = call(&c, "power.list", json!({})).await.unwrap();
+        let lg = &list["screens"][1];
+        assert_eq!(lg["error"], error);
+        assert_eq!(lg["percent"], Value::Null, "{error}");
+    }
+}
+
+#[tokio::test]
+async fn unreadable_panel_is_a_row_error() {
+    let r = rig();
+    let brightness =
+        r.f.tree
+            .roots()
+            .sysfs
+            .join("class/backlight/intel_backlight/brightness");
+    std::fs::write(&brightness, "lixo\n").unwrap();
+    let c = client(&r.path).await;
+    let list = call(&c, "power.list", json!({})).await.unwrap();
+    let panel = &list["screens"][0];
+    let error = panel["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("Não consegui ler o brilho da tela integrada: "),
+        "{error}"
+    );
+    assert!(error.ends_with('.'));
+    assert_eq!(panel["percent"], Value::Null);
+}
+
+/// Um writer que entra em pânico.
+struct PanicWriter;
+
+impl BacklightWriter for PanicWriter {
+    fn write<'a>(&'a self, _device: &'a str, _value: u32) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { panic!("PanicWriter: de propósito") })
+    }
+}
+
+#[tokio::test]
+async fn writer_panic_is_a_row_error() {
+    let r = rig_with(|cfg| cfg.writer = Arc::new(PanicWriter));
+    let c = watching(&r).await;
+    set(&c, "backlight", 30).await;
+    wait_until(LONG, "a integrada com o erro", || {
+        screen(&r.t, "backlight").is_some_and(|s| {
+            s["error"] == "Não consegui ajustar o brilho pelo logind: erro interno."
+        })
+    })
+    .await;
+    assert_eq!(pct(&r.t, "backlight"), Some(50));
+    wait_until(LONG, "o trabalho solto", || r.work.pending() == 0).await;
+    // O módulo segue: o status não caiu.
+    assert_eq!(
+        r.t.status.current().data,
+        json!({"available": true, "error": null})
+    );
+}
+
+#[tokio::test]
+async fn hotplug_does_not_wait_for_a_stuck_new_monitor() {
+    // Um prazo longo: se o hotplug esperasse a primeira leitura, o laço
+    // ficaria parado nele.
+    let r = rig_with(|cfg| cfg.op_timeout = Duration::from_secs(3));
+    let c = watching(&r).await;
+    let dell = edid("DELL U2720Q", 2);
+    r.f.i2c.clone().monitor(
+        20,
+        FakeMonitor {
+            edid: dell.clone(),
+            current: 50,
+            max: 100,
+            off_by: 0,
+        },
+    );
+    r.f.i2c.hang(20);
+    // Pelo link `ddc` (o AUX do conector): nenhuma leitura de EDID.
+    r.f.tree
+        .connector("card1", "DP-1", "connected", &dell, Some(20));
+    r.f.uevents.send(
+        "change",
+        "drm",
+        "/devices/pci0000:00/0000:01:00.0/drm/card1",
+    );
+    wait_until(LONG, "o Dell na lista", || screen(&r.t, DELL).is_some()).await;
+
+    let start = Instant::now();
+    set(&c, "backlight", 20).await;
+    wait_pct(&r.t, "backlight", 20).await;
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(pct(&r.t, DELL), None);
+    r.f.i2c.release(20);
+    wait_pct(&r.t, DELL, 50).await;
 }

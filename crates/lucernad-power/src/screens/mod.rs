@@ -10,31 +10,30 @@
 //! operação em voo: uma escrita pedida no meio fica guardada e sai quando a
 //! anterior volta.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use lucerna_service::{RpcError, Topic, WorkGuard, WorkTracker};
-use lucernad_core::{Detached, detached, panic_message, publish_changed};
+use lucernad_core::publish_changed;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::adjust::{Adjuster, Step, percent_of};
-use crate::backlight::{Backlight, choose, read_value};
+use crate::backlight::{Backlight, read_value};
 use crate::bus::{BacklightWriter, INACTIVE_SESSION, NO_SESSION, clip_error};
-use crate::ddc::{DdcError, DdcTiming, Vcp, read_edid};
-use crate::drm::{
-    BusMatch, Connector, candidate_buses, connected, edid_name, i2c_dev_loaded, match_edid,
-};
+use crate::ddc::{DdcError, DdcTiming, Vcp};
 use crate::i2c::I2cOpener;
 use crate::monitor::{Cmd, Link};
 use crate::roots::Roots;
 use crate::uevent::{Uevent, Uevents, devpath_name};
+
+mod discovery;
+
+use discovery::Why;
 
 /// O id da tela integrada.
 pub const BACKLIGHT_ID: &str = "backlight";
@@ -54,9 +53,11 @@ pub const BUS_AMBIGUOUS: &str =
 
 /// O erro de leitura da integrada.
 fn read_failed(e: &std::io::Error) -> String {
-    clip_error(&format!(
-        "Não consegui ler o brilho da tela integrada: {e}."
-    ))
+    let cause = clip_error(&e.to_string());
+    format!(
+        "Não consegui ler o brilho da tela integrada: {}.",
+        cause.trim_end_matches('.')
+    )
 }
 
 /// Se o texto é um erro de leitura da integrada (que uma leitura boa apaga).
@@ -74,6 +75,8 @@ pub(crate) struct ScreensCfg {
     pub op_timeout: Duration,
     pub stale: Duration,
     pub hotplug_delay: Duration,
+    /// Conta as descobertas (para os testes e o diagnóstico).
+    pub discoveries: Arc<AtomicUsize>,
 }
 
 /// Um pedido dos métodos ao laço.
@@ -96,6 +99,12 @@ pub(crate) enum Request {
 /// A tela pedida não existe.
 fn no_screen() -> RpcError {
     RpcError::app(1001, "Essa tela não existe.")
+}
+
+/// A tela existe mas não tem barramento (o erro da linha, que uma nova
+/// descoberta não resolveu).
+fn row_failed(error: &str) -> RpcError {
+    RpcError::app(1003, error)
 }
 
 /// Um ajuste pedido a uma tela, em percentual.
@@ -226,6 +235,9 @@ pub(crate) struct Screens {
     /// O barramento achado pelo EDID, por conector e hash do EDID.
     cache: HashMap<(String, u64), u32>,
     discovered: bool,
+    discoveries: Arc<AtomicUsize>,
+    /// O uevent está sendo escutado (as mudanças de fora chegam sozinhas).
+    watching: bool,
     next_gen: u64,
 }
 
@@ -237,6 +249,7 @@ pub(crate) async fn run(
     mut requests: UnboundedReceiver<Request>,
 ) {
     let (events_tx, mut events) = unbounded_channel();
+    let discoveries = cfg.discoveries.clone();
     let mut s = Screens {
         cfg,
         topic: topic.clone(),
@@ -246,6 +259,8 @@ pub(crate) async fn run(
         monitors: BTreeMap::new(),
         cache: HashMap::new(),
         discovered: false,
+        discoveries,
+        watching: false,
         next_gen: 0,
     };
     loop {
@@ -267,7 +282,7 @@ pub(crate) async fn run(
         }
 
         // Com assinante: uma descoberta nova e o uevent.
-        s.discover(&mut events).await;
+        s.discover(Why::Subscribed, &mut events).await;
         let mut uevents = match s.cfg.uevents.watch() {
             Ok(rx) => Some(rx),
             Err(e) => {
@@ -277,6 +292,7 @@ pub(crate) async fn run(
                 None
             }
         };
+        s.watching = uevents.is_some();
         let mut hotplug: Option<Instant> = None;
         loop {
             let deadline = hotplug.unwrap_or_else(Instant::now);
@@ -293,10 +309,11 @@ pub(crate) async fn run(
                         "lucernad: o uevent do kernel fechou; o brilho não acompanha mais mudanças de fora"
                     );
                     uevents = None;
+                    s.watching = false;
                 }
                 Next::Uevent(Some(Uevent::Lost)) => {
                     s.reread_panel();
-                    s.discover(&mut events).await;
+                    s.discover(Why::Hotplug, &mut events).await;
                 }
                 Next::Uevent(Some(Uevent::Event {
                     subsystem, devpath, ..
@@ -315,12 +332,15 @@ pub(crate) async fn run(
                 },
                 Next::Hotplug => {
                     hotplug = None;
-                    s.discover(&mut events).await;
+                    s.discover(Why::Hotplug, &mut events).await;
                 }
                 Next::Request(None) => return,
                 Next::Request(Some(r)) => s.request(r, &mut events).await,
                 Next::Event(e) => s.event(e),
-                Next::Unsubscribed => break,
+                Next::Unsubscribed => {
+                    s.watching = false;
+                    break;
+                }
                 Next::Subscribed => {}
             }
             s.publish();
@@ -388,7 +408,7 @@ impl Screens {
     async fn request(&mut self, r: Request, events: &mut UnboundedReceiver<Event>) {
         match r {
             Request::List { reply } => {
-                self.discover(events).await;
+                self.discover(Why::Explicit, events).await;
                 let _ = reply.send(self.to_json());
             }
             Request::Set { id, percent, reply } => {
@@ -408,18 +428,36 @@ impl Screens {
         req: Req,
         events: &mut UnboundedReceiver<Event>,
     ) -> Result<(), RpcError> {
-        if !self.discovered || !self.exists(id) {
-            self.discover(events).await;
+        // Sem a tela, ou com a linha sem barramento: uma descoberta
+        // explícita (o monitor plugado sem assinante, a regra udev instalada
+        // depois).
+        if !self.discovered || !self.exists(id) || self.row_error(id).is_some() {
+            self.discover(Why::Explicit, events).await;
         }
         if !self.exists(id) {
             return Err(no_screen());
         }
+        if let Some(error) = self.row_error(id) {
+            return Err(row_failed(&error));
+        }
         if id == BACKLIGHT_ID {
+            if !self.watching {
+                // Sem o uevent, o valor pode ter mudado por fora.
+                self.reread_panel();
+            }
             self.panel_request(req);
         } else if let Some(output) = id.strip_prefix(DDC_PREFIX) {
             self.monitor_request(output, req);
         }
         Ok(())
+    }
+
+    /// O erro de uma linha de monitor sem barramento.
+    fn row_error(&self, id: &str) -> Option<String> {
+        let m = self.monitors.get(id.strip_prefix(DDC_PREFIX)?)?;
+        m.link
+            .is_none()
+            .then(|| m.error.clone().unwrap_or_default())
     }
 
     fn exists(&self, id: &str) -> bool {
@@ -488,7 +526,11 @@ impl Screens {
         };
         match step {
             Step::Write(v) if p.writing => p.deferred = Some(v),
-            Step::Write(v) => self.panel_write(v),
+            Step::Write(v) => {
+                // O que estava guardado ficou para trás deste.
+                p.deferred = None;
+                self.panel_write(v);
+            }
             Step::Publish(v) => {
                 p.shown = Some(v);
                 p.error = None;
@@ -509,13 +551,18 @@ impl Screens {
         let device = p.device.device.clone();
         let writer = self.cfg.writer.clone();
         let roots = self.cfg.roots.clone();
-        let events = self.events.clone();
+        let reply = PanelReply {
+            events: self.events.clone(),
+            epoch,
+            target: writer.target(),
+            sent: false,
+        };
         tokio::spawn(async move {
             let result = match writer.write(&device, v).await {
                 Ok(()) => read_value(&roots, &device).map_err(|e| read_failed(&e)),
                 Err(cause) => Err(write_failed(&*writer, &cause)),
             };
-            let _ = events.send(Event::Panel { epoch, result });
+            reply.send(result);
         });
     }
 
@@ -589,6 +636,8 @@ impl Screens {
         match step {
             Step::Write(v) if m.busy => m.deferred = Some(v),
             Step::Write(v) => {
+                // O que estava guardado ficou para trás deste.
+                m.deferred = None;
                 let value = u16::try_from(v).unwrap_or(u16::MAX);
                 self.dispatch(output, Cmd::Set(value));
             }
@@ -770,183 +819,38 @@ impl Screens {
             hold(&mut m.work, needed, &work);
         }
     }
+}
 
-    // ---- a descoberta ----
+/// A resposta da escrita da integrada ao laço: se a tarefa cair num pânico
+/// do writer antes de responder, o `Drop` responde com o erro (a escrita não
+/// fica em voo para sempre, nem o trabalho do daemon preso).
+struct PanelReply {
+    events: UnboundedSender<Event>,
+    epoch: u64,
+    target: &'static str,
+    sent: bool,
+}
 
-    /// A integrada e os monitores ligados agora. Os monitores que ficam (o
-    /// mesmo conector com o mesmo EDID) não são relidos; só os novos leem o
-    /// EDID dos barramentos candidatos (fora os já tomados) e o brilho.
-    async fn discover(&mut self, events: &mut UnboundedReceiver<Event>) {
-        self.discovered = true;
-        self.discover_panel();
-        let fresh = self.discover_monitors().await;
-        // Espera a primeira leitura dos monitores novos (cada uma com prazo).
-        while self
-            .monitors
-            .values()
-            .any(|m| m.reading && fresh.contains(&m.epoch))
-        {
-            match events.recv().await {
-                Some(e) => self.event(e),
-                None => break,
-            }
-        }
-        self.publish();
-    }
-
-    fn discover_panel(&mut self) {
-        let roots = self.cfg.roots.clone();
-        let Some(device) = choose(&roots) else {
-            self.panel = None;
-            return;
-        };
-        if let Some(p) = self
-            .panel
-            .as_mut()
-            .filter(|p| p.device.device == device.device)
-        {
-            // O mesmo dispositivo: o valor fica (as mudanças chegam pelo
-            // uevent); só o máximo é conferido.
-            if p.device.max != device.max {
-                p.adjuster.set_max(device.max);
-                p.device = device;
-                self.reread_panel();
-            } else {
-                p.device = device;
-            }
-            return;
-        }
-        let epoch = self.epoch();
-        let (adjuster, shown, error) = match read_value(&roots, &device.device) {
-            Ok(v) => (Adjuster::new(v, device.max), Some(v), None),
-            Err(e) => (Adjuster::new(0, device.max), None, Some(read_failed(&e))),
-        };
-        self.panel = Some(Panel {
-            epoch,
-            device,
-            adjuster,
-            shown,
-            error,
-            writing: false,
-            deferred: None,
-            work: None,
+impl PanelReply {
+    fn send(mut self, result: Result<u32, String>) {
+        self.sent = true;
+        let _ = self.events.send(Event::Panel {
+            epoch: self.epoch,
+            result,
         });
     }
+}
 
-    /// Os monitores: tira os que saíram, põe os novos e pede a primeira
-    /// leitura deles. Devolve as gerações dos novos com barramento.
-    async fn discover_monitors(&mut self) -> Vec<u64> {
-        let roots = self.cfg.roots.clone();
-        let Some(opener) = self.cfg.i2c.clone() else {
-            // A raiz de teste: sem DDC.
-            self.monitors.clear();
-            return Vec::new();
-        };
-        let list = connected(&roots);
-        let hashes: HashMap<String, u64> = list
-            .iter()
-            .map(|c| (c.name.clone(), edid_hash(&c.edid)))
-            .collect();
-        // Saiu ou trocou de monitor: a linha sai e a thread termina.
-        self.monitors
-            .retain(|name, m| hashes.get(name) == Some(&m.edid_hash));
-        let new: Vec<Connector> = list
-            .iter()
-            .filter(|c| !self.monitors.contains_key(&c.name))
-            .cloned()
-            .collect();
-        if new.is_empty() {
-            return Vec::new();
-        }
-        if !i2c_dev_loaded(&roots) {
-            for c in &new {
-                let m = self.monitor(c, None, Err(NO_I2C_DEV.to_string()));
-                self.monitors.insert(c.name.clone(), m);
-            }
-            return Vec::new();
-        }
-
-        let mut taken: Vec<u32> = list.iter().filter_map(|c| c.ddc).collect();
-        taken.extend(self.monitors.values().filter_map(|m| m.bus));
-        let mut buses: Vec<(Connector, Result<u32, String>)> = Vec::new();
-        let mut by_card: BTreeMap<PathBuf, Vec<Connector>> = BTreeMap::new();
-        for c in new {
-            let key = (c.name.clone(), edid_hash(&c.edid));
-            if let Some(bus) = c.ddc {
-                buses.push((c, Ok(bus)));
-            } else if let Some(bus) = self.cache.get(&key).filter(|b| !taken.contains(b)) {
-                taken.push(*bus);
-                buses.push((c, Ok(*bus)));
-            } else {
-                by_card.entry(c.pci.clone()).or_default().push(c);
-            }
-        }
-        for (pci, conns) in by_card {
-            let candidates = candidate_buses(&roots, &pci, &taken);
-            let read = read_edids(&opener, &candidates, self.cfg.op_timeout).await;
-            let pairs: Vec<(u32, Option<[u8; 128]>)> = read
-                .iter()
-                .map(|(bus, r)| (*bus, r.as_ref().ok().copied()))
-                .collect();
-            for c in conns {
-                let found = match match_edid(&c.edid, &pairs) {
-                    BusMatch::Found(bus) => {
-                        self.cache.insert((c.name.clone(), edid_hash(&c.edid)), bus);
-                        Ok(bus)
-                    }
-                    BusMatch::Ambiguous => Err(BUS_AMBIGUOUS.to_string()),
-                    // Um candidato que não abriu pode ser o dele: o erro de
-                    // abrir diz mais que "não achei".
-                    BusMatch::NotFound => Err(open_error(&read)
-                        .map(DdcError::message)
-                        .unwrap_or_else(|| BUS_NOT_FOUND.to_string())),
-                };
-                buses.push((c, found));
-            }
-        }
-
-        let mut fresh = Vec::new();
-        for (c, bus) in buses {
-            let link = bus
-                .as_ref()
-                .ok()
-                .map(|b| Link::spawn(opener.clone(), *b, self.cfg.timing));
-            let m = self.monitor(&c, link, bus);
-            let epoch = m.epoch;
-            let ready = m.link.is_some();
-            self.monitors.insert(c.name.clone(), m);
-            if ready {
-                fresh.push(epoch);
-                self.monitor_read(&c.name);
-            }
-        }
-        fresh
-    }
-
-    fn monitor(&mut self, c: &Connector, link: Option<Link>, bus: Result<u32, String>) -> Monitor {
-        let epoch = self.epoch();
-        let (bus, error) = match bus {
-            Ok(b) => (Some(b), None),
-            Err(e) => (None, Some(e)),
-        };
-        Monitor {
-            epoch,
-            output: c.name.clone(),
-            name: edid_name(&c.edid).unwrap_or_else(|| format!("Monitor {}", c.name)),
-            edid_hash: edid_hash(&c.edid),
-            bus,
-            link,
-            adjuster: None,
-            max: None,
-            shown: None,
-            error,
-            last_read: None,
-            busy: false,
-            stuck: false,
-            reading: false,
-            queued: Vec::new(),
-            deferred: None,
-            work: None,
+impl Drop for PanelReply {
+    fn drop(&mut self) {
+        if !self.sent {
+            let _ = self.events.send(Event::Panel {
+                epoch: self.epoch,
+                result: Err(format!(
+                    "Não consegui ajustar o brilho {}: erro interno.",
+                    self.target
+                )),
+            });
         }
     }
 }
@@ -967,11 +871,11 @@ fn write_failed(writer: &dyn BacklightWriter, cause: &str) -> String {
     if cause == NO_SESSION || cause == INACTIVE_SESSION {
         return cause.to_string();
     }
-    clip_error(&format!(
+    format!(
         "Não consegui ajustar o brilho {}: {}.",
         writer.target(),
-        cause.trim_end_matches('.')
-    ))
+        clip_error(cause.trim_end_matches('.'))
+    )
 }
 
 /// Uma linha do `power.screens`.
@@ -1006,65 +910,4 @@ fn row(
         o.insert("error".into(), json!(error));
     }
     Value::Object(o)
-}
-
-fn edid_hash(edid: &[u8]) -> u64 {
-    let mut h = DefaultHasher::new();
-    edid.hash(&mut h);
-    h.finish()
-}
-
-/// O primeiro erro de abrir um barramento (sem acesso antes de sem o
-/// `/dev/i2c-N`).
-fn open_error(read: &[(u32, Result<[u8; 128], DdcError>)]) -> Option<&DdcError> {
-    let errors = || read.iter().filter_map(|(_, r)| r.as_ref().err());
-    errors()
-        .find(|e| **e == DdcError::NoAccess)
-        .or_else(|| errors().find(|e| matches!(e, DdcError::NoDevice(_))))
-}
-
-/// Lê o EDID de cada barramento, cada um numa thread solta com `limit`
-/// (juntos: um barramento preso não segura os outros).
-async fn read_edids(
-    opener: &Arc<dyn I2cOpener>,
-    buses: &[u32],
-    limit: Duration,
-) -> Vec<(u32, Result<[u8; 128], DdcError>)> {
-    let tasks: Vec<_> = buses
-        .iter()
-        .map(|&bus| {
-            let opener = opener.clone();
-            tokio::spawn(async move {
-                let read = move || {
-                    let mut device = opener.open(bus).map_err(|e| DdcError::from_open(bus, &e))?;
-                    read_edid(&mut *device)
-                };
-                match detached(read, limit).await {
-                    Detached::Done(result) => result,
-                    Detached::TimedOut => {
-                        eprintln!("lucernad: o EDID do i2c-{bus} não veio em {limit:?}");
-                        Err(DdcError::NoAnswer)
-                    }
-                    Detached::Panicked(p) => {
-                        eprintln!(
-                            "lucernad: a leitura do EDID do i2c-{bus} entrou em pânico: {:?}",
-                            panic_message(&*p)
-                        );
-                        Err(DdcError::NoAnswer)
-                    }
-                    Detached::SpawnFailed(e) => {
-                        eprintln!(
-                            "lucernad: não consegui criar a thread do EDID do i2c-{bus}: {e}"
-                        );
-                        Err(DdcError::NoAnswer)
-                    }
-                }
-            })
-        })
-        .collect();
-    let mut out = Vec::with_capacity(tasks.len());
-    for (bus, task) in buses.iter().zip(tasks) {
-        out.push((*bus, task.await.unwrap_or(Err(DdcError::NoAnswer))));
-    }
-    out
 }

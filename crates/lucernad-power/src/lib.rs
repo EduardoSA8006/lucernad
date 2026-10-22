@@ -20,6 +20,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use lucerna_service::{RpcError, ServerBuilder, Topic, WorkTracker};
@@ -160,6 +161,7 @@ pub struct PowerTopics {
 pub struct Power {
     pub topics: PowerTopics,
     parts: Option<Parts>,
+    discoveries: Discoveries,
 }
 
 /// O que o laço leva (nada com a raiz inválida).
@@ -277,6 +279,7 @@ pub fn register(server: &mut ServerBuilder, cfg: PowerConfig, work: WorkTracker)
         profiles: server.topic("power.profiles", Value::Null),
         status: server.topic("power.status", status),
     };
+    let discoveries = Discoveries::default();
     let (parts, requests) = if cfg.root_error.is_some() {
         (None, None)
     } else {
@@ -291,6 +294,7 @@ pub fn register(server: &mut ServerBuilder, cfg: PowerConfig, work: WorkTracker)
                 op_timeout: cfg.op_timeout,
                 stale: cfg.stale,
                 hotplug_delay: cfg.hotplug_delay,
+                discoveries: discoveries.0.clone(),
             },
             bus: cfg.bus,
             history_interval: cfg.history_interval,
@@ -306,10 +310,30 @@ pub fn register(server: &mut ServerBuilder, cfg: PowerConfig, work: WorkTracker)
     method(server, "power.set", &ctx, Ctx::set);
     method(server, "power.change", &ctx, Ctx::change);
     method(server, "power.list", &ctx, Ctx::list);
-    Power { topics, parts }
+    Power {
+        topics,
+        parts,
+        discoveries,
+    }
+}
+
+/// Quantas descobertas das telas o módulo fez (para os testes e o
+/// diagnóstico). Clonar dá outra alça para o mesmo contador.
+#[derive(Clone, Default)]
+pub struct Discoveries(Arc<AtomicUsize>);
+
+impl Discoveries {
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 impl Power {
+    /// O contador de descobertas (pegue antes do [`Power::spawn`]).
+    pub fn discoveries(&self) -> Discoveries {
+        self.discoveries.clone()
+    }
+
     /// Roda o laço do módulo e o supervisor (chame dentro do runtime). Se o
     /// laço entrar em pânico, o `power.status` fica indisponível; o servidor
     /// continua atendendo. Com a raiz inválida, nada roda.

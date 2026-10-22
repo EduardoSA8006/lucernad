@@ -259,6 +259,8 @@ struct FakeState {
 struct I2cState {
     monitor: Option<FakeMonitor>,
     denied: bool,
+    missing: bool,
+    unsupported: bool,
     silent: bool,
     busy: usize,
     corrupt: usize,
@@ -296,6 +298,23 @@ impl FakeI2c {
     pub fn denied(self, bus: u32) -> FakeI2c {
         self.with(bus, |b| b.denied = true);
         self
+    }
+
+    /// Abrir o barramento `bus` dá `ENOENT` (sem o `/dev/i2c-N`).
+    pub fn missing(self, bus: u32) -> FakeI2c {
+        self.with(bus, |b| b.missing = true);
+        self
+    }
+
+    /// O monitor do `bus` responde "não suportado" ao VCP do brilho.
+    pub fn unsupported(self, bus: u32) -> FakeI2c {
+        self.with(bus, |b| b.unsupported = true);
+        self
+    }
+
+    /// Abrir o barramento `bus` volta a dar certo (a regra udev instalada).
+    pub fn allow(&self, bus: u32) {
+        self.with(bus, |b| b.denied = false);
     }
 
     /// O barramento `bus` só devolve zeros.
@@ -387,8 +406,12 @@ impl I2cOpener for FakeI2c {
     fn open(&self, bus: u32) -> io::Result<Box<dyn I2cBus>> {
         let mut state = self.state();
         state.opened.push(bus);
-        if state.buses.entry(bus).or_default().denied {
+        let b = state.buses.entry(bus).or_default();
+        if b.denied {
             return Err(io::Error::from_raw_os_error(13)); // EACCES
+        }
+        if b.missing {
+            return Err(io::Error::from_raw_os_error(2)); // ENOENT
         }
         Ok(Box::new(OpenBus {
             i2c: self.clone(),
@@ -451,7 +474,7 @@ impl I2cBus for OpenBus {
                     b.busy -= 1;
                     vec![0x6E, 0x80, 0xBE]
                 } else {
-                    let result = u8::from(code != VCP_BRIGHTNESS);
+                    let result = u8::from(code != VCP_BRIGHTNESS || b.unsupported);
                     let [max_h, max_l] = m.max.to_be_bytes();
                     let [cur_h, cur_l] = m.current.to_be_bytes();
                     let mut reply = vec![
