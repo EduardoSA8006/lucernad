@@ -26,6 +26,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rustix = { version = "1", features = ["fs", "event"] }
+i2cdev = "0.6"
 nvml-wrapper = "0.11"
 tempfile = "3"
 pipewire = "0.10"

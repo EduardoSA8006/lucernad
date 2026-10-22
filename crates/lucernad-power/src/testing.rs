@@ -1,12 +1,18 @@
 //! Ajudantes para os testes (feature `testing`): o montador de árvores falsas
-//! do sysfs e um EDID de exemplo.
+//! do sysfs, um EDID de exemplo e os barramentos i2c falsos do DDC/CI.
 //!
 //! Nada aqui toca o `/sys` ou o `/dev` de verdade: tudo fica sob a pasta dada
-//! ao [`Tree::new`].
+//! ao [`Tree::new`], e o [`FakeI2c`] nunca abre um `/dev/i2c-N`.
 
+use std::collections::HashMap;
+use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
+use crate::ddc::{DDC_ADDR, DdcTiming, EDID_ADDR, VCP_BRIGHTNESS};
+use crate::i2c::{I2cBus, I2cOpener};
 use crate::roots::Roots;
 
 /// Monta uma árvore falsa do sysfs sobre um diretório, com os links
@@ -194,4 +200,281 @@ fn link(target: &Path, at: &Path) {
         std::fs::remove_file(at).expect("trocar o link da árvore falsa");
     }
     symlink(target, at).expect("criar o link da árvore falsa");
+}
+
+/// Os atrasos do DDC/CI zerados, para os testes não esperarem.
+pub fn fast_timing() -> DdcTiming {
+    DdcTiming {
+        get_delay: Duration::ZERO,
+        set_delay: Duration::ZERO,
+        retry_delay: Duration::ZERO,
+    }
+}
+
+/// Um monitor falso atrás de um barramento do [`FakeI2c`].
+#[derive(Clone, Debug)]
+pub struct FakeMonitor {
+    /// O EDID que ele devolve em 0x50.
+    pub edid: Vec<u8>,
+    /// O brilho atual (VCP 0x10).
+    pub current: u16,
+    /// O máximo do brilho.
+    pub max: u16,
+    /// O que ele guarda a mais ou a menos do que recebe num Set VCP.
+    pub off_by: i16,
+}
+
+/// Barramentos i2c falsos, compartilhados entre os clones: cada barramento
+/// tem (ou não) um [`FakeMonitor`] e os defeitos que o teste pedir. Abrir um
+/// barramento sem monitor dá certo e toda leitura dele vem com zeros, como um
+/// barramento vazio de verdade.
+#[derive(Clone, Default)]
+pub struct FakeI2c {
+    shared: Arc<FakeShared>,
+}
+
+#[derive(Default)]
+struct FakeShared {
+    state: Mutex<FakeState>,
+    /// Acorda as leituras presas pelo [`FakeI2c::hang`].
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct FakeState {
+    buses: HashMap<u32, FakeBusState>,
+    opened: Vec<u32>,
+}
+
+#[derive(Default)]
+struct FakeBusState {
+    monitor: Option<FakeMonitor>,
+    denied: bool,
+    silent: bool,
+    busy: usize,
+    corrupt: usize,
+    slow: Duration,
+    hang: bool,
+    writes: Vec<(u16, Vec<u8>)>,
+    locks: usize,
+    unlocks: usize,
+    reads: usize,
+    /// O que a última escrita pediu.
+    pending: Pending,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Pending {
+    #[default]
+    Nothing,
+    Vcp(u8),
+    Edid(usize),
+}
+
+impl FakeI2c {
+    /// Nenhum barramento com monitor.
+    pub fn new() -> FakeI2c {
+        FakeI2c::default()
+    }
+
+    /// Põe `m` no barramento `bus`.
+    pub fn monitor(self, bus: u32, m: FakeMonitor) -> FakeI2c {
+        self.with(bus, |b| b.monitor = Some(m));
+        self
+    }
+
+    /// Abrir o barramento `bus` dá `EACCES`.
+    pub fn denied(self, bus: u32) -> FakeI2c {
+        self.with(bus, |b| b.denied = true);
+        self
+    }
+
+    /// O barramento `bus` só devolve zeros.
+    pub fn silent(self, bus: u32) -> FakeI2c {
+        self.with(bus, |b| b.silent = true);
+        self
+    }
+
+    /// As próximas `n` leituras de VCP do `bus` devolvem a "null message".
+    pub fn busy_times(&self, bus: u32, n: usize) {
+        self.with(bus, |b| b.busy = n);
+    }
+
+    /// As próximas `n` leituras de VCP do `bus` vêm com o checksum errado.
+    pub fn corrupt_times(&self, bus: u32, n: usize) {
+        self.with(bus, |b| b.corrupt = n);
+    }
+
+    /// Cada escrita e cada leitura no `bus` demora `d`.
+    pub fn slow(&self, bus: u32, d: Duration) {
+        self.with(bus, |b| b.slow = d);
+    }
+
+    /// A próxima leitura do `bus` não volta até o [`FakeI2c::release`].
+    pub fn hang(&self, bus: u32) {
+        self.with(bus, |b| b.hang = true);
+    }
+
+    /// Solta a leitura presa pelo [`FakeI2c::hang`].
+    pub fn release(&self, bus: u32) {
+        self.with(bus, |b| b.hang = false);
+        self.shared.wake.notify_all();
+    }
+
+    /// Troca o brilho do monitor do `bus` por fora (o botão do monitor).
+    pub fn set_current(&self, bus: u32, v: u16) {
+        self.with(bus, |b| {
+            if let Some(m) = b.monitor.as_mut() {
+                m.current = v;
+            }
+        });
+    }
+
+    /// O brilho do monitor do `bus` (0 sem monitor).
+    pub fn current(&self, bus: u32) -> u16 {
+        self.with(bus, |b| b.monitor.as_ref().map_or(0, |m| m.current))
+    }
+
+    /// Cada `open`, na ordem.
+    pub fn opened(&self) -> Vec<u32> {
+        self.state().opened.clone()
+    }
+
+    /// O endereço e os bytes de cada escrita no `bus`.
+    pub fn writes(&self, bus: u32) -> Vec<(u16, Vec<u8>)> {
+        self.with(bus, |b| b.writes.clone())
+    }
+
+    /// Quantos `lock` e quantos `unlock` no `bus`.
+    pub fn locks(&self, bus: u32) -> (usize, usize) {
+        self.with(bus, |b| (b.locks, b.unlocks))
+    }
+
+    /// Quantas leituras no `bus`.
+    pub fn reads(&self, bus: u32) -> usize {
+        self.with(bus, |b| b.reads)
+    }
+
+    fn state(&self) -> MutexGuard<'_, FakeState> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn with<T>(&self, bus: u32, f: impl FnOnce(&mut FakeBusState) -> T) -> T {
+        f(self.state().buses.entry(bus).or_default())
+    }
+
+    fn slowness(&self, bus: u32) {
+        let d = self.with(bus, |b| b.slow);
+        if !d.is_zero() {
+            std::thread::sleep(d);
+        }
+    }
+}
+
+impl I2cOpener for FakeI2c {
+    fn open(&self, bus: u32) -> io::Result<Box<dyn I2cBus>> {
+        let mut state = self.state();
+        state.opened.push(bus);
+        if state.buses.entry(bus).or_default().denied {
+            return Err(io::Error::from_raw_os_error(13)); // EACCES
+        }
+        Ok(Box::new(FakeBus {
+            i2c: self.clone(),
+            bus,
+        }))
+    }
+}
+
+/// Um barramento aberto do [`FakeI2c`].
+struct FakeBus {
+    i2c: FakeI2c,
+    bus: u32,
+}
+
+impl I2cBus for FakeBus {
+    fn write(&mut self, addr: u16, data: &[u8]) -> io::Result<()> {
+        self.i2c.slowness(self.bus);
+        self.i2c.with(self.bus, |b| {
+            b.writes.push((addr, data.to_vec()));
+            b.pending = Pending::Nothing;
+            let valid = data.len() >= 3
+                && data[0] == 0x51
+                && usize::from(data[1] & 0x7F) + 3 == data.len()
+                && data.iter().fold(0x6E, |acc, x| acc ^ x) == 0;
+            match (addr, data) {
+                (EDID_ADDR, [offset]) => b.pending = Pending::Edid(usize::from(*offset)),
+                (DDC_ADDR, [_, _, 0x01, code, _]) if valid => b.pending = Pending::Vcp(*code),
+                (DDC_ADDR, [_, _, 0x03, VCP_BRIGHTNESS, high, low, _]) if valid => {
+                    if let Some(m) = b.monitor.as_mut() {
+                        let asked = i32::from(u16::from_be_bytes([*high, *low]));
+                        let kept = (asked + i32::from(m.off_by)).clamp(0, i32::from(m.max));
+                        m.current = kept as u16;
+                    }
+                }
+                _ => {}
+            }
+        });
+        Ok(())
+    }
+
+    fn read(&mut self, addr: u16, buf: &mut [u8]) -> io::Result<()> {
+        self.i2c.slowness(self.bus);
+        let shared = &self.i2c.shared;
+        let mut state = self.i2c.state();
+        while state.buses.get(&self.bus).is_some_and(|b| b.hang) {
+            state = shared
+                .wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let b = state.buses.entry(self.bus).or_default();
+        b.reads += 1;
+        buf.fill(0);
+        let Some(m) = b.monitor.as_ref().filter(|_| !b.silent) else {
+            return Ok(());
+        };
+        match (addr, b.pending) {
+            (DDC_ADDR, Pending::Vcp(code)) => {
+                let reply = if b.busy > 0 {
+                    b.busy -= 1;
+                    vec![0x6E, 0x80, 0xBE]
+                } else {
+                    let result = u8::from(code != VCP_BRIGHTNESS);
+                    let [max_h, max_l] = m.max.to_be_bytes();
+                    let [cur_h, cur_l] = m.current.to_be_bytes();
+                    let mut reply = vec![
+                        0x6E, 0x88, 0x02, result, code, 0x00, max_h, max_l, cur_h, cur_l,
+                    ];
+                    let mut chk = reply.iter().fold(0x50, |acc, x| acc ^ x);
+                    if b.corrupt > 0 {
+                        b.corrupt -= 1;
+                        chk ^= 0x01;
+                    }
+                    reply.push(chk);
+                    reply
+                };
+                let n = reply.len().min(buf.len());
+                buf[..n].copy_from_slice(&reply[..n]);
+            }
+            (EDID_ADDR, Pending::Edid(offset)) => {
+                let edid = m.edid.get(offset..).unwrap_or(&[]);
+                let n = edid.len().min(buf.len());
+                buf[..n].copy_from_slice(&edid[..n]);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn lock(&mut self) -> io::Result<()> {
+        self.i2c.with(self.bus, |b| b.locks += 1);
+        Ok(())
+    }
+
+    fn unlock(&mut self) {
+        self.i2c.with(self.bus, |b| b.unlocks += 1);
+    }
 }
