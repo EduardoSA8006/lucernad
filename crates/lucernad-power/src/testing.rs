@@ -1,10 +1,12 @@
 //! Ajudantes para os testes (feature `testing`): o montador de árvores falsas
 //! do sysfs, um EDID de exemplo, os barramentos i2c falsos do DDC/CI e os
-//! uevents falsos.
+//! uevents falsos, o D-Bus falso ([`FakeBus`]), a escrita falsa do brilho
+//! ([`FakeWriter`]) e a trava da sonda ([`isolated`]).
 //!
 //! Nada aqui toca o `/sys` ou o `/dev` de verdade: tudo fica sob a pasta dada
 //! ao [`Tree::new`], o [`FakeI2c`] nunca abre um `/dev/i2c-N` e o
-//! [`FakeUevents`] nunca abre o socket netlink.
+//! [`FakeUevents`] nunca abre o socket netlink; o [`FakeBus`] e o
+//! [`FakeWriter`] nunca falam com o D-Bus.
 
 use std::collections::HashMap;
 use std::io;
@@ -13,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::bus::{BacklightWriter, BoxFuture, Point, PowerBus, Profiles, TreeWriter};
 use crate::ddc::{DDC_ADDR, DdcTiming, EDID_ADDR, VCP_BRIGHTNESS};
 use crate::i2c::{I2cBus, I2cOpener};
 use crate::roots::Roots;
@@ -245,12 +248,12 @@ struct FakeShared {
 
 #[derive(Default)]
 struct FakeState {
-    buses: HashMap<u32, FakeBusState>,
+    buses: HashMap<u32, I2cState>,
     opened: Vec<u32>,
 }
 
 #[derive(Default)]
-struct FakeBusState {
+struct I2cState {
     monitor: Option<FakeMonitor>,
     denied: bool,
     silent: bool,
@@ -365,7 +368,7 @@ impl FakeI2c {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn with<T>(&self, bus: u32, f: impl FnOnce(&mut FakeBusState) -> T) -> T {
+    fn with<T>(&self, bus: u32, f: impl FnOnce(&mut I2cState) -> T) -> T {
         f(self.state().buses.entry(bus).or_default())
     }
 
@@ -384,7 +387,7 @@ impl I2cOpener for FakeI2c {
         if state.buses.entry(bus).or_default().denied {
             return Err(io::Error::from_raw_os_error(13)); // EACCES
         }
-        Ok(Box::new(FakeBus {
+        Ok(Box::new(OpenBus {
             i2c: self.clone(),
             bus,
         }))
@@ -392,12 +395,12 @@ impl I2cOpener for FakeI2c {
 }
 
 /// Um barramento aberto do [`FakeI2c`].
-struct FakeBus {
+struct OpenBus {
     i2c: FakeI2c,
     bus: u32,
 }
 
-impl I2cBus for FakeBus {
+impl I2cBus for OpenBus {
     fn write(&mut self, addr: u16, data: &[u8]) -> io::Result<()> {
         self.i2c.slowness(self.bus);
         self.i2c.with(self.bus, |b| {
@@ -534,4 +537,178 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A trava da sonda do D-Bus (`tests/sonda.rs`): só passa com
+/// `LUCERNA_ISOLADO=1` **e** dentro de um container (`/.dockerenv` ou
+/// `/run/.containerenv`), que é onde o `tests/isolado.sh` sobe um D-Bus do
+/// sistema de mentira. Fora disso, entra em pânico: a sonda nunca fala com o
+/// logind, o UPower ou os perfis da máquina.
+pub fn isolated() {
+    let flag = std::env::var_os("LUCERNA_ISOLADO").is_some_and(|v| v == "1");
+    let container = Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists();
+    assert!(
+        flag && container,
+        "sonda.rs: só roda pelo tests/isolado.sh, num container"
+    );
+}
+
+/// O dublê do [`PowerBus`]: o teste dá o histórico, faz falhar e muda os
+/// perfis na mão.
+#[derive(Clone)]
+pub struct FakeBus {
+    state: Arc<Mutex<FakeBusState>>,
+}
+
+struct FakeBusState {
+    history: Vec<Point>,
+    failing: Option<String>,
+    panicking: bool,
+    history_calls: usize,
+    profiles: Profiles,
+    senders: Vec<tokio::sync::mpsc::UnboundedSender<Profiles>>,
+}
+
+impl Default for FakeBus {
+    fn default() -> FakeBus {
+        FakeBus {
+            state: Arc::new(Mutex::new(FakeBusState {
+                history: Vec::new(),
+                failing: None,
+                panicking: false,
+                history_calls: 0,
+                profiles: Profiles {
+                    available: true,
+                    performance: true,
+                },
+                senders: Vec::new(),
+            })),
+        }
+    }
+}
+
+impl FakeBus {
+    /// Sem histórico (sem bateria) e com os perfis `{true, true}`.
+    pub fn new() -> FakeBus {
+        FakeBus::default()
+    }
+
+    /// Com estes pontos no histórico.
+    pub fn with_history(self, points: Vec<Point>) -> FakeBus {
+        lock(&self.state).history = points;
+        self
+    }
+
+    /// Um dublê cujo `history` entra em pânico.
+    pub fn panicking() -> FakeBus {
+        let bus = FakeBus::new();
+        lock(&bus.state).panicking = true;
+        bus
+    }
+
+    /// Daqui em diante, o `history` falha com `e`.
+    pub fn history_fails(&self, e: &str) {
+        lock(&self.state).failing = Some(e.to_owned());
+    }
+
+    /// Muda os perfis e manda a todos os receptores vivos.
+    pub fn set_profiles(&self, p: Profiles) {
+        let mut state = lock(&self.state);
+        state.profiles = p;
+        state.senders.retain(|tx| tx.send(p).is_ok());
+    }
+
+    /// Quantas vezes o `history` foi chamado.
+    pub fn history_calls(&self) -> usize {
+        lock(&self.state).history_calls
+    }
+
+    /// Quantos receptores dos perfis estão vivos.
+    pub fn watching(&self) -> usize {
+        let mut state = lock(&self.state);
+        state.senders.retain(|tx| !tx.is_closed());
+        state.senders.len()
+    }
+}
+
+impl PowerBus for FakeBus {
+    fn history(&self) -> BoxFuture<'_, Result<Vec<Point>, String>> {
+        let result = {
+            let mut state = lock(&self.state);
+            state.history_calls += 1;
+            assert!(!state.panicking, "FakeBus: o history em pânico");
+            match &state.failing {
+                Some(e) => Err(e.clone()),
+                None => Ok(state.history.clone()),
+            }
+        };
+        Box::pin(async move { result })
+    }
+
+    fn watch_profiles(&self) -> tokio::sync::mpsc::UnboundedReceiver<Profiles> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = lock(&self.state);
+        let _ = tx.send(state.profiles);
+        state.senders.push(tx);
+        rx
+    }
+}
+
+/// O dublê do [`BacklightWriter`]: grava na árvore falsa como o
+/// [`TreeWriter`] e anota cada escrita feita; o teste faz falhar ou demorar.
+#[derive(Clone)]
+pub struct FakeWriter {
+    tree: Arc<TreeWriter>,
+    state: Arc<Mutex<FakeWriterState>>,
+}
+
+#[derive(Default)]
+struct FakeWriterState {
+    failing: Option<String>,
+    slow: Duration,
+    writes: Vec<(String, u32)>,
+}
+
+impl FakeWriter {
+    /// Grava no `brightness` (e no `actual_brightness`) da árvore `tree`.
+    pub fn new(tree: Tree) -> FakeWriter {
+        FakeWriter {
+            tree: Arc::new(TreeWriter {
+                roots: tree.roots(),
+            }),
+            state: Arc::default(),
+        }
+    }
+
+    /// Daqui em diante, toda escrita falha com `e` (sem gravar).
+    pub fn fails(&self, e: &str) {
+        lock(&self.state).failing = Some(e.to_owned());
+    }
+
+    /// Daqui em diante, toda escrita demora `d` antes de gravar.
+    pub fn slow(&self, d: Duration) {
+        lock(&self.state).slow = d;
+    }
+
+    /// As escritas que deram certo, em ordem: `(dispositivo, valor)`.
+    pub fn writes(&self) -> Vec<(String, u32)> {
+        lock(&self.state).writes.clone()
+    }
+}
+
+impl BacklightWriter for FakeWriter {
+    fn write<'a>(&'a self, device: &'a str, value: u32) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let slow = lock(&self.state).slow;
+            if !slow.is_zero() {
+                tokio::time::sleep(slow).await;
+            }
+            if let Some(e) = lock(&self.state).failing.clone() {
+                return Err(e);
+            }
+            self.tree.write(device, value).await?;
+            lock(&self.state).writes.push((device.to_owned(), value));
+            Ok(())
+        })
+    }
 }

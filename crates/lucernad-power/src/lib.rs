@@ -8,10 +8,12 @@
 //! os barramentos candidatos e o casamento pelo EDID), no [`drm`]; o
 //! protocolo DDC/CI, no [`ddc`], sobre o barramento do [`i2c`]; o juntar de
 //! ajustes de cada tela, no [`adjust`]; as mudanças de fora e o plugar e
-//! tirar, pelo [`uevent`] do kernel.
+//! tirar, pelo [`uevent`] do kernel; o logind, o histórico do UPower e os
+//! perfis de energia, pelo D-Bus do [`bus`].
 
 pub mod adjust;
 pub mod backlight;
+pub mod bus;
 pub mod ddc;
 pub mod drm;
 pub mod i2c;

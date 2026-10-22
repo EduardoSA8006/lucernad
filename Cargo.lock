@@ -857,6 +857,7 @@ dependencies = [
  "rustix",
  "tempfile",
  "tokio",
+ "zbus",
 ]
 
 [[package]]
