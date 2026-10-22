@@ -112,6 +112,20 @@ fn env_root_is_checked() {
         );
     }
 
+    // Uma raiz cujo sys ou dev leva ao /sys ou ao /dev reais (só o link é
+    // resolvido; nada é lido lá).
+    for (inner, real) in [("sys", "/sys"), ("dev", "/dev")] {
+        let linked = dir.path().join(format!("link-{inner}"));
+        std::fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(real, linked.join(inner)).unwrap();
+        let err = root_from_env(Some(linked.as_os_str()), false).unwrap_err();
+        assert_eq!(
+            err,
+            "LUCERNAD_POWER_ROOT inválido: precisa ser uma pasta de teste fora do /sys, do /dev e do /proc.",
+            "{inner} -> {real}"
+        );
+    }
+
     // A comparação é por componente: "sysfoo" não é o /sys.
     let sysfoo = dir.path().join("sysfoo");
     std::fs::create_dir(&sysfoo).unwrap();

@@ -42,6 +42,9 @@ const INTERNAL: [&str; 4] = ["eDP", "LVDS", "DSI", "Writeback"];
 /// O tamanho do bloco base do EDID, o que se compara.
 const EDID_BLOCK: usize = 128;
 
+/// O cabeçalho fixo de todo EDID.
+const EDID_HEADER: [u8; 8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+
 /// Os conectores com `status` `connected`, fora os internos, ordenados por
 /// nome. Um conector cuja placa não leva a um dispositivo fica de fora.
 pub fn connected(roots: &Roots) -> Vec<Connector> {
@@ -130,12 +133,18 @@ pub fn i2c_dev_loaded(roots: &Roots) -> bool {
 }
 
 /// Casa os 128 primeiros bytes do EDID do sysfs com os lidos em cada
-/// barramento (`None` = não respondeu). Só um casamento vale: nenhum é
+/// barramento (`None` = não respondeu). Um EDID do sysfs sem o cabeçalho
+/// `00 FF FF FF FF FF FF 00` não casa com nada. Só um casamento vale: nenhum é
 /// [`BusMatch::NotFound`] e mais de um, [`BusMatch::Ambiguous`] (nunca chutar).
 pub fn match_edid(sysfs_edid: &[u8], read: &[(u32, Option<[u8; 128]>)]) -> BusMatch {
     let Some(base) = sysfs_edid.get(..EDID_BLOCK) else {
         return BusMatch::NotFound;
     };
+    // Sem o cabeçalho, não é um EDID (128 zeros casariam com um barramento
+    // que devolve zeros).
+    if base[..8] != EDID_HEADER {
+        return BusMatch::NotFound;
+    }
     let mut found = read
         .iter()
         .filter(|(_, edid)| edid.as_ref().is_some_and(|edid| edid[..] == *base))

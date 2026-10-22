@@ -143,6 +143,12 @@ fn edid_matching() {
         BusMatch::NotFound
     );
     assert_eq!(match_edid(&a, &[]), BusMatch::NotFound);
+    let zeros = [0u8; 128];
+    assert_eq!(
+        match_edid(&zeros, &[(0, Some(zeros))]),
+        BusMatch::NotFound,
+        "128 zeros não são um EDID"
+    );
     assert_eq!(
         match_edid(&[], &[(1, Some(first))]),
         BusMatch::NotFound,

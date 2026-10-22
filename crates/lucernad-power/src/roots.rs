@@ -51,8 +51,8 @@ impl Roots {
 /// Ausente ou vazia: `Ok(None)` (a máquina de verdade), salvo em container,
 /// onde é recusada ([`CONTAINER_REFUSED`]). Definida, precisa ser uma pasta
 /// que existe, por caminho absoluto, e que, depois do `canonicalize`, não é o
-/// `/` nem fica dentro do `/sys`, do `/dev` ou do `/proc` (por componente);
-/// senão, [`ROOT_INVALID`]. Nunca volta à máquina de verdade com a variável
+/// `/` nem fica dentro do `/sys`, do `/dev` ou do `/proc` (por componente),
+/// e cujos `sys` e `dev`, se existem, também não levam a eles; senão, [`ROOT_INVALID`]. Nunca volta à máquina de verdade com a variável
 /// definida.
 pub fn root_from_env(value: Option<&OsStr>, in_container: bool) -> Result<Option<Roots>, String> {
     let value = value.filter(|v| !v.is_empty());
@@ -68,16 +68,40 @@ pub fn root_from_env(value: Option<&OsStr>, in_container: bool) -> Result<Option
         return Err(ROOT_INVALID.to_string());
     }
     let base = path.canonicalize().map_err(|_| ROOT_INVALID.to_string())?;
-    let forbidden = base == Path::new("/") || FORBIDDEN.iter().any(|f| base.starts_with(f));
-    if forbidden || !base.is_dir() {
+    if forbidden(&base) || !base.is_dir() {
         return Err(ROOT_INVALID.to_string());
     }
-    Ok(Some(Roots::at(&base)))
+    // O `sys` e o `dev` da raiz também: um link para o /sys ou o /dev reais
+    // levaria o módulo à máquina de verdade.
+    let roots = Roots::at(&base);
+    for inner in [&roots.sysfs, &roots.dev] {
+        if inner.symlink_metadata().is_ok() {
+            let real = inner.canonicalize().map_err(|_| ROOT_INVALID.to_string())?;
+            if forbidden(&real) {
+                return Err(ROOT_INVALID.to_string());
+            }
+        }
+    }
+    Ok(Some(roots))
 }
 
-/// Se o daemon roda num container (Docker ou Podman).
+/// Se um caminho canônico é o `/` ou fica dentro do `/sys`, do `/dev` ou do
+/// `/proc` (por componente).
+fn forbidden(path: &Path) -> bool {
+    path == Path::new("/") || FORBIDDEN.iter().any(|f| path.starts_with(f))
+}
+
+/// Se o daemon roda num container: o `/.dockerenv` do Docker (o container do
+/// `dev/test.sh`), o `/run/.containerenv` do Podman e o
+/// `/run/host/container-manager` do toolbox e do distrobox.
 pub fn in_container() -> bool {
-    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+    [
+        "/.dockerenv",
+        "/run/.containerenv",
+        "/run/host/container-manager",
+    ]
+    .iter()
+    .any(|marker| Path::new(marker).exists())
 }
 
 /// Um arquivo pequeno do sysfs (até 4 KiB), sem espaços nas pontas.
