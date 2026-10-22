@@ -76,16 +76,21 @@ impl Adjuster {
         let base = self.pending.or(self.in_flight).unwrap_or(self.current);
         let percent = i32::from(percent_of(base, self.max)).saturating_add(delta);
         let percent = u8::try_from(percent.clamp(1, 100)).unwrap_or(100);
+        let floor = raw_of(1, self.max);
         let mut target = raw_of(percent, self.max);
         // Com um máximo pequeno, um passo de percentual pode cair no mesmo
-        // valor bruto: anda um, para a tecla nunca ficar sem efeito.
-        if target == base && delta != 0 && self.max > 1 {
+        // valor bruto: anda um, para a tecla nunca ficar sem efeito. Só longe
+        // dos limites (1% e 100%): no limite o valor fica nele, e o resultado
+        // nunca sai de [1%, max] (uma base abaixo de 1% com delta negativo vai
+        // ao piso, e o "anda um" nunca a leva além dele).
+        if target == base && delta != 0 && percent > 1 && percent < 100 {
             target = if delta > 0 {
-                base.saturating_add(1).min(self.max)
+                base.saturating_add(1)
             } else {
-                base.saturating_sub(1).max(1)
+                base.saturating_sub(1)
             };
         }
+        let target = target.clamp(floor, self.max.max(floor));
         self.request(target)
     }
 
@@ -144,8 +149,15 @@ impl Adjuster {
         self.current
     }
 
-    /// Troca o máximo (a releitura do DDC pode trazer outro).
+    /// Troca o máximo (a releitura do DDC pode trazer outro). Se o máximo
+    /// mudou, o alvo pendente e o em voo são descartados: estão em valor bruto
+    /// do máximo antigo. A escrita que já saiu ainda chama `written`, que só
+    /// publica a releitura.
     pub fn set_max(&mut self, max: u32) {
+        if max != self.max {
+            self.pending = None;
+            self.in_flight = None;
+        }
         self.max = max;
     }
 }

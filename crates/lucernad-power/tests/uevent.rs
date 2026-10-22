@@ -53,12 +53,20 @@ fn rejects_garbage() {
 
 /// A thread de leitura sobre uma fonte falsa (o que o `KernelUevents` faz
 /// com o socket): só mensagens do kernel e inteiras passam, o `ENOBUFS` vira
-/// `Lost` e largar o receptor encerra a thread (o contador volta).
+/// `Lost`, subsistema que o módulo não usa fica fora e largar o receptor
+/// encerra a thread (o contador volta).
+///
+/// O `threads()` é um contador global do processo: este é o único teste
+/// deste binário que sobe a thread de leitura, então rodar em paralelo com os
+/// outros não o mexe. Um segundo teste que suba a thread precisa de um
+/// `Mutex` de teste em volta dos dois.
 #[test]
 fn reader_thread_filters_and_ends_when_dropped() {
     let before = lucernad_power::uevent::threads();
     let good = b"change@/devices/x/intel_backlight\0ACTION=change\0DEVPATH=/devices/x/intel_backlight\0SUBSYSTEM=backlight\0".to_vec();
+    let usb = b"add@/devices/usb1\0ACTION=add\0DEVPATH=/devices/usb1\0SUBSYSTEM=usb\0".to_vec();
     let mut script = vec![
+        (usb, true, false),           // do kernel, mas não é backlight nem drm: fora
         (good.clone(), false, false), // de um processo (pid ≠ 0): fora
         (good.clone(), true, true),   // truncada: fora
         (good.clone(), true, false),  // do kernel e inteira: passa

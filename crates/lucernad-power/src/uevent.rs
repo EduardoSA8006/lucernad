@@ -149,6 +149,12 @@ where
     Ok(rx)
 }
 
+/// Só o que o módulo usa vai ao canal (que é ilimitado): o `backlight` e o
+/// `drm`.
+fn wanted(event: &Uevent) -> bool {
+    matches!(event, Uevent::Event { subsystem, .. } if subsystem == "backlight" || subsystem == "drm")
+}
+
 fn read_loop(recv: &mut dyn FnMut(&mut [u8]) -> Received, tx: &UnboundedSender<Uevent>) {
     let mut buf = vec![0u8; BUFFER];
     while !tx.is_closed() {
@@ -157,10 +163,13 @@ fn read_loop(recv: &mut dyn FnMut(&mut [u8]) -> Received, tx: &UnboundedSender<U
                 len,
                 from_kernel: true,
                 truncated: false,
-            } => parse_uevent(&buf[..len.min(buf.len())]),
+            } => parse_uevent(&buf[..len.min(buf.len())]).filter(wanted),
             Received::Message { .. } | Received::Timeout => None,
             Received::Lost => Some(Uevent::Lost),
-            Received::Closed(_) => return,
+            Received::Closed(error) => {
+                eprintln!("lucernad: o uevent do kernel parou: {error:?}");
+                return;
+            }
         };
         if let Some(event) = event
             && tx.send(event).is_err()
