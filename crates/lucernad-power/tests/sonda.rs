@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lucernad_power::bus::{
-    BacklightWriter, LogindWriter, NO_SESSION, Point, PowerBus, Profiles, ZbusPower,
+    BacklightWriter, INACTIVE_SESSION, LogindWriter, NO_SESSION, Point, PowerBus, Profiles,
+    ZbusPower,
 };
 use lucernad_power::testing::isolated;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -48,12 +49,42 @@ impl FakeUser {
     }
 }
 
+/// O que a sessão falsa diz de si: `Active`, `Type` e o id do `Seat`.
+#[derive(Clone)]
+struct SessionState {
+    active: bool,
+    kind: String,
+    seat: String,
+}
+
 struct FakeSession {
     calls: Arc<Mutex<Vec<(String, String, u32)>>>,
+    state: Arc<Mutex<SessionState>>,
 }
 
 #[zbus::interface(name = "org.freedesktop.login1.Session")]
 impl FakeSession {
+    #[zbus(property)]
+    fn active(&self) -> bool {
+        self.state.lock().unwrap().active
+    }
+
+    #[zbus(property, name = "Type")]
+    fn kind(&self) -> String {
+        self.state.lock().unwrap().kind.clone()
+    }
+
+    #[zbus(property)]
+    fn seat(&self) -> (String, OwnedObjectPath) {
+        let seat = self.state.lock().unwrap().seat.clone();
+        let object = if seat.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/org/freedesktop/login1/seat/{seat}")
+        };
+        (seat, path(&object))
+    }
+
     fn set_brightness(&self, subsystem: String, name: String, brightness: u32) {
         self.calls
             .lock()
@@ -68,6 +99,11 @@ async fn logind_receives_set_brightness() {
     isolated();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let display = Arc::new(Mutex::new(("2".to_string(), path(SESSION))));
+    let state = Arc::new(Mutex::new(SessionState {
+        active: true,
+        kind: "wayland".to_string(),
+        seat: "seat0".to_string(),
+    }));
     let service = Builder::system()
         .unwrap()
         .name("org.freedesktop.login1")
@@ -83,6 +119,7 @@ async fn logind_receives_set_brightness() {
             SESSION,
             FakeSession {
                 calls: calls.clone(),
+                state: state.clone(),
             },
         )
         .unwrap()
@@ -96,6 +133,29 @@ async fn logind_receives_set_brightness() {
         *calls.lock().unwrap(),
         vec![("backlight".to_string(), "intel_backlight".to_string(), 9600)]
     );
+
+    // A troca rápida de usuário: a sessão fica inativa e nada é gravado (o
+    // brilho na tela é o do outro usuário). Ativa de novo, volta a gravar.
+    state.lock().unwrap().active = false;
+    let err = writer.write("intel_backlight", 100).await.unwrap_err();
+    assert_eq!(err, INACTIVE_SESSION);
+    assert_eq!(calls.lock().unwrap().len(), 1, "a sessão inativa não grava");
+    state.lock().unwrap().active = true;
+    writer.write("intel_backlight", 200).await.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 2);
+
+    // Uma sessão que não é gráfica (tty, sem assento) também não grava.
+    *state.lock().unwrap() = SessionState {
+        active: true,
+        kind: "tty".to_string(),
+        seat: String::new(),
+    };
+    let err = writer.write("intel_backlight", 100).await.unwrap_err();
+    assert_eq!(err, NO_SESSION);
+    // Com assento, mesmo sem o Type gráfico, grava.
+    state.lock().unwrap().seat = "seat0".to_string();
+    writer.write("intel_backlight", 300).await.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 3);
 
     // A sessão acaba: o Display vira "/" e o objeto da sessão some. O
     // caminho guardado falha uma vez e o próximo pedido relê o Display.
@@ -119,7 +179,7 @@ async fn logind_receives_set_brightness() {
         .await
         .unwrap_err();
     assert_eq!(err, NO_SESSION);
-    assert_eq!(calls.lock().unwrap().len(), 1, "nenhuma escrita a mais");
+    assert_eq!(calls.lock().unwrap().len(), 3, "nenhuma escrita a mais");
 }
 
 // --- o UPower falso ---------------------------------------------------------
@@ -166,7 +226,10 @@ impl FakeDevice {
 #[ignore = "só no D-Bus isolado (tests/isolado.sh)"]
 async fn history_from_the_battery() {
     isolated();
-    let devices = Arc::new(Mutex::new(vec![path(AC), path(BAT)]));
+    // Um aparelho que sumiu (o objeto não existe) é pulado, sem derrubar o
+    // histórico.
+    let gone = "/org/freedesktop/UPower/devices/sumiu";
+    let devices = Arc::new(Mutex::new(vec![path(AC), path(gone), path(BAT)]));
     let asked = Arc::new(Mutex::new(Vec::new()));
     // Como na sonda (d): o mais novo primeiro, taxa 0 no estado 4.
     let history = vec![
@@ -298,7 +361,10 @@ fn profiles(available: bool, performance: bool) -> Profiles {
 #[ignore = "só no D-Bus isolado (tests/isolado.sh)"]
 async fn profiles_follow_the_service() {
     isolated();
+    // Listas diferentes: o {true, true} só vem do
+    // org.freedesktop.UPower.PowerProfiles, que é o preferido.
     let all = names(&["power-saver", "balanced", "performance"]);
+    let without = names(&["power-saver", "balanced"]);
     let first = Builder::system()
         .unwrap()
         .name(UPOWER_PROFILES)
@@ -307,7 +373,12 @@ async fn profiles_follow_the_service() {
         .unwrap()
         .serve_at(UPOWER_PROFILES_PATH, UpowerProfiles { names: all.clone() })
         .unwrap()
-        .serve_at(HADESS_PATH, HadessProfiles { names: all.clone() })
+        .serve_at(
+            HADESS_PATH,
+            HadessProfiles {
+                names: without.clone(),
+            },
+        )
         .unwrap()
         .build()
         .await
@@ -316,7 +387,11 @@ async fn profiles_follow_the_service() {
     let power = ZbusPower::system();
     let mut rx = power.watch_profiles();
     let start = tokio::time::timeout(WAIT, rx.recv()).await.unwrap();
-    assert_eq!(start, Some(profiles(true, true)), "o estado atual primeiro");
+    assert_eq!(
+        start,
+        Some(profiles(true, true)),
+        "o estado atual primeiro, do UPower.PowerProfiles"
+    );
 
     // O serviço cai: os dois nomes somem.
     first.release_name(UPOWER_PROFILES).await.unwrap();

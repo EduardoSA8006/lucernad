@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use lucernad_power::bus::{
-    BacklightWriter, MAX_POINTS, Point, Profiles, TreeWriter, clip_error, points_from,
-    profiles_from,
+    BacklightWriter, MAX_POINTS, Point, Profiles, ROOT_FORBIDDEN, TreeWriter, clip_error,
+    points_from, profiles_from,
 };
+use lucernad_power::roots::Roots;
 use lucernad_power::testing::{Tree, isolated};
 use tempfile::TempDir;
 use zbus::zvariant::{OwnedValue, Value};
@@ -147,6 +149,19 @@ fn tree_writer_refuses_links_out_of_the_root() {
         "500",
         "nada escrito quando um dos arquivos sai da raiz"
     );
+
+    // Uma raiz que é o /dev de verdade é recusada antes de abrir qualquer
+    // coisa (o dispositivo nem existe: sem a trava, o erro seria outro).
+    let real = TreeWriter {
+        roots: Roots {
+            sysfs: PathBuf::from("/dev"),
+            dev: PathBuf::from("/dev"),
+        },
+    };
+    let err = runtime()
+        .block_on(real.write("lucerna-inexistente", 1))
+        .expect_err("a raiz no /dev");
+    assert_eq!(err, ROOT_FORBIDDEN);
 
     // Um nome de dispositivo que sobe na árvore também fica fora.
     let err = runtime()

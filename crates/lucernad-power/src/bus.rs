@@ -9,7 +9,7 @@
 //! [`clip_error`].
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::timeout;
@@ -28,7 +30,7 @@ use zbus::proxy::CacheProperties;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::{Connection, MatchRule, MessageStream, Proxy};
 
-use crate::roots::Roots;
+use crate::roots::{Roots, forbidden};
 
 /// Um futuro em caixa, para os traits serem usados como objeto.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -56,9 +58,21 @@ pub const HISTORY_RESOLUTION: u32 = 120;
 /// ajustar…".
 pub const NO_SESSION: &str = "O logind não tem uma sessão gráfica deste usuário.";
 
+/// O erro do logind com a sessão gráfica do usuário inativa (outro usuário
+/// na tela, pela troca rápida de usuário): nada é gravado. Também é o texto
+/// inteiro, publicado sem o começo "Não consegui ajustar…".
+pub const INACTIVE_SESSION: &str = "A sessão gráfica deste usuário não está ativa.";
+
 /// O erro do [`TreeWriter`] quando um arquivo de brilho leva para fora da
 /// raiz de teste (um link para o `/sys` de verdade).
 pub const OUTSIDE_ROOT: &str = "o arquivo de brilho sai da raiz de teste";
+
+/// O erro do [`TreeWriter`] quando a própria raiz cai no `/sys`, no `/dev`
+/// ou no `/proc` (ou é o `/`).
+pub const ROOT_FORBIDDEN: &str = "a raiz de teste fica no /sys, no /dev ou no /proc";
+
+/// Os tipos de sessão gráfica do logind.
+const GRAPHICAL: [&str; 2] = ["wayland", "x11"];
 
 const LOGIND: &str = "org.freedesktop.login1";
 const LOGIND_USER: &str = "/org/freedesktop/login1/user/self";
@@ -276,13 +290,21 @@ impl ZbusPower {
         let upower = proxy(conn, UPOWER, UPOWER_PATH, UPOWER).await?;
         let devices: Vec<OwnedObjectPath> = within(upower.call("EnumerateDevices", &())).await?;
         for path in devices {
-            let device = proxy(conn, UPOWER, path.as_str(), UPOWER_DEVICE).await?;
-            let kind: u32 = within(device.get_property("Type")).await?;
-            if kind != BATTERY {
+            // Um aparelho que não responde (ou some no meio) fica de fora,
+            // sem derrubar o histórico.
+            let Ok(device) = proxy(conn, UPOWER, path.as_str(), UPOWER_DEVICE).await else {
+                continue;
+            };
+            if !matches!(
+                within(device.get_property::<u32>("Type")).await,
+                Ok(BATTERY)
+            ) {
                 continue;
             }
-            let supply: bool = within(device.get_property("PowerSupply")).await?;
-            if !supply {
+            if !matches!(
+                within(device.get_property::<bool>("PowerSupply")).await,
+                Ok(true)
+            ) {
                 continue;
             }
             let raw: Vec<(u32, f64, u32)> = within(device.call(
@@ -382,7 +404,10 @@ async fn follow_on(
         }
     }
     // Os sinais assinados antes da leitura: nenhuma mudança fica no meio.
-    publish(tx, last, current_profiles(conn).await);
+    // Uma leitura incerta (`None`) não publica: fica o último estado.
+    if let Some(now) = current_profiles(conn).await {
+        publish(tx, last, now);
+    }
     loop {
         tokio::select! {
             () = tx.closed() => return Ended::Closed,
@@ -390,7 +415,9 @@ async fn follow_on(
                 if !alive {
                     return Ended::Lost;
                 }
-                publish(tx, last, current_profiles(conn).await);
+                if let Some(now) = current_profiles(conn).await {
+                    publish(tx, last, now);
+                }
             }
         }
     }
@@ -416,14 +443,18 @@ fn properties_rule(path: &str) -> zbus::Result<MatchRule<'_>> {
 }
 
 /// O próximo sinal de qualquer um dos fluxos: `true` com um sinal, `false`
-/// quando um deles terminou ou deu erro (a conexão caiu).
+/// quando um deles terminou (a conexão caiu). Uma mensagem com erro sozinha
+/// é pulada: a queda de verdade termina o fluxo.
 async fn next_signal(streams: &mut [MessageStream]) -> bool {
     poll_fn(|cx| {
         for stream in streams.iter_mut() {
-            match Pin::new(stream).poll_next(cx) {
-                Poll::Ready(Some(Ok(_))) => return Poll::Ready(true),
-                Poll::Ready(_) => return Poll::Ready(false),
-                Poll::Pending => {}
+            loop {
+                match Pin::new(&mut *stream).poll_next(cx) {
+                    Poll::Ready(Some(Ok(_))) => return Poll::Ready(true),
+                    Poll::Ready(Some(Err(_))) => continue,
+                    Poll::Ready(None) => return Poll::Ready(false),
+                    Poll::Pending => break,
+                }
             }
         }
         Poll::Pending
@@ -432,35 +463,38 @@ async fn next_signal(streams: &mut [MessageStream]) -> bool {
 }
 
 /// O estado dos perfis agora: o primeiro serviço com dono e com a
-/// propriedade `Profiles` legível; nenhum, indisponível. Só pergunta a quem
-/// tem dono (um nome sem dono ativaria o serviço).
-async fn current_profiles(conn: &Connection) -> Profiles {
-    let Ok(dbus) = within(DBusProxy::new(conn)).await else {
-        return NO_PROFILES;
-    };
+/// propriedade `Profiles` legível; nenhum nome com dono, indisponível. Só
+/// pergunta a quem tem dono (um nome sem dono ativaria o serviço). `None`
+/// quando não deu para saber (um erro ou um prazo estourado no meio): quem
+/// chama fica com o último estado, porque só a falta de dono (ou a queda da
+/// conexão) diz que o serviço sumiu.
+async fn current_profiles(conn: &Connection) -> Option<Profiles> {
+    let dbus = within(DBusProxy::new(conn)).await.ok()?;
+    let mut uncertain = false;
     for (name, path) in PROFILE_SERVICES {
-        let Ok(bus_name) = BusName::try_from(name) else {
-            continue;
-        };
-        if !matches!(within(dbus.name_has_owner(bus_name)).await, Ok(true)) {
+        let bus_name = BusName::try_from(name).ok()?;
+        if !within(dbus.name_has_owner(bus_name)).await.ok()? {
             continue;
         }
         let read = async {
             let service = proxy(conn, name, path, name).await?;
             within(service.get_property::<Vec<HashMap<String, OwnedValue>>>("Profiles")).await
         };
-        if let Ok(list) = read.await {
-            return profiles_from(&list);
+        match read.await {
+            Ok(list) => return Some(profiles_from(&list)),
+            Err(_) => uncertain = true,
         }
     }
-    NO_PROFILES
+    (!uncertain).then_some(NO_PROFILES)
 }
 
 /// Por que não há o caminho da sessão.
 enum NoPath {
     /// O `Display` é `/`: sem sessão gráfica.
     NoSession,
-    /// A leitura do `Display` falhou.
+    /// A sessão não está ativa (outro usuário na tela).
+    Inactive,
+    /// A leitura do `Display` ou da sessão falhou.
     Failed(Failure),
 }
 
@@ -500,15 +534,54 @@ impl LogindWriter {
         Ok(path)
     }
 
+    /// Se a sessão `path` pode receber o brilho agora: ativa e gráfica (o
+    /// `Type` `wayland` ou `x11`, ou com assento). Conferido a cada escrita:
+    /// com a troca rápida de usuário, a sessão fica inativa e o brilho é do
+    /// outro usuário.
+    async fn usable(session: &Proxy<'_>) -> Result<(), NoPath> {
+        let active: bool = within(session.get_property("Active"))
+            .await
+            .map_err(NoPath::Failed)?;
+        let kind: String = within(session.get_property("Type"))
+            .await
+            .map_err(NoPath::Failed)?;
+        let (seat, _): (String, OwnedObjectPath) = within(session.get_property("Seat"))
+            .await
+            .map_err(NoPath::Failed)?;
+        if !GRAPHICAL.contains(&kind.as_str()) && seat.is_empty() {
+            return Err(NoPath::NoSession);
+        }
+        if !active {
+            return Err(NoPath::Inactive);
+        }
+        Ok(())
+    }
+
     async fn set(&self, conn: &Connection, device: &str, value: u32) -> Result<(), String> {
-        let path = match self.session(conn).await {
-            Ok(path) => path,
-            Err(NoPath::NoSession) => return Err(NO_SESSION.to_string()),
+        let result = match self.session(conn).await {
+            Ok(path) => self.set_on(conn, &path, device, value).await,
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(NoPath::NoSession) => Err(NO_SESSION.to_string()),
+            Err(NoPath::Inactive) => Err(INACTIVE_SESSION.to_string()),
             Err(NoPath::Failed(err)) => {
                 self.bus.forget_on_io(&err).await;
-                return Err(clip_error(&err.to_string()));
+                Err(clip_error(&err.to_string()))
             }
-        };
+        }
+    }
+
+    /// Confere a sessão `path` e grava nela. Qualquer erro esquece o caminho
+    /// guardado: o próximo pedido relê o `Display`.
+    async fn set_on(
+        &self,
+        conn: &Connection,
+        path: &OwnedObjectPath,
+        device: &str,
+        value: u32,
+    ) -> Result<(), NoPath> {
         let call = async {
             let session = proxy(
                 conn,
@@ -516,18 +589,18 @@ impl LogindWriter {
                 path.as_str(),
                 "org.freedesktop.login1.Session",
             )
-            .await?;
-            within(session.call::<_, _, ()>("SetBrightness", &("backlight", device, value))).await
+            .await
+            .map_err(NoPath::Failed)?;
+            Self::usable(&session).await?;
+            within(session.call::<_, _, ()>("SetBrightness", &("backlight", device, value)))
+                .await
+                .map_err(NoPath::Failed)
         };
-        match call.await {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                // A sessão pode ter acabado: o próximo pedido relê o Display.
-                *self.session.lock().await = None;
-                self.bus.forget_on_io(&err).await;
-                Err(clip_error(&err.to_string()))
-            }
+        let result = call.await;
+        if result.is_err() {
+            *self.session.lock().await = None;
         }
+        result
     }
 }
 
@@ -551,6 +624,9 @@ pub struct TreeWriter {
 impl TreeWriter {
     fn write_now(&self, device: &str, value: u32) -> Result<(), String> {
         let root = self.roots.sysfs.canonicalize().map_err(|e| io_text(&e))?;
+        if forbidden(&root) {
+            return Err(ROOT_FORBIDDEN.to_string());
+        }
         let dir = self.roots.sysfs.join("class/backlight").join(device);
         let brightness = inside(&root, &dir.join("brightness"))?;
         // O `actual_brightness` é opcional, mas também precisa ficar dentro.
@@ -561,11 +637,16 @@ impl TreeWriter {
         };
         let text = format!("{value}\n");
         for path in std::iter::once(brightness).chain(actual) {
-            OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&path)
-                .and_then(|mut file| file.write_all(text.as_bytes()))
+            // O `O_NOFOLLOW`: um link posto no lugar do arquivo depois do
+            // `canonicalize` é recusado (`ELOOP`), não seguido.
+            let flags = OFlags::WRONLY | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let fd = match rustix::fs::open(&path, flags, Mode::empty()) {
+                Ok(fd) => fd,
+                Err(Errno::LOOP) => return Err(OUTSIDE_ROOT.to_string()),
+                Err(e) => return Err(io_text(&e.into())),
+            };
+            File::from(fd)
+                .write_all(text.as_bytes())
                 .map_err(|e| io_text(&e))?;
         }
         Ok(())

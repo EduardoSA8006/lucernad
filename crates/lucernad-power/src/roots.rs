@@ -87,7 +87,7 @@ pub fn root_from_env(value: Option<&OsStr>, in_container: bool) -> Result<Option
 
 /// Se um caminho canônico é o `/` ou fica dentro do `/sys`, do `/dev` ou do
 /// `/proc` (por componente).
-fn forbidden(path: &Path) -> bool {
+pub(crate) fn forbidden(path: &Path) -> bool {
     path == Path::new("/") || FORBIDDEN.iter().any(|f| path.starts_with(f))
 }
 
