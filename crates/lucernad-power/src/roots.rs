@@ -92,13 +92,15 @@ pub(crate) fn forbidden(path: &Path) -> bool {
 }
 
 /// Se o daemon roda num container: o `/.dockerenv` do Docker (o container do
-/// `dev/test.sh`), o `/run/.containerenv` do Podman e o
-/// `/run/host/container-manager` do toolbox e do distrobox.
+/// `dev/test.sh`), o `/run/.containerenv` do Podman, o
+/// `/run/host/container-manager` do toolbox e do distrobox e o
+/// `/run/systemd/container` do systemd-nspawn (e de outros que o seguem).
 pub fn in_container() -> bool {
     [
         "/.dockerenv",
         "/run/.containerenv",
         "/run/host/container-manager",
+        "/run/systemd/container",
     ]
     .iter()
     .any(|marker| Path::new(marker).exists())

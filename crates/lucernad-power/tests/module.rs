@@ -14,7 +14,7 @@ use lucernad_power::bus::{BacklightWriter, BoxFuture};
 use lucernad_power::bus::{Point, Profiles};
 use lucernad_power::ddc::set_request;
 use lucernad_power::roots::ROOT_INVALID;
-use lucernad_power::testing::{FakeBus, FakeMonitor, Fakes, Tree, edid, fake_config, lg};
+use lucernad_power::testing::{FakeBus, FakeMonitor, Fakes, Tree, edid, fake_config, lg, lg_edid};
 use lucernad_power::{
     Discoveries, HISTORY_RESOLUTION, HISTORY_SPAN, PowerConfig, PowerTopics, register,
 };
@@ -407,6 +407,11 @@ async fn dead_monitor_keeps_its_row_and_the_others_work() {
     .await;
     assert_eq!(ids(&r.t), ["backlight", DELL, LG]);
     assert_eq!(pct(&r.t, DELL), Some(50), "fica o último valor conhecido");
+    // Preso, ele diz o erro em vez de juntar pedidos numa fila.
+    assert_eq!(
+        rpc_error(call(&c, "power.set", json!({"id": DELL, "percent": 40})).await),
+        (1003, NO_ANSWER.to_string())
+    );
 
     let start = Instant::now();
     set(&c, "backlight", 20).await;
@@ -860,8 +865,10 @@ async fn error_rows_retry_on_explicit_requests() {
         rpc_error(call(&c, "power.set", json!({"id": LG, "percent": 50})).await),
         (1003, NO_ACCESS.to_string())
     );
-    // A regra instalada: o próximo ajuste acha o monitor.
+    // A regra instalada: o próximo ajuste, passado o intervalo das novas
+    // tentativas (300 ms no `fake_config`), acha o monitor.
     r.f.i2c.allow(1);
+    tokio::time::sleep(Duration::from_millis(400)).await;
     set(&c, LG, 50).await;
     wait_pct(&r.t, LG, 50).await;
     assert!(screen(&r.t, LG).unwrap().get("error").is_none());
@@ -910,12 +917,18 @@ async fn unreadable_panel_is_a_row_error() {
     let list = call(&c, "power.list", json!({})).await.unwrap();
     let panel = &list["screens"][0];
     let error = panel["error"].as_str().unwrap();
-    assert!(
-        error.starts_with("Não consegui ler o brilho da tela integrada: "),
-        "{error}"
+    // A causa sem o texto do errno (esse vai só para o log).
+    assert_eq!(
+        error,
+        "Não consegui ler o brilho da tela integrada: o valor não é um número."
     );
-    assert!(error.ends_with('.'));
     assert_eq!(panel["percent"], Value::Null);
+    // Sem valor lido, o `change` não tem base: diz o erro, nada é gravado.
+    assert_eq!(
+        rpc_error(call(&c, "power.change", json!({"id": "backlight", "delta": 5})).await),
+        (1003, error.to_string())
+    );
+    assert!(r.f.writer.writes().is_empty());
 }
 
 /// Um writer que entra em pânico.
@@ -985,4 +998,89 @@ async fn hotplug_does_not_wait_for_a_stuck_new_monitor() {
     assert_eq!(pct(&r.t, DELL), None);
     r.f.i2c.release(20);
     wait_pct(&r.t, DELL, 50).await;
+}
+
+#[tokio::test]
+async fn cached_bus_is_rechecked() {
+    let r = rig();
+    let _c = watching(&r).await;
+    let drm = "/devices/pci0000:00/0000:01:00.0/drm/card1";
+    // O LG sai; os barramentos são renumerados e ele volta no 0.
+    r.f.tree
+        .connector("card1", "HDMI-A-1", "disconnected", &[], None);
+    r.f.uevents.send("change", "drm", drm);
+    wait_until(LONG, "o LG fora", || screen(&r.t, LG).is_none()).await;
+    r.f.i2c.unplug(1);
+    r.f.i2c.clone().monitor(0, lg());
+    r.f.tree
+        .connector("card1", "HDMI-A-1", "connected", &lg_edid(), None);
+    r.f.uevents.send("change", "drm", drm);
+    wait_pct(&r.t, LG, 70).await;
+    assert!(screen(&r.t, LG).unwrap().get("error").is_none());
+
+    let c = client(&r.path).await;
+    set(&c, LG, 40).await;
+    wait_pct(&r.t, LG, 40).await;
+    assert_eq!(set_writes(&r.f, 0), [set_request(0x10, 40)]);
+    assert!(
+        set_writes(&r.f, 1).is_empty(),
+        "o barramento velho do cache"
+    );
+}
+
+#[tokio::test]
+async fn error_rows_retry_at_most_every_interval() {
+    let r = rig();
+    r.f.i2c.clone().denied(1);
+    let c = client(&r.path).await;
+    call(&c, "power.list", json!({})).await.unwrap();
+    let opened = r.f.i2c.opened().len();
+    // Logo em seguida: a linha com erro não é refeita.
+    call(&c, "power.list", json!({})).await.unwrap();
+    let _ = call(&c, "power.set", json!({"id": LG, "percent": 50})).await;
+    assert_eq!(r.f.i2c.opened().len(), opened);
+    // Passado o intervalo (300 ms no `fake_config`), é.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    call(&c, "power.list", json!({})).await.unwrap();
+    assert!(r.f.i2c.opened().len() > opened);
+}
+
+#[tokio::test]
+async fn timed_out_bus_waits_for_the_next_hotplug() {
+    let r = rig();
+    // O barramento 0 (sem monitor) trava na leitura do EDID.
+    r.f.i2c.hang(0);
+    r.f.tree
+        .connector("card1", "DP-1", "connected", &edid("Fantasma", 3), None);
+    let c = client(&r.path).await;
+    let list = call(&c, "power.list", json!({})).await.unwrap();
+    assert_eq!(
+        list["screens"][1]["error"],
+        "Não achei o barramento deste monitor."
+    );
+    let opens0 = || r.f.i2c.opened().iter().filter(|b| **b == 0).count();
+    assert_eq!(opens0(), 1);
+    r.f.i2c.release(0);
+
+    // A nova tentativa da linha não relê o barramento que estourou o prazo.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    call(&c, "power.list", json!({})).await.unwrap();
+    assert_eq!(opens0(), 1);
+
+    // Depois de um hotplug, relê.
+    c.subscribe(&["power.screens"]).await.unwrap();
+    wait_until(LONG, "o uevent escutado", || r.f.uevents.watching() == 1).await;
+    let before = r.discoveries.get();
+    r.f.uevents.send(
+        "change",
+        "drm",
+        "/devices/pci0000:00/0000:01:00.0/drm/card1",
+    );
+    wait_until(LONG, "a descoberta do hotplug", || {
+        r.discoveries.get() > before
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    call(&c, "power.list", json!({})).await.unwrap();
+    assert_eq!(opens0(), 2);
 }

@@ -182,6 +182,22 @@ pub trait PowerBus: Send + Sync + 'static {
     fn watch_profiles(&self) -> UnboundedReceiver<Profiles>;
 }
 
+/// Nenhum D-Bus: sem histórico e sem serviço de perfis (a raiz de teste do
+/// `LUCERNAD_POWER_ROOT`, que nunca fala com o UPower da máquina).
+pub struct NoBus;
+
+impl PowerBus for NoBus {
+    fn history(&self) -> BoxFuture<'_, Result<Vec<Point>, String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn watch_profiles(&self) -> UnboundedReceiver<Profiles> {
+        let (tx, rx) = unbounded_channel();
+        let _ = tx.send(NO_PROFILES);
+        rx
+    }
+}
+
 /// A conexão preguiçosa com o D-Bus do sistema, refeita depois de um erro de
 /// E/S (como o `SessionBus` do espectro).
 struct SystemBus {

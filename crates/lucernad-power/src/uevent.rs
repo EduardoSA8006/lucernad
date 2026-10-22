@@ -179,6 +179,27 @@ fn read_loop(recv: &mut dyn FnMut(&mut [u8]) -> Received, tx: &UnboundedSender<U
     }
 }
 
+/// Nenhum uevent: a escuta fica aberta e calada (a raiz de teste do
+/// `LUCERNAD_POWER_ROOT`, que nunca ouve o kernel da máquina).
+#[derive(Default)]
+pub struct NoUevents {
+    senders: std::sync::Mutex<Vec<UnboundedSender<Uevent>>>,
+}
+
+impl Uevents for NoUevents {
+    fn watch(&self) -> Result<UnboundedReceiver<Uevent>, String> {
+        let (tx, rx) = unbounded_channel();
+        let mut senders = self
+            .senders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Guarda o emissor (o canal não fecha) e larga os já sem receptor.
+        senders.retain(|tx| !tx.is_closed());
+        senders.push(tx);
+        Ok(rx)
+    }
+}
+
 /// Os uevents do kernel por um socket `NETLINK_KOBJECT_UEVENT` (só em
 /// produção; nenhum teste abre o socket de verdade).
 pub struct KernelUevents;

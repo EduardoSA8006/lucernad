@@ -342,7 +342,8 @@ fn brightness_command() -> lucerna_cli::CliCommand {
     }
 }
 
-/// Uma linha `id  N%  nome` por tela (com `  (erro)` quando houver); só o
+/// Uma linha `id  N%  nome` por tela (`—` no lugar do percentual quando a
+/// tela não tem valor lido, e `  (erro)` quando houver); só o
 /// `power.list` traz `screens`: o `{}` do `set` não imprime nada.
 #[cfg(feature = "power")]
 fn render_screens(v: &serde_json::Value) -> String {
@@ -355,11 +356,14 @@ fn render_screens(v: &serde_json::Value) -> String {
     screens
         .iter()
         .map(|s| {
+            let percent = match s["percent"].as_u64() {
+                Some(p) => format!("{p}%"),
+                None => "—".to_string(),
+            };
             let mut line = format!(
-                "{}  {}%  {}",
-                plain(s["id"].as_str().unwrap_or("?")),
-                s["percent"].as_u64().unwrap_or(0),
-                plain(s["name"].as_str().unwrap_or(""))
+                "{}  {percent}  {}",
+                plain(s["id"].as_str().unwrap_or_default()),
+                plain(s["name"].as_str().unwrap_or_default())
             );
             if let Some(e) = s["error"].as_str() {
                 line.push_str(&format!("  ({})", plain(e)));
@@ -388,6 +392,19 @@ mod power_tests {
             "backlight  50%  a\u{FFFD}[2Jb  (x\u{FFFD}y)\nddc  1%  LG"
         );
         assert!(!out.chars().any(|c| c.is_control() && c != '\n'));
+    }
+
+    #[test]
+    fn screen_without_value_shows_a_dash() {
+        let v = json!({"screens": [
+            {"id": "ddc:DP-1", "kind": "ddc", "output": "DP-1", "name": "Monitor DP-1",
+             "value": null, "max": null, "percent": null,
+             "error": "Não achei o barramento deste monitor."},
+        ]});
+        assert_eq!(
+            render_screens(&v),
+            "ddc:DP-1  —  Monitor DP-1  (Não achei o barramento deste monitor.)"
+        );
     }
 
     #[test]

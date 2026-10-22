@@ -32,7 +32,7 @@ use serde_json::json;
 /// o `power`, a árvore falsa em `dir/power` e um D-Bus do sistema que não existe.
 fn lucernad(dir: &Path) -> Command {
     // A raiz falsa precisa existir (vazia, sem telas) em todo processo.
-    let _ = std::fs::create_dir_all(dir.join("power"));
+    std::fs::create_dir_all(dir.join("power")).unwrap();
     let mut c = Command::new(env!("CARGO_BIN_EXE_lucernad"));
     c.env_clear()
         .env("HOME", dir)
@@ -335,6 +335,20 @@ fn cli_help_status_and_exit_codes() {
         assert_ne!(out.status.code(), Some(0));
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("Essa tela não existe."), "stderr: {err}");
+        // Sem valor lido, o `+N` não tem base: o 1003 com o erro da linha,
+        // e nada é gravado.
+        std::fs::write(&brightness, "lixo\n").unwrap();
+        let out = lucernad(t.path())
+            .args(["brilho", "backlight", "+5"])
+            .output()
+            .unwrap();
+        assert_ne!(out.status.code(), Some(0));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("Não consegui ler o brilho da tela integrada: o valor não é um número."),
+            "stderr: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&brightness).unwrap(), "lixo\n");
     }
 }
 

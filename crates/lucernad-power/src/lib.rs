@@ -18,7 +18,7 @@
 //! tópico dele).
 
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -29,13 +29,13 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bus::{
-    BacklightWriter, LogindWriter, Point, PowerBus, TreeWriter, ZbusPower, clip_error,
+    BacklightWriter, LogindWriter, NoBus, Point, PowerBus, TreeWriter, ZbusPower, clip_error,
 };
 use crate::ddc::DdcTiming;
 use crate::i2c::{I2cOpener, LinuxI2c};
 use crate::roots::{Roots, in_container, root_from_env};
 use crate::screens::{Request, ScreensCfg};
-use crate::uevent::{KernelUevents, Uevents};
+use crate::uevent::{KernelUevents, NoUevents, Uevents};
 
 pub mod adjust;
 pub mod backlight;
@@ -59,6 +59,9 @@ pub const OP_TIMEOUT: Duration = Duration::from_secs(3);
 pub const STALE: Duration = Duration::from_secs(2);
 /// A espera depois do último uevent do `drm` antes de descobrir de novo.
 pub const HOTPLUG_DELAY: Duration = Duration::from_millis(2500);
+/// No máximo uma nova tentativa das linhas sem barramento a cada tanto
+/// (pelos métodos; o hotplug refaz por conta própria).
+pub const RETRY_ROWS: Duration = Duration::from_secs(2);
 /// De quanto em quanto tempo o histórico é relido (com assinante).
 pub const HISTORY_INTERVAL: Duration = Duration::from_secs(60);
 /// O período do histórico, em segundos (a última hora).
@@ -88,12 +91,15 @@ pub struct PowerConfig {
     pub op_timeout: Duration,
     pub stale: Duration,
     pub hotplug_delay: Duration,
+    /// O intervalo mínimo entre as novas tentativas das linhas com erro.
+    pub retry_rows: Duration,
     pub history_interval: Duration,
 }
 
 impl PowerConfig {
     /// A máquina de verdade, ou a árvore falsa do `LUCERNAD_POWER_ROOT`
-    /// (gravada direto no arquivo, sem logind nem DDC). Uma raiz inválida, ou
+    /// (gravada direto no arquivo, sem logind nem DDC, sem o uevent do kernel
+    /// e sem o D-Bus do sistema). Uma raiz inválida, ou
     /// um container sem ela, deixa o módulo indisponível: nunca volta à
     /// máquina de verdade com a variável definida.
     pub fn system() -> PowerConfig {
@@ -112,6 +118,7 @@ impl PowerConfig {
             op_timeout: OP_TIMEOUT,
             stale: STALE,
             hotplug_delay: HOTPLUG_DELAY,
+            retry_rows: RETRY_ROWS,
             history_interval: HISTORY_INTERVAL,
         };
         match root_from_env(value.as_deref(), in_container()) {
@@ -119,7 +126,7 @@ impl PowerConfig {
                 cfg.roots = Roots::system();
                 cfg.writer = Arc::new(LogindWriter::system());
                 cfg.i2c = Some(Arc::new(LinuxI2c {
-                    dev: PathBuf::from("/dev"),
+                    roots: Roots::system(),
                 }));
             }
             Ok(Some(roots)) => {
@@ -132,6 +139,10 @@ impl PowerConfig {
                     roots: roots.clone(),
                 });
                 cfg.roots = roots;
+                // Nada da máquina na raiz de teste: nem o uevent do kernel,
+                // nem o UPower e os perfis do D-Bus do sistema.
+                cfg.uevents = Arc::new(NoUevents::default());
+                cfg.bus = Arc::new(NoBus);
             }
             Err(e) => {
                 eprintln!("lucernad: {e}");
@@ -294,6 +305,7 @@ pub fn register(server: &mut ServerBuilder, cfg: PowerConfig, work: WorkTracker)
                 op_timeout: cfg.op_timeout,
                 stale: cfg.stale,
                 hotplug_delay: cfg.hotplug_delay,
+                retry_rows: cfg.retry_rows,
                 discoveries: discoveries.0.clone(),
             },
             bus: cfg.bus,

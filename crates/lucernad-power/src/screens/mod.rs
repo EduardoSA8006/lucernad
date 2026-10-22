@@ -10,7 +10,7 @@
 //! operação em voo: uma escrita pedida no meio fica guardada e sai quando a
 //! anterior volta.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -53,12 +53,19 @@ pub const BUS_AMBIGUOUS: &str =
 
 /// O erro de leitura da integrada.
 fn read_failed(e: &std::io::Error) -> String {
-    let cause = clip_error(&e.to_string());
-    format!(
-        "Não consegui ler o brilho da tela integrada: {}.",
-        cause.trim_end_matches('.')
-    )
+    // O errno e o detalhe vão só para o log; a tela recebe a causa em texto.
+    eprintln!("lucernad: não consegui ler o brilho da tela integrada: {e}");
+    let cause = match e.kind() {
+        std::io::ErrorKind::NotFound => "o arquivo brightness não existe",
+        std::io::ErrorKind::PermissionDenied => "sem permissão no arquivo brightness",
+        std::io::ErrorKind::InvalidData => "o valor não é um número",
+        _ => "o sysfs não deixou ler",
+    };
+    format!("Não consegui ler o brilho da tela integrada: {cause}.")
 }
+
+/// A integrada sem valor lido e sem erro guardado (não deve acontecer).
+const PANEL_UNKNOWN: &str = "Não consegui ler o brilho da tela integrada: o valor é desconhecido.";
 
 /// Se o texto é um erro de leitura da integrada (que uma leitura boa apaga).
 fn is_read_error(e: &str) -> bool {
@@ -75,6 +82,7 @@ pub(crate) struct ScreensCfg {
     pub op_timeout: Duration,
     pub stale: Duration,
     pub hotplug_delay: Duration,
+    pub retry_rows: Duration,
     /// Conta as descobertas (para os testes e o diagnóstico).
     pub discoveries: Arc<AtomicUsize>,
 }
@@ -236,6 +244,12 @@ pub(crate) struct Screens {
     cache: HashMap<(String, u64), u32>,
     discovered: bool,
     discoveries: Arc<AtomicUsize>,
+    /// A última nova tentativa das linhas com erro (no máximo uma a cada
+    /// `retry_rows`, fora a do hotplug).
+    last_row_retry: Option<Instant>,
+    /// Os barramentos cuja leitura do EDID passou do prazo: não são relidos
+    /// até o próximo hotplug.
+    timed_out: HashSet<u32>,
     /// O uevent está sendo escutado (as mudanças de fora chegam sozinhas).
     watching: bool,
     next_gen: u64,
@@ -260,6 +274,8 @@ pub(crate) async fn run(
         cache: HashMap::new(),
         discovered: false,
         discoveries,
+        last_row_retry: None,
+        timed_out: HashSet::new(),
         watching: false,
         next_gen: 0,
     };
@@ -441,9 +457,16 @@ impl Screens {
             return Err(row_failed(&error));
         }
         if id == BACKLIGHT_ID {
-            if !self.watching {
+            if !self.watching || self.panel.as_ref().is_some_and(|p| p.shown.is_none()) {
                 // Sem o uevent, o valor pode ter mudado por fora.
                 self.reread_panel();
+            }
+            if let Some(p) = self.panel.as_ref().filter(|p| p.shown.is_none())
+                && matches!(req, Req::Change(_))
+            {
+                // O `change` soma ao valor atual: sem ele, não grava nada.
+                let error = p.error.as_deref().unwrap_or(PANEL_UNKNOWN);
+                return Err(row_failed(error));
             }
             self.panel_request(req);
         } else if let Some(output) = id.strip_prefix(DDC_PREFIX) {
@@ -452,9 +475,13 @@ impl Screens {
         Ok(())
     }
 
-    /// O erro de uma linha de monitor sem barramento.
+    /// O erro de uma linha de monitor sem barramento, ou presa (a thread
+    /// passou do prazo e não voltou: os pedidos não fazem fila atrás dela).
     fn row_error(&self, id: &str) -> Option<String> {
         let m = self.monitors.get(id.strip_prefix(DDC_PREFIX)?)?;
+        if m.stuck {
+            return Some(DdcError::NoAnswer.message());
+        }
         m.link
             .is_none()
             .then(|| m.error.clone().unwrap_or_default())
@@ -504,7 +531,12 @@ impl Screens {
                     p.error = None;
                 }
             }
-            Err(e) => p.error = Some(read_failed(&e)),
+            Err(e) => {
+                // Sem leitura, o valor é desconhecido (e o `change` não tem
+                // base).
+                p.error = Some(read_failed(&e));
+                p.shown = None;
+            }
         }
     }
 
@@ -721,6 +753,7 @@ impl Screens {
         self.ddc_result(output, cmd, result);
         if timed_out && let Some(m) = self.monitors.get_mut(output) {
             m.error = Some(DdcError::NoAnswer.message());
+            m.queued.clear();
         }
         self.monitor_next(output);
         self.monitor_work(output);

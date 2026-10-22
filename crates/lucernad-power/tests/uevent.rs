@@ -4,7 +4,9 @@
 use std::time::{Duration, Instant};
 
 use lucernad_power::testing::FakeUevents;
-use lucernad_power::uevent::{Received, Uevent, Uevents, devpath_name, parse_uevent, spawn_reader};
+use lucernad_power::uevent::{
+    NoUevents, Received, Uevent, Uevents, devpath_name, parse_uevent, spawn_reader,
+};
 
 const BACKLIGHT: &str = "/devices/pci0000:00/0000:00:02.0/drm/card2/card2-eDP-1/intel_backlight";
 
@@ -121,4 +123,22 @@ fn fake_delivers_and_counts() {
     assert_eq!(rx.blocking_recv(), Some(Uevent::Lost));
     drop(rx);
     assert_eq!(fake.watching(), 0);
+}
+
+/// A raiz de teste: a escuta abre, fica calada e não fecha.
+#[test]
+fn no_uevents_stays_open_and_silent() {
+    let source = NoUevents::default();
+    let mut rx = source.watch().unwrap();
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    drop(rx);
+    // Uma escuta nova depois de largar a anterior também.
+    let mut rx = source.watch().unwrap();
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }

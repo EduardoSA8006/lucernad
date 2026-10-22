@@ -7,7 +7,6 @@
 
 use std::fs::File;
 use std::io;
-use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
@@ -17,6 +16,8 @@ use rustix::fs::{FlockOperation, flock};
 use rustix::io::Errno;
 
 use crate::ddc::DDC_ADDR;
+use crate::drm::is_gpu_bus;
+use crate::roots::Roots;
 
 /// Um barramento i2c aberto.
 pub trait I2cBus: Send {
@@ -58,14 +59,23 @@ fn try_flock(file: &File, tries: usize, wait: Duration) -> io::Result<()> {
     }
 }
 
-/// Os barramentos de verdade, em `<dev>/i2c-<n>`.
+/// Os barramentos de verdade, em `<dev>/i2c-<n>` da raiz. Só abre
+/// barramento de placa de vídeo ([`is_gpu_bus`] no sysfs da raiz): a última
+/// defesa contra um número de barramento que mudou (um dock, o driver
+/// recarregado) e passou a ser o SMBus ou um sensor.
 pub struct LinuxI2c {
-    pub dev: PathBuf,
+    pub roots: Roots,
 }
 
 impl I2cOpener for LinuxI2c {
     fn open(&self, bus: u32) -> io::Result<Box<dyn I2cBus>> {
-        let path = self.dev.join(format!("i2c-{bus}"));
+        if !is_gpu_bus(&self.roots, bus) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("o i2c-{bus} não é barramento de placa de vídeo; recusado"),
+            ));
+        }
+        let path = self.roots.dev.join(format!("i2c-{bus}"));
         // O `flock` vai num descritor próprio do mesmo arquivo: o do
         // `LinuxI2CDevice` não sai dele sem `unsafe`. O `flock` vale para o
         // arquivo, então o libddcutil e o PowerDevil, que travam o mesmo
@@ -129,7 +139,8 @@ mod tests {
 
     use rustix::fs::{FlockOperation, flock};
 
-    use super::try_flock;
+    use super::{I2cOpener, LinuxI2c, try_flock};
+    use crate::roots::Roots;
 
     /// Só um arquivo temporário: nenhum `/dev/i2c-N`.
     #[test]
@@ -150,5 +161,34 @@ mod tests {
 
         flock(&other, FlockOperation::Unlock).unwrap();
         try_flock(&ours, 3, Duration::from_millis(10)).unwrap();
+    }
+
+    /// Uma árvore falsa num `TempDir` (nenhum `/dev/i2c-N`): um barramento
+    /// fora de placa de vídeo é recusado antes de qualquer abertura, mesmo
+    /// com o arquivo lá.
+    #[test]
+    fn non_gpu_bus_is_never_opened() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let roots = Roots::at(dir.path());
+        let smbus = roots.sysfs.join("devices/0000:00:1f.4");
+        let adapter = smbus.join("i2c-16");
+        std::fs::create_dir_all(adapter.join("i2c-dev/i2c-16")).unwrap();
+        std::fs::write(smbus.join("class"), "0x0c0500\n").unwrap();
+        std::fs::create_dir_all(roots.sysfs.join("class/i2c-dev")).unwrap();
+        std::os::unix::fs::symlink(&adapter, adapter.join("i2c-dev/i2c-16/device")).unwrap();
+        std::os::unix::fs::symlink(
+            adapter.join("i2c-dev/i2c-16"),
+            roots.sysfs.join("class/i2c-dev/i2c-16"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&roots.dev).unwrap();
+        std::fs::write(roots.dev.join("i2c-16"), b"").unwrap();
+
+        let err = LinuxI2c { roots }.open(16).err().expect("recusado");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .contains("não é barramento de placa de vídeo")
+        );
     }
 }

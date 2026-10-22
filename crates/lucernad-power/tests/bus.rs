@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use lucernad_power::bus::{
-    BacklightWriter, MAX_POINTS, Point, Profiles, ROOT_FORBIDDEN, TreeWriter, clip_error,
-    points_from, profiles_from,
+    BacklightWriter, MAX_POINTS, NoBus, Point, PowerBus, Profiles, ROOT_FORBIDDEN, TreeWriter,
+    clip_error, points_from, profiles_from,
 };
 use lucernad_power::roots::Roots;
 use lucernad_power::testing::{Tree, isolated};
@@ -200,5 +200,22 @@ fn sonda_refuses_outside_the_container() {
     assert_eq!(
         message,
         "sonda.rs: só roda pelo tests/isolado.sh, num container"
+    );
+}
+
+/// A raiz de teste: sem histórico e sem perfis, sem D-Bus nenhum.
+#[test]
+fn no_bus_has_no_history_nor_profiles() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert_eq!(rt.block_on(NoBus.history()), Ok(vec![]));
+    let mut rx = NoBus.watch_profiles();
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Profiles {
+            available: false,
+            performance: false
+        }
     );
 }

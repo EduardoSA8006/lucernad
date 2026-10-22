@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use lucernad_core::{Detached, detached, panic_message};
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::time::Instant;
 
 use super::{
     BUS_AMBIGUOUS, BUS_NOT_FOUND, Event, Monitor, NO_I2C_DEV, Panel, Screens, read_failed,
@@ -48,6 +49,10 @@ impl Screens {
     pub(super) async fn discover(&mut self, why: Why, events: &mut UnboundedReceiver<Event>) {
         self.discovered = true;
         self.discoveries.fetch_add(1, Ordering::Relaxed);
+        if why == Why::Hotplug {
+            // Plugou ou tirou: um barramento que travou pode ter voltado.
+            self.timed_out.clear();
+        }
         self.discover_panel(why != Why::Hotplug);
         let fresh = self.discover_monitors(why == Why::Explicit).await;
         if why == Why::Explicit {
@@ -112,6 +117,15 @@ impl Screens {
     /// barramento), põe os novos e pede a primeira leitura deles. Devolve as
     /// gerações dos novos com barramento.
     async fn discover_monitors(&mut self, retry: bool) -> Vec<u64> {
+        // No máximo uma nova tentativa das linhas com erro por `retry_rows`:
+        // cada uma pode ler o EDID de todos os candidatos.
+        let retry = retry
+            && self
+                .last_row_retry
+                .is_none_or(|t| t.elapsed() >= self.cfg.retry_rows);
+        if retry {
+            self.last_row_retry = Some(Instant::now());
+        }
         let roots = self.cfg.roots.clone();
         let Some(opener) = self.cfg.i2c.clone() else {
             // A raiz de teste: sem DDC.
@@ -151,16 +165,22 @@ impl Screens {
             let key = (c.name.clone(), edid_hash(&c.edid));
             if let Some(bus) = c.ddc {
                 buses.push((c, Ok(bus)));
-            } else if let Some(bus) = self.cache.get(&key).filter(|b| !taken.contains(b)) {
-                taken.push(*bus);
-                buses.push((c, Ok(*bus)));
+            } else if let Some(bus) = self.cache.get(&key).copied()
+                && !taken.contains(&bus)
+                && self.cached_bus_holds(&opener, &c, bus, &taken).await
+            {
+                taken.push(bus);
+                buses.push((c, Ok(bus)));
             } else {
+                // O barramento guardado mudou (um dock, o driver
+                // recarregado): o casamento é refeito.
+                self.cache.remove(&key);
                 by_card.entry(c.pci.clone()).or_default().push(c);
             }
         }
         for (pci, conns) in by_card {
             let candidates = candidate_buses(&roots, &pci, &taken);
-            let read = read_edids(&opener, &candidates, self.cfg.op_timeout).await;
+            let read = self.read_edids(&opener, &candidates).await;
             let pairs: Vec<(u32, Option<[u8; 128]>)> = read
                 .iter()
                 .map(|(bus, r)| (*bus, r.as_ref().ok().copied()))
@@ -198,6 +218,50 @@ impl Screens {
             }
         }
         fresh
+    }
+
+    /// O barramento do cache ainda vale: continua candidato (de placa de
+    /// vídeo, sob a placa do conector) e o EDID lido nele casa com o do
+    /// conector.
+    async fn cached_bus_holds(
+        &mut self,
+        opener: &Arc<dyn I2cOpener>,
+        c: &Connector,
+        bus: u32,
+        taken: &[u32],
+    ) -> bool {
+        if !candidate_buses(&self.cfg.roots, &c.pci, taken).contains(&bus) {
+            return false;
+        }
+        let read = self.read_edids(opener, &[bus]).await;
+        let pairs: Vec<(u32, Option<[u8; 128]>)> = read
+            .iter()
+            .map(|(bus, r)| (*bus, r.as_ref().ok().copied()))
+            .collect();
+        match_edid(&c.edid, &pairs) == BusMatch::Found(bus)
+    }
+
+    /// O EDID dos barramentos, fora os que passaram do prazo antes (até o
+    /// próximo hotplug); os que passarem agora ficam anotados.
+    async fn read_edids(
+        &mut self,
+        opener: &Arc<dyn I2cOpener>,
+        buses: &[u32],
+    ) -> Vec<(u32, Result<[u8; 128], DdcError>)> {
+        let buses: Vec<u32> = buses
+            .iter()
+            .copied()
+            .filter(|b| !self.timed_out.contains(b))
+            .collect();
+        let read = read_edids(opener, &buses, self.cfg.op_timeout).await;
+        read.into_iter()
+            .map(|(bus, result, timed_out)| {
+                if timed_out {
+                    self.timed_out.insert(bus);
+                }
+                (bus, result)
+            })
+            .collect()
     }
 
     fn monitor(&mut self, c: &Connector, link: Option<Link>, bus: Result<u32, String>) -> Monitor {
@@ -244,39 +308,49 @@ fn open_error(read: &[(u32, Result<[u8; 128], DdcError>)]) -> Option<&DdcError> 
 }
 
 /// Lê o EDID de cada barramento, cada um numa thread solta com `limit`
-/// (juntos: um barramento preso não segura os outros).
+/// (juntos: um barramento preso não segura os outros). O terceiro campo diz
+/// se a leitura passou do prazo.
 async fn read_edids(
     opener: &Arc<dyn I2cOpener>,
     buses: &[u32],
     limit: Duration,
-) -> Vec<(u32, Result<[u8; 128], DdcError>)> {
+) -> Vec<(u32, Result<[u8; 128], DdcError>, bool)> {
     let tasks: Vec<_> = buses
         .iter()
         .map(|&bus| {
             let opener = opener.clone();
             tokio::spawn(async move {
                 let read = move || {
-                    let mut device = opener.open(bus).map_err(|e| DdcError::from_open(bus, &e))?;
+                    let mut device = opener.open(bus).map_err(|e| {
+                        let error = DdcError::from_open(bus, &e);
+                        if let DdcError::Io(detail) = &error {
+                            eprintln!("lucernad: não abri o i2c-{bus}: {detail}");
+                        }
+                        error
+                    })?;
                     read_edid(&mut *device)
                 };
                 match detached(read, limit).await {
-                    Detached::Done(result) => result,
+                    Detached::Done(result) => (result, false),
                     Detached::TimedOut => {
-                        eprintln!("lucernad: o EDID do i2c-{bus} não veio em {limit:?}");
-                        Err(DdcError::NoAnswer)
+                        eprintln!(
+                            "lucernad: o EDID do i2c-{bus} não veio em {limit:?}; \
+                             ele só é relido depois do próximo hotplug"
+                        );
+                        (Err(DdcError::NoAnswer), true)
                     }
                     Detached::Panicked(p) => {
                         eprintln!(
                             "lucernad: a leitura do EDID do i2c-{bus} entrou em pânico: {:?}",
                             panic_message(&*p)
                         );
-                        Err(DdcError::NoAnswer)
+                        (Err(DdcError::NoAnswer), false)
                     }
                     Detached::SpawnFailed(e) => {
                         eprintln!(
                             "lucernad: não consegui criar a thread do EDID do i2c-{bus}: {e}"
                         );
-                        Err(DdcError::NoAnswer)
+                        (Err(DdcError::NoAnswer), false)
                     }
                 }
             })
@@ -284,7 +358,8 @@ async fn read_edids(
         .collect();
     let mut out = Vec::with_capacity(tasks.len());
     for (bus, task) in buses.iter().zip(tasks) {
-        out.push((*bus, task.await.unwrap_or(Err(DdcError::NoAnswer))));
+        let (result, timed_out) = task.await.unwrap_or((Err(DdcError::NoAnswer), false));
+        out.push((*bus, result, timed_out));
     }
     out
 }

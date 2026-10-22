@@ -20,7 +20,7 @@ use crate::ddc::{DDC_ADDR, DdcTiming, EDID_ADDR, VCP_BRIGHTNESS};
 use crate::i2c::{I2cBus, I2cOpener};
 use crate::roots::Roots;
 use crate::uevent::{Uevent, Uevents};
-use crate::{HISTORY_INTERVAL, HOTPLUG_DELAY, OP_TIMEOUT, PowerConfig, STALE};
+use crate::{HISTORY_INTERVAL, HOTPLUG_DELAY, OP_TIMEOUT, PowerConfig, RETRY_ROWS, STALE};
 
 /// Monta uma árvore falsa do sysfs sobre um diretório, com os links
 /// simbólicos de verdade (`class/drm/<card>` → `devices/<pci>/drm/<card>`,
@@ -310,6 +310,11 @@ impl FakeI2c {
     pub fn unsupported(self, bus: u32) -> FakeI2c {
         self.with(bus, |b| b.unsupported = true);
         self
+    }
+
+    /// Tira o monitor do `bus` (o barramento fica vazio).
+    pub fn unplug(&self, bus: u32) {
+        self.with(bus, |b| b.monitor = None);
     }
 
     /// Abrir o barramento `bus` volta a dar certo (a regra udev instalada).
@@ -769,7 +774,8 @@ pub struct Fakes {
 /// (`raw`, 9600 de 19200, do `card2-eDP-1`), a NVIDIA com os barramentos 0 e
 /// 1 e o LG no `card1-HDMI-A-1` (sem o link `ddc`) e no barramento 1 do
 /// [`FakeI2c`]. Os prazos curtos: [`fast_timing`], `op_timeout` 300 ms,
-/// `stale` 100 ms, `hotplug_delay` 100 ms, `history_interval` 200 ms.
+/// `stale` 100 ms, `hotplug_delay` 100 ms, `retry_rows` 300 ms,
+/// `history_interval` 200 ms.
 pub fn fake_config(dir: &Path) -> (PowerConfig, Fakes) {
     let tree = Tree::new(dir);
     tree.gpu("0000:01:00.0", "0x030000", "card1");
@@ -802,6 +808,7 @@ pub fn fake_config(dir: &Path) -> (PowerConfig, Fakes) {
         op_timeout: Duration::from_millis(300),
         stale: Duration::from_millis(100),
         hotplug_delay: Duration::from_millis(100),
+        retry_rows: Duration::from_millis(300),
         history_interval: Duration::from_millis(200),
     };
     let fakes = Fakes {
@@ -831,6 +838,7 @@ pub fn quiet_config(dir: &Path) -> PowerConfig {
         op_timeout: OP_TIMEOUT,
         stale: STALE,
         hotplug_delay: HOTPLUG_DELAY,
+        retry_rows: RETRY_ROWS,
         history_interval: HISTORY_INTERVAL,
     }
 }

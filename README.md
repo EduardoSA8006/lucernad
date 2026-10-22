@@ -61,7 +61,7 @@ O histórico mora em `$XDG_DATA_HOME/lucerna/clipboard/` (`history.db` e `images
 
 ### `power`
 
-Ajusta o brilho das telas, lê o histórico de consumo da bateria e os perfis de energia, sem nenhum processo externo (nada de `brightnessctl`, `ddcutil` nem `busctl`). A tela integrada é lida pelo `/sys/class/backlight` e ajustada pelo logind (`SetBrightness`, sem root); os monitores externos, por DDC/CI em código próprio (o `/dev/i2c-N`, só os barramentos das placas de vídeo, falando só com o endereço 0x37 e 0x50 e gravando só o brilho). Ajustes em sequência (segurar a tecla) são juntados numa escrita só. Mudanças de fora e monitor plugado ou tirado chegam pelo uevent do kernel. Roda **só com assinante** dos tópicos (o histórico e os perfis, só com assinante deles); os métodos funcionam sozinhos, sem assinante.
+Ajusta o brilho das telas, lê o histórico de consumo da bateria e os perfis de energia, sem nenhum processo externo (nada de `brightnessctl`, `ddcutil` nem `busctl`). A tela integrada é lida pelo `/sys/class/backlight` e ajustada pelo logind (`SetBrightness`, sem root); os monitores externos, por DDC/CI em código próprio (o `/dev/i2c-N`, só os barramentos das placas de vídeo, falando só com os endereços 0x37 e 0x50 e gravando só o brilho). Ajustes em sequência (segurar a tecla) são juntados numa escrita só. Mudanças de fora e monitor plugado ou tirado chegam pelo uevent do kernel. Roda **só com assinante** dos tópicos (o histórico e os perfis, só com assinante deles); os métodos funcionam sozinhos, sem assinante.
 
 | Tópico | O que traz | Quando muda |
 | --- | --- | --- |
@@ -76,9 +76,9 @@ Métodos:
 - `power.change {id, delta}` → `{}`: soma `delta` ao valor atual (para as teclas de brilho).
 - `power.list {}` → `{"screens":[…]}`: o mesmo do tópico, com a descoberta refeita (para a linha de comando).
 
-Erros: `-32602` para parâmetro inválido, `1001` para tela que não existe, `1002` com o módulo indisponível e `1003` para uma tela sem barramento (a linha dela diz por quê).
+Erros: `-32602` para parâmetro inválido, `1001` para tela que não existe, `1002` com o módulo indisponível e `1003` para uma tela sem barramento utilizável (o `i2c-dev` fora, sem acesso, barramento não achado ou ambíguo), monitor que não respondeu ou integrada sem valor lido para o `change`; a linha dela diz por quê.
 
-O i2c só abre barramentos de placa de vídeo (classe PCI `0x03*`): SMBus, sensores e touchpad nunca são tocados. O `LUCERNAD_POWER_ROOT` é **só de teste**: aponta o módulo para uma árvore falsa (fora do `/sys`, do `/dev` e do `/proc`), sem logind nem DDC; em container, sem ele, o módulo fica indisponível.
+O i2c só abre barramentos de placa de vídeo (classe PCI `0x03*`): SMBus, sensores e touchpad nunca são tocados. O `LUCERNAD_POWER_ROOT` é **só de teste**: aponta o módulo para uma árvore falsa (fora do `/sys`, do `/dev` e do `/proc`), sem logind nem DDC, sem o uevent do kernel (mudanças de fora na árvore só aparecem relendo: num assinante novo ou num método) e sem o UPower e os perfis (histórico vazio, perfis indisponíveis); em container, sem ele, o módulo fica indisponível.
 
 ## Instalação
 
@@ -96,7 +96,14 @@ sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=i2c-dev
 systemctl --user daemon-reload && systemctl --user enable --now lucerna-lucernad.socket
 ```
 
-A regra udev e o `modules-load` são só para o brilho dos monitores externos: carregam o `i2c-dev` e dão acesso ao `/dev/i2c-N` das placas de vídeo ao usuário da sessão (equivale à regra do `ddcutil`, e basta uma das duas). A tela integrada não precisa deles.
+A regra udev e o `modules-load` são só para o brilho dos monitores externos: o `modules-load` carrega o módulo `i2c-dev` do kernel na partida (sem ele não existe `/dev/i2c-N`) e a regra dá acesso ao `/dev/i2c-N` das placas de vídeo ao usuário da sessão (equivale à regra do `ddcutil`, e basta uma das duas). A tela integrada não precisa deles.
+
+Para desfazer:
+
+```sh
+sudo rm /usr/lib/udev/rules.d/60-lucernad-i2c.rules /usr/lib/modules-load.d/lucernad-i2c.conf
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=i2c-dev
+```
 
 O socket fica em `$XDG_RUNTIME_DIR/lucerna/lucernad.sock`; o systemd sobe o daemon na primeira conexão, e ele sai sozinho depois de 60 s sem cliente (`LUCERNA_IDLE_TIMEOUT_MS` muda).
 

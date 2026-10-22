@@ -26,7 +26,7 @@ fn main() -> ExitCode {
 
     let start = Instant::now();
     let opener = LinuxI2c {
-        dev: roots.dev.clone(),
+        roots: roots.clone(),
     };
     let mut device = match opener.open(bus) {
         Ok(device) => device,
