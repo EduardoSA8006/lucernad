@@ -15,7 +15,7 @@ O shell busca a letra (LRCLIB) e o clima (Open-Meteo) direto pelo `XMLHttpReques
 - **Aba Clima copiada do Caelestia** (`caelestia-dots/shell`, `modules/dashboard/WeatherTab.qml`), adaptada à fonte, aos tamanhos de texto, aos ícones e ao tema do Lucerna, com o minimalismo dele. **A previsão hora a hora sai.**
 - **Sem reserva**, como nos outros módulos: sem o `lucernad`, a letra e o clima ficam indisponíveis.
 - **Créditos num lugar só** (2026-10-24): uma página "Créditos" nas Configurações e a seção "Créditos" do README; nenhum crédito nos painéis (sai o "Previsão da Open-Meteo" da aba Clima, a letra não ganha rótulo do Vagalume) nem na tela Sobre (sai a linha "Serviços na internet").
-- **Vagalume é escolha de quem usa** (2026-10-24): os termos da API pedem crédito com link junto do conteúdo e dizem que a API não transfere o direito de exibir a letra. Como o shell é de uso próprio e a chave é criada por cada usuário, o README avisa disso e deixa a decisão com ele; se o Vagalume pedir, o rótulo com link junto da letra é acrescentado depois.
+- **Vagalume é escolha de quem usa** (2026-10-24): os termos da API pedem crédito com link junto do conteúdo e dizem que a API não transfere o direito de exibir a letra. Como o shell é de uso próprio e a chave é criada por cada usuário, o README avisa disso e deixa a decisão com ele, deixando claro que o crédito existe de forma indireta: para usar o Vagalume, a pessoa precisa obrigatoriamente entrar no site deles e gerar a própria chave, e o Lucerna não traz chave nenhuma; se o Vagalume pedir, o rótulo com link junto da letra é acrescentado depois.
 
 ## Objetivos
 
