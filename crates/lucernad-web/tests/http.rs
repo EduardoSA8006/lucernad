@@ -226,3 +226,52 @@ fn retry_after_parsing() {
     assert_eq!(retry_after("-1"), None);
     assert_eq!(retry_after(""), None);
 }
+
+/// O pool não guarda conexão ociosa: cada pedido abre a sua e o cliente a
+/// fecha depois da resposta (o servidor aqui oferece keep-alive).
+#[tokio::test]
+async fn no_idle_connection_is_kept() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let (a, c) = (accepted.clone(), closed.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            a.fetch_add(1, Ordering::SeqCst);
+            let c = c.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                // Atende pedidos até o cliente fechar (leitura de 0 bytes).
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => {
+                            c.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        Ok(_) => {
+                            let reply = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok";
+                            if stream.write_all(reply.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let http = client();
+    let req = Request::new(format!("http://127.0.0.1:{port}/x"));
+    http.get(&req).await.expect("primeiro");
+    http.get(&req).await.expect("segundo");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), 2, "uma conexão por pedido");
+    assert_eq!(closed.load(Ordering::SeqCst), 2, "nenhuma ficou aberta");
+}

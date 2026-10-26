@@ -149,7 +149,10 @@ impl ReqwestHttp {
         let builder = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(timeout)
-            .connect_timeout(CONNECT_TIMEOUT.min(timeout));
+            .connect_timeout(CONNECT_TIMEOUT.min(timeout))
+            // Sem conexão ociosa no pool: com o modo offline ligado, nada
+            // pode ficar aberto. Custa um handshake por pedido, e são poucos.
+            .pool_max_idle_per_host(0);
         let builder = match network {
             Network::Internet => {
                 builder
