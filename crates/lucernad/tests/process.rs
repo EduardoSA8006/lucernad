@@ -10,12 +10,15 @@
 //! `clipboard` sem `WAYLAND_DISPLAY`: nenhum teste fala com a sessão Wayland
 //! do usuário (a área de transferência dele nunca é tocada). O `power` roda
 //! sobre uma árvore falsa (`LUCERNAD_POWER_ROOT`) e sem o D-Bus do sistema:
-//! o brilho, o logind e o i2c da máquina nunca são tocados.
+//! o brilho, o logind e o i2c da máquina nunca são tocados. O `web` roda
+//! contra um servidor local (`LUCERNAD_WEB_BASE`): nenhum processo daqui vai à
+//! internet.
 #![cfg(any(
     feature = "system",
     feature = "spectrum",
     feature = "clipboard",
-    feature = "power"
+    feature = "power",
+    feature = "web"
 ))]
 
 use std::io::{BufRead, BufReader};
@@ -25,11 +28,77 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-#[cfg(any(feature = "system", feature = "power"))]
+#[cfg(any(feature = "system", feature = "power", feature = "web"))]
 use serde_json::json;
 
+/// Um servidor HTTP local (127.0.0.1) num runtime próprio: vive enquanto o
+/// teste (síncrono) o guardar e morre com ele. Responde a busca de cidade
+/// com Cacaulândia e o resto com 404.
+#[cfg(feature = "web")]
+struct WebServer {
+    // O servidor cai antes do runtime que o roda.
+    server: Option<lucernad_web::testing::LocalServer>,
+    rt: Option<tokio::runtime::Runtime>,
+}
+
+#[cfg(feature = "web")]
+impl WebServer {
+    fn start() -> WebServer {
+        use lucernad_web::testing::{LocalServer, Reply};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = rt.block_on(LocalServer::start(|seen| {
+            if seen.path == "/geocoding/v1/search" {
+                Reply::json(
+                    200,
+                    &json!({"results": [{
+                        "id": 1, "name": "Cacaulândia", "latitude": -10.3375,
+                        "longitude": -62.8986, "country_code": "BR",
+                        "country": "Brasil", "admin1": "Rondônia",
+                    }]}),
+                )
+            } else {
+                Reply::text(404, "não achei")
+            }
+        }));
+        WebServer {
+            server: Some(server),
+            rt: Some(rt),
+        }
+    }
+
+    fn base(&self) -> String {
+        self.server.as_ref().unwrap().base()
+    }
+}
+
+#[cfg(feature = "web")]
+impl Drop for WebServer {
+    fn drop(&mut self) {
+        drop(self.server.take());
+        drop(self.rt.take());
+    }
+}
+
+#[cfg(feature = "web")]
+thread_local! {
+    // Um servidor por teste (cada teste roda na própria thread): sobe na
+    // primeira vez que um processo precisa da base e morre com a thread.
+    static WEB: WebServer = WebServer::start();
+}
+
+/// A base do servidor local deste teste.
+#[cfg(feature = "web")]
+fn web_base() -> String {
+    WEB.with(WebServer::base)
+}
+
 /// O binário com um ambiente limpo: `HOME`, `XDG_RUNTIME_DIR`, `PATH` e, para
-/// o `power`, a árvore falsa em `dir/power` e um D-Bus do sistema que não existe.
+/// o `power`, a árvore falsa em `dir/power` e um D-Bus do sistema que não
+/// existe; para o `web`, o `LUCERNAD_WEB_BASE` do servidor local do teste.
 fn lucernad(dir: &Path) -> Command {
     // A raiz falsa precisa existir (vazia, sem telas) em todo processo.
     std::fs::create_dir_all(dir.join("power")).unwrap();
@@ -43,6 +112,9 @@ fn lucernad(dir: &Path) -> Command {
             format!("unix:path={}", dir.join("sem-barramento").display()),
         )
         .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    // Sem isto o binário iria às fontes de verdade (LRCLIB, Open-Meteo).
+    #[cfg(feature = "web")]
+    c.env("LUCERNAD_WEB_BASE", web_base());
     c
 }
 
@@ -111,6 +183,7 @@ fn serve(dir: &Path, idle_ms: u64) -> Serve {
             .arg("serve")
             .env("LUCERNA_IDLE_TIMEOUT_MS", idle_ms.to_string())
             .stdout(Stdio::null())
+            .stderr(std::fs::File::create(dir.join("serve.log")).unwrap())
             .spawn()
             .unwrap(),
     );
@@ -272,6 +345,8 @@ fn cli_help_status_and_exit_codes() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("não existe mais"), "stderr: {err}");
     }
+    #[cfg(feature = "web")]
+    web_cli(t.path());
     #[cfg(feature = "power")]
     {
         // Só o status: a raiz é a falsa e o D-Bus não existe.
@@ -350,6 +425,120 @@ fn cli_help_status_and_exit_codes() {
         );
         assert_eq!(std::fs::read_to_string(&brightness).unwrap(), "lixo\n");
     }
+}
+
+/// O `web`: a busca de cidade, o `rede` e o `faixa` pela linha de comando, o
+/// módulo indisponível com uma base inválida e a chave que nunca aparece.
+#[cfg(feature = "web")]
+fn web_cli(dir: &Path) {
+    let log = || std::fs::read_to_string(dir.join("serve.log")).unwrap();
+    assert!(
+        log().contains(&format!(
+            "LUCERNAD_WEB_BASE={}: a rede é de teste",
+            web_base()
+        )),
+        "log: {}",
+        log()
+    );
+    let (_w, _rx, status) = watch_json(dir, "web.status");
+    assert_eq!(status["data"]["available"], true, "{status}");
+    // Antes do `rede` o módulo está offline.
+    let out = lucernad(dir).args(["cidade", "Cacau"]).output().unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Modo offline ligado"), "stderr: {err}");
+    let out = lucernad(dir).arg("rede").output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = lucernad(dir).args(["cidade", "Cacau"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Cacaulândia, Rondônia, Brasil  (-10.3375, -62.8986)"),
+        "stdout: {stdout}"
+    );
+    let out = lucernad(dir)
+        .args(["rede", "--cidade", "X"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(64), "uso errado");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("Passe --cidade, --lat e --lon juntos"),
+        "stderr: {err}"
+    );
+    let out = lucernad(dir)
+        .args(["faixa", "Legião Urbana", "Tempo Perdido", "201"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = lucernad(dir)
+        .args(["faixa", "A", "B", "90000"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(64), "uso errado");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("SEGUNDOS precisa ser"), "stderr: {err}");
+    // A chave vem só do ambiente e nunca aparece no log nem na saída.
+    let out = lucernad(dir)
+        .arg("rede")
+        .env("LUCERNAD_VAGALUME_KEY", "CHAVE-SECRETA")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let all = format!(
+        "{}{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        log()
+    );
+    assert!(!all.contains("CHAVE-SECRETA"), "a chave vazou: {all}");
+}
+
+/// Uma base que não é de loopback deixa o módulo indisponível, nunca na rede
+/// de verdade.
+#[cfg(feature = "web")]
+#[test]
+fn invalid_web_base_makes_the_module_unavailable() {
+    let t = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(t.path().join("run")).unwrap();
+    let mut srv = Serve(
+        lucernad(t.path())
+            .arg("serve")
+            .env("LUCERNAD_WEB_BASE", "https://example.com")
+            .env("LUCERNA_IDLE_TIMEOUT_MS", "60000")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let start = Instant::now();
+    while !socket(t.path()).exists() {
+        assert!(srv.child().try_wait().unwrap().is_none());
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (_watch, _rx, v) = watch_json(t.path(), "web.status");
+    assert_eq!(v["data"]["available"], false, "{v}");
+    assert_eq!(
+        v["data"]["error"],
+        "LUCERNAD_WEB_BASE inválido: precisa ser http://127.0.0.1:<porta> ou http://[::1]:<porta> (só para testes).",
+        "{v}"
+    );
 }
 
 #[cfg(feature = "system")]

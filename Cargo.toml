@@ -23,6 +23,7 @@ lucernad-system = { path = "crates/lucernad-system" }
 lucernad-spectrum = { path = "crates/lucernad-spectrum" }
 lucernad-clipboard = { path = "crates/lucernad-clipboard" }
 lucernad-power = { path = "crates/lucernad-power" }
+lucernad-web = { path = "crates/lucernad-web" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -33,6 +34,8 @@ tempfile = "3"
 pipewire = "0.10"
 rustfft = "6"
 unicode-normalization = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "query"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 sha2 = "0.10"

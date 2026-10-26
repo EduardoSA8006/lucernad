@@ -4,7 +4,8 @@
     feature = "system",
     feature = "spectrum",
     feature = "clipboard",
-    feature = "power"
+    feature = "power",
+    feature = "web"
 ))]
 
 mod common;
@@ -12,7 +13,12 @@ mod common;
 use common::start;
 #[cfg(feature = "system")]
 use serde_json::Value;
-#[cfg(any(feature = "spectrum", feature = "clipboard", feature = "power"))]
+#[cfg(any(
+    feature = "spectrum",
+    feature = "clipboard",
+    feature = "power",
+    feature = "web"
+))]
 use serde_json::json;
 
 #[cfg(feature = "system")]
@@ -109,5 +115,29 @@ async fn the_daemon_serves_the_power_module() {
     );
     let v = c.call("power.list", Some(json!({}))).await.unwrap();
     assert_eq!(v, json!({"screens": []}));
+    r.stop().await;
+}
+
+#[cfg(feature = "web")]
+#[tokio::test]
+async fn the_daemon_serves_the_web_module() {
+    let r = start().await;
+    let c = r.client().await;
+    for t in ["web.lyrics", "web.weather", "web.status"] {
+        assert!(c.hello().topics.iter().any(|x| x == t), "falta {t}");
+    }
+    assert!(
+        c.hello().methods.iter().any(|m| m == "web.searchCity"),
+        "falta o web.searchCity"
+    );
+    // Antes do `configure` o módulo está offline: o 1001, sem nenhum pedido.
+    let e = c
+        .call("web.searchCity", Some(json!({"query": "x"})))
+        .await
+        .unwrap_err();
+    match e {
+        lucerna_ipc::ClientError::Rpc(e) => assert_eq!(e.code, 1001, "{}", e.message),
+        other => panic!("esperava o 1001: {other:?}"),
+    }
     r.stop().await;
 }

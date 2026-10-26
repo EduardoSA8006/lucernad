@@ -14,11 +14,13 @@ O shell busca a letra (LRCLIB) e o clima (Open-Meteo) direto pelo `XMLHttpReques
 - **Segunda fonte de letras: só o Vagalume**, consultado quando a LRCLIB não acha (música brasileira; só texto, sem sincronização). Descartados: NetEase, Musixmatch, Spotify, Genius, Letras.mus.br, Lyrics.ovh (termos ou estabilidade).
 - **Aba Clima copiada do Caelestia** (`caelestia-dots/shell`, `modules/dashboard/WeatherTab.qml`), adaptada à fonte, aos tamanhos de texto, aos ícones e ao tema do Lucerna, com o minimalismo dele. **A previsão hora a hora sai.**
 - **Sem reserva**, como nos outros módulos: sem o `lucernad`, a letra e o clima ficam indisponíveis.
+- **Créditos num lugar só** (2026-10-24): uma página "Créditos" nas Configurações e a seção "Créditos" do README; nenhum crédito nos painéis (sai o "Previsão da Open-Meteo" da aba Clima, a letra não ganha rótulo do Vagalume) nem na tela Sobre (sai a linha "Serviços na internet").
+- **Vagalume é escolha de quem usa** (2026-10-24): os termos da API pedem crédito com link junto do conteúdo e dizem que a API não transfere o direito de exibir a letra. Como o shell é de uso próprio e a chave é criada por cada usuário, o README avisa disso e deixa a decisão com ele, deixando claro que o crédito existe de forma indireta: para usar o Vagalume, a pessoa precisa obrigatoriamente entrar no site deles e gerar a própria chave, e o Lucerna não traz chave nenhuma; se o Vagalume pedir, o rótulo com link junto da letra é acrescentado depois.
 
 ## Objetivos
 
 - Letras com prazo, nova tentativa em erro passageiro, casamento confiável e cache em disco.
-- Vagalume como segunda fonte, com a chave do próprio usuário e o crédito exigido.
+- Vagalume como segunda fonte, com a chave do próprio usuário (o aviso sobre os termos fica no README).
 - Clima que abre na hora com a última previsão guardada, se atualiza sozinho no fundo e respeita a falta de internet.
 - Escolha da cidade entre vários resultados.
 - A aba Clima nova: cidade e data; nascer e pôr do sol; card grande com ícone, temperatura e descrição; umidade, sensação e vento; previsão de 7 dias.
@@ -50,7 +52,7 @@ O shell busca a letra (LRCLIB) e o clima (Open-Meteo) direto pelo `XMLHttpReques
 - **Ordem:** LRCLIB `get` (título, artista, álbum, duração) → LRCLIB `search` (título e artista) → Vagalume (só com a chave configurada).
 - **Casamento confiável na busca reserva e no Vagalume:** só aceita um resultado com título e artista iguais depois de normalizados (sem acentos, maiúsculas, pontuação, sufixos como "(Remastered)"/"- Ao Vivo") e, quando a fonte informa a duração, diferença de até 2 s. Prefere letra sincronizada. Na dúvida, nenhuma letra.
 - **LRC completo:** várias marcas de tempo na mesma linha, o `[offset:]`, linhas vazias como pausa; o resultado é uma lista ordenada de `{time, text}`.
-- **Vagalume:** `api.vagalume.com.br/search.php` com `apikey` do usuário (configurada no shell e mandada pelo `web.configure`); letra só texto; o resultado carrega o crédito (`source: "vagalume"`, `url` da página da letra) para o shell mostrar "Letra: Vagalume" com o link, como os termos pedem.
+- **Vagalume:** `api.vagalume.com.br/search.php` com `apikey` do usuário (configurada no shell e mandada pelo `web.configure`); letra só texto; o resultado carrega a origem (`source: "vagalume"`, `url` da página da letra), que o shell não mostra hoje mas deixa pronto o rótulo com link se o Vagalume pedir.
 - **Cache em disco** (em `$XDG_CACHE_HOME/lucerna/web/`, pela `lucerna-paths`): a letra encontrada fica guardada sem prazo; "sem letra" fica guardado por 7 dias (depois tenta de novo); falha de rede nunca é guardada. Limite de tamanho do cache (ex.: 50 MB, apaga as mais antigas). Chave: artista + título + duração arredondada, normalizados.
 - **Quando busca:** o shell manda `web.track` a cada troca de faixa (é informação local, não sai da máquina), mas o módulo só consulta as fontes **com assinante de `web.lyrics`** — o shell assina só com a aba Mídia visível e a letra ligada, como hoje; ao ganhar assinante, busca a faixa atual. Assim nada vai à internet além do que vai hoje (decisão do construtor do documento).
 - **Sem bug de carregando:** pedir a letra de uma faixa já em cache responde na hora e nunca deixa o estado em "procurando".
@@ -74,7 +76,7 @@ O shell busca a letra (LRCLIB) e o clima (Open-Meteo) direto pelo `XMLHttpReques
 ## Lado do shell (`lucerna-shell`)
 
 - **`services/Lyrics.qml` e `services/Weather.qml` viram adaptadores** (donos `"lyrics"` e `"weather"`), mantendo para quem usa o que a aba Mídia, o card do Painel e a aba Clima precisam; o `XMLHttpRequest` sai.
-- **Letra:** quando a fonte é o Vagalume, a letra aparece como texto rolável (sem acompanhar a música) com "Letra: Vagalume" e o link.
+- **Letra:** quando a fonte é o Vagalume, a letra aparece como texto rolável (sem acompanhar a música) sem rótulo da fonte (os créditos ficam na página Créditos).
 - **Configurações:** um campo para a chave do Vagalume (com o link de onde criar), guardado como os outros segredos do shell (ou na configuração, se não houver lugar de segredo; escolha do construtor), e a busca de cidade com a lista de resultados.
 - **Aba Clima nova**, no desenho do Caelestia (`WeatherTab.qml`), com a fonte, os tamanhos, os ícones e o tema do Lucerna:
   - topo: a cidade em destaque e a data por extenso; à direita, nascer e pôr do sol com ícones;
@@ -83,7 +85,7 @@ O shell busca a letra (LRCLIB) e o clima (Open-Meteo) direto pelo `XMLHttpReques
   - "Previsão de 7 dias": um card por dia com "Hoje"/dia da semana abreviado, a data, o ícone e mínima/máxima;
   - quando a previsão for a guardada e velha, a hora da última atualização; sem internet ou offline, o aviso de hoje.
   - **Sem campos de busca nem botões na aba** (o minimalismo do Caelestia): a escolha da cidade, com a lista de resultados, fica só em Configurações; sem cidade escolhida, a aba mostra um aviso com um botão que abre essa página. A atualização é automática; "Atualizar agora" fica nas Configurações (e no IPC), pelo `web.refresh` (decisão do construtor do documento).
-- **Créditos:** o README e a tela Sobre acrescentam a aba Clima à inspiração do Caelestia (que já tem o crédito da barra do topo); a tela Sobre cita o Vagalume.
+- **Créditos:** página nova "Créditos" nas Configurações, com link em cada item: inspiração (Caelestia Shell: painel superior, aba Clima, curvas de animação do Material 3), dados (Open-Meteo com a licença CC BY 4.0, LRCLIB, Vagalume) e base (Quickshell, Hyprland, fonte Material Symbols). O README mantém a seção "Créditos" com o mesmo conteúdo e ganha o aviso sobre os termos do Vagalume. Saem o rodapé "Previsão da Open-Meteo" da aba Clima e a linha "Serviços na internet" da tela Sobre.
 - **Sem o `lucernad`:** "Indisponível" na aba Clima, no card e na letra.
 
 ## Testes
