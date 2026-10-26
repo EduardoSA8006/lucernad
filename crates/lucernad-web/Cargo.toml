@@ -15,13 +15,16 @@ publish.workspace = true
 testing = []
 
 [dependencies]
+lucerna-paths.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 unicode-normalization.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 # Os testes deste crate usam o módulo `testing`.
 lucernad-web = { path = ".", features = ["testing"] }
 

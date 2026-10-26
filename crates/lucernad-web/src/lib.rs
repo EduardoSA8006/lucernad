@@ -4,8 +4,10 @@
 //! Por enquanto: o [`lrc`] lê a letra (sincronizada ou de texto), o
 //! [`matching`] decide se a faixa que uma fonte devolveu é a que foi pedida,
 //! o [`http`] faz os pedidos (com prazo, nova tentativa e `Retry-After`) e o
-//! [`endpoints`] diz para onde eles vão.
+//! [`endpoints`] diz para onde eles vão; o [`cache`] guarda as respostas em
+//! disco.
 
+pub mod cache;
 pub mod endpoints;
 pub mod http;
 pub mod lrc;

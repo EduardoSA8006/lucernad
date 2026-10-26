@@ -1247,10 +1247,13 @@ dependencies = [
 name = "lucernad-web"
 version = "0.1.0"
 dependencies = [
+ "lucerna-paths",
  "lucernad-web",
  "reqwest",
  "rustls",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "unicode-normalization",
 ]
