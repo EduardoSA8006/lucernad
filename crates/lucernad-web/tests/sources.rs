@@ -431,6 +431,123 @@ async fn network_error_is_an_error_not_none() {
     assert!(!err.contains("http"), "{err}");
 }
 
+/// A LRCLIB sobrecarregada no `get`: 503 com `Retry-After: 1` (dentro da
+/// política rápida, o `Retry-After` de 1 ms).
+fn overloaded() -> impl Fn(&Request) -> Result<Response, HttpError> {
+    |_| {
+        Ok(Response {
+            status: 503,
+            retry_after: Some(Duration::from_millis(1)),
+            body: br#"{"name":"ServerOverloaded"}"#.to_vec(),
+        })
+    }
+}
+
+fn get_count(http: &FakeHttp) -> usize {
+    urls(http).iter().filter(|u| **u == get_url()).count()
+}
+
+const OVERLOADED: &str = "Não consegui falar com a LRCLIB: o servidor respondeu 503.";
+
+#[tokio::test]
+async fn overloaded_get_falls_back_to_the_search() {
+    let http = FakeHttp::new();
+    http.route(&get_url(), overloaded());
+    http.route(
+        &search_url(),
+        answer(
+            200,
+            json!([
+                lrclib_entry("Outro", "Outra", 201.0, Some(PLAIN), Some(SYNCED)),
+                lrclib_entry(
+                    "Legião Urbana",
+                    "Tempo Perdido",
+                    201.0,
+                    Some(PLAIN),
+                    Some(SYNCED)
+                ),
+            ]),
+        ),
+    );
+    assert_eq!(
+        find(&http, &want(), None).await.unwrap(),
+        Found::Lyrics(Lyrics {
+            synced: true,
+            lines: synced_lines(),
+            source: Source::Lrclib,
+            url: None,
+        })
+    );
+    assert_eq!(get_count(&http), 2);
+}
+
+#[tokio::test]
+async fn overloaded_get_without_a_match_is_an_error_not_none() {
+    let http = FakeHttp::new();
+    http.route(&get_url(), overloaded());
+    http.route(
+        &search_url(),
+        answer(
+            200,
+            json!([lrclib_entry(
+                "Outro",
+                "Outra",
+                201.0,
+                Some(PLAIN),
+                Some(SYNCED)
+            )]),
+        ),
+    );
+    assert_eq!(
+        find(&http, &want(), None).await,
+        Err(OVERLOADED.to_string())
+    );
+    assert_eq!(get_count(&http), 2);
+
+    // A busca que dá 404 também não confirma nada.
+    let http = FakeHttp::new();
+    http.route(&get_url(), overloaded());
+    http.route(&search_url(), answer(404, not_found()));
+    assert_eq!(
+        find(&http, &want(), None).await,
+        Err(OVERLOADED.to_string())
+    );
+
+    // Com a chave, o Vagalume sem a letra também fica no erro do `get`.
+    let http = FakeHttp::new();
+    http.route(&get_url(), overloaded());
+    http.route(&search_url(), answer(200, json!([])));
+    http.route(&vagalume_url(), answer(200, json!({"type": "notfound"})));
+    assert_eq!(
+        find(&http, &want(), Some("CHAVE")).await,
+        Err(OVERLOADED.to_string())
+    );
+    assert!(urls(&http).contains(&vagalume_url()));
+}
+
+#[tokio::test]
+async fn overloaded_get_and_failed_search_is_the_get_error() {
+    let http = FakeHttp::new();
+    http.route(&get_url(), overloaded());
+    http.route(&search_url(), answer(500, json!({})));
+    assert_eq!(
+        find(&http, &want(), None).await,
+        Err(OVERLOADED.to_string())
+    );
+}
+
+#[tokio::test]
+async fn forbidden_get_does_not_search() {
+    let http = FakeHttp::new();
+    http.route(&get_url(), answer(403, json!({})));
+    http.route(&search_url(), answer(200, json!([])));
+    assert_eq!(
+        find(&http, &want(), None).await,
+        Err("Não consegui falar com a LRCLIB: o servidor respondeu 403.".to_string())
+    );
+    assert_eq!(urls(&http), vec![get_url()]);
+}
+
 #[tokio::test]
 async fn captive_portal_html_is_an_error() {
     let http = FakeHttp::new();

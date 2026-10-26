@@ -8,6 +8,9 @@
 //! que case, senão uma de texto que case; nada → o Vagalume (com a chave).
 //! Na LRCLIB, só 404 e 400 são "não achou". Erro de rede ou outro status é
 //! erro, não "sem letra": o `Err` traz o texto do Formato.
+//! O `get` usa a política curta; se acabar em erro passageiro (a LRCLIB
+//! sobrecarregada), a busca conferida e o Vagalume entram no lugar dele, e
+//! só uma letra achada vale: sem ela, fica o erro do `get`.
 
 use std::time::{Duration, SystemTime};
 
@@ -176,11 +179,12 @@ pub async fn find(
     t: &Track,
     key: Option<&str>,
 ) -> Result<Found, String> {
-    let lrclib_err = |e: HttpError| format!("Não consegui falar com a LRCLIB: {}.", e.message());
-
-    let resp = fetch(http, &lrclib_get(ep, t), policy)
-        .await
-        .map_err(lrclib_err)?;
+    let resp = match fetch(http, &lrclib_get(ep, t), &get_policy(policy)).await {
+        Ok(resp) => resp,
+        // A LRCLIB sobrecarregada no `get`: a busca entra no lugar dele.
+        Err(e) if passing(&e) => return instead_of_get(http, ep, policy, t, key, e).await,
+        Err(e) => return Err(lrclib_err(e)),
+    };
     let mut reserve = None;
     match resp.status {
         200 => {
@@ -200,31 +204,10 @@ pub async fn find(
         s => return Err(lrclib_err(HttpError::Status(s))),
     }
 
-    let search = match fetch(http, &lrclib_search(ep, t), policy).await {
-        Ok(resp) if resp.status == 200 => match json_body(&resp) {
-            Some(Value::Array(entries)) => Ok(entries),
-            _ => Err(LRCLIB_FORMAT.to_string()),
-        },
-        Ok(resp) if not_found(resp.status) => Ok(Vec::new()),
-        Ok(resp) => Err(lrclib_err(HttpError::Status(resp.status))),
-        Err(e) => Err(lrclib_err(e)),
-    };
-    match (search, reserve) {
+    match (search(http, ep, policy, t).await, reserve) {
         (Ok(entries), reserve) => {
-            let matching: Vec<_> = entries
-                .iter()
-                .filter_map(Value::as_object)
-                .filter(|e| entry_matches(t, e))
-                .map(entry_lyrics)
-                .collect();
-            if let Some(lines) = matching.iter().find_map(|(s, _)| s.clone()) {
-                return Ok(lrclib(true, lines));
-            }
-            if let Some(lines) = reserve {
-                return Ok(lrclib(false, lines));
-            }
-            if let Some(lines) = matching.into_iter().find_map(|(_, p)| p) {
-                return Ok(lrclib(false, lines));
+            if let Some(found) = best_match(t, &entries, reserve) {
+                return Ok(found);
             }
         }
         // A busca falhou, mas o `get` já tinha a letra de texto.
@@ -236,6 +219,93 @@ pub async fn find(
         Some(key) => from_vagalume(http, ep, policy, t, key).await,
         None => Ok(Found::None { vagalume: false }),
     }
+}
+
+/// O `get` com a política curta (no máximo 1 nova tentativa, `Retry-After`
+/// até 5 s): sobrecarregado, ele cede a vez à busca em vez de segurar a
+/// letra por segundos.
+fn get_policy(policy: &RetryPolicy) -> RetryPolicy {
+    RetryPolicy {
+        retries: policy.retries.min(1),
+        base: policy.base,
+        retry_after_max: policy.retry_after_max.min(Duration::from_secs(5)),
+    }
+}
+
+/// O erro do [`fetch`] é passageiro (prazo, conexão, 429/5xx esgotados ou
+/// um `Retry-After` longo demais)?
+fn passing(e: &HttpError) -> bool {
+    matches!(
+        e,
+        HttpError::Timeout | HttpError::Connect | HttpError::Status(_) | HttpError::WaitTooLong(_)
+    )
+}
+
+fn lrclib_err(e: HttpError) -> String {
+    format!("Não consegui falar com a LRCLIB: {}.", e.message())
+}
+
+/// O `get` falhou de passagem: a busca conferida e, com a chave, o Vagalume.
+/// Só uma letra achada vale; sem ela, o erro do `get` (o `get` não confirmou
+/// nada, e um "sem letra" ficaria guardado por [`NONE_TTL`]).
+async fn instead_of_get(
+    http: &dyn Http,
+    ep: &Endpoints,
+    policy: &RetryPolicy,
+    t: &Track,
+    key: Option<&str>,
+    get_err: HttpError,
+) -> Result<Found, String> {
+    if let Ok(entries) = search(http, ep, policy, t).await
+        && let Some(found) = best_match(t, &entries, None)
+    {
+        return Ok(found);
+    }
+    if let Some(key) = key
+        && let Ok(found @ Found::Lyrics(_)) = from_vagalume(http, ep, policy, t, key).await
+    {
+        return Ok(found);
+    }
+    Err(lrclib_err(get_err))
+}
+
+/// A busca da LRCLIB: as entradas, ou o erro (404/400 → nenhuma entrada).
+async fn search(
+    http: &dyn Http,
+    ep: &Endpoints,
+    policy: &RetryPolicy,
+    t: &Track,
+) -> Result<Vec<Value>, String> {
+    match fetch(http, &lrclib_search(ep, t), policy).await {
+        Ok(resp) if resp.status == 200 => match json_body(&resp) {
+            Some(Value::Array(entries)) => Ok(entries),
+            _ => Err(LRCLIB_FORMAT.to_string()),
+        },
+        Ok(resp) if not_found(resp.status) => Ok(Vec::new()),
+        Ok(resp) => Err(lrclib_err(HttpError::Status(resp.status))),
+        Err(e) => Err(lrclib_err(e)),
+    }
+}
+
+/// Entre as entradas que casam: uma sincronizada; senão a reserva do `get`;
+/// senão uma de texto.
+fn best_match(t: &Track, entries: &[Value], reserve: Option<Vec<Line>>) -> Option<Found> {
+    let matching: Vec<_> = entries
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|e| entry_matches(t, e))
+        .map(entry_lyrics)
+        .collect();
+    if let Some(lines) = matching.iter().find_map(|(s, _)| s.clone()) {
+        return Some(lrclib(true, lines));
+    }
+    if let Some(lines) = reserve {
+        return Some(lrclib(false, lines));
+    }
+    matching
+        .into_iter()
+        .find_map(|(_, p)| p)
+        .map(|lines| lrclib(false, lines))
 }
 
 /// Os únicos status da LRCLIB que querem dizer "não achou": 404 e 400 (a
