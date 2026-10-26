@@ -595,6 +595,32 @@ async fn skipping_tracks_never_shows_old_lyrics() {
 }
 
 #[tokio::test]
+async fn skipping_fast_sends_nothing_for_skipped_tracks() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |cfg| cfg.settle = Duration::from_millis(200));
+    let c = client(&r.path).await;
+    online(&c).await;
+    let seq = record(&r.path, "web.lyrics").await;
+    // Trocas mais rápidas que o `settle`: nenhuma faixa pulada chega a pedir.
+    for i in 0..9 {
+        track(&c, &missing(&format!("Faixa {i}"))).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    track(&c, &tempo_perdido()).await;
+    let key = tempo_perdido().key();
+    wait_seq(&seq, 0, "a última achada", |v| is(v, &key, "found")).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(is(&r.t.lyrics.current().data, &key, "found"));
+    let reqs = r.f.http.requests();
+    assert!(
+        reqs.iter()
+            .all(|q| param(q, "track_name") == Some("Tempo Perdido")),
+        "pedidos das faixas puladas: {reqs:?}"
+    );
+    assert!(requests_to(&r.f, "/api/get").len() <= 1);
+}
+
+#[tokio::test]
 async fn lyrics_only_with_subscriber() {
     let dir = tempfile::tempdir().unwrap();
     let r = rig_on(dir.path(), |_| {});
