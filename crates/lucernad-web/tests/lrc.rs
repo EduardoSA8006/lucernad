@@ -92,3 +92,18 @@ fn plain_lyrics() {
     let synced = lines_json(&parse_lrc("[00:01.5]a"));
     assert_eq!(synced.to_string(), r#"[{"time":1.5,"text":"a"}]"#);
 }
+
+#[test]
+fn huge_stamp_lines_stay_bounded() {
+    let stamps = "[00:01.00]".repeat(200_000);
+    let lrc = format!("{stamps}{}", "x".repeat(1_000_000));
+    let start = std::time::Instant::now();
+    let lines = parse_lrc(&lrc);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(!lines.is_empty() && lines.len() <= LINES_MAX);
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.text.chars().count() <= LINE_CHARS_MAX)
+    );
+}

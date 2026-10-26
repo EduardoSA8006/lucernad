@@ -130,7 +130,11 @@ fn same_artist(a: &str, b: &str) -> bool {
     if na.is_empty() || nb.is_empty() {
         return false;
     }
-    na == nb || first_artist(a) == first_artist(b)
+    if na == nb {
+        return true;
+    }
+    let (fa, fb) = (first_artist(a), first_artist(b));
+    !fa.is_empty() && fa == fb
 }
 
 /// A faixa que a fonte devolveu é a pedida? Título pelo [`title_key`], artista

@@ -88,3 +88,10 @@ fn key_is_normalized_and_rounded() {
     assert_eq!(a, b);
     assert!(want("A", "B", None).key().ends_with("\u{1f}-"));
 }
+
+#[test]
+fn empty_first_artists_do_not_match() {
+    let w = want(", A", "Música", None);
+    assert!(!same_track(&w, "Música", "& B", None));
+    assert!(!same_track(&want("", "Música", None), "Música", "", None));
+}

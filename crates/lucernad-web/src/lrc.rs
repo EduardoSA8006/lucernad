@@ -14,6 +14,13 @@ pub const LINE_CHARS_MAX: usize = 200;
 /// Máximo de texto somado, em bytes UTF-8.
 pub const TEXT_BYTES_MAX: usize = 128 * 1024;
 
+/// Teto de entradas coletadas no LRC antes da ordenação por tempo: um LRC pode
+/// trazer centenas de milhares de marcas numa linha só, e a ordenação vem
+/// depois. Quatro vezes o limite de linhas basta para um arquivo fora de ordem
+/// razoável; o que passa disso é ignorado (e o texto é cortado antes de ser
+/// copiado, então a memória fica limitada).
+const COLLECT_MAX: usize = 4 * LINES_MAX;
+
 /// Uma linha da letra; `time` em segundos, ou `None` na letra de texto.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Line {
@@ -34,7 +41,9 @@ pub fn parse_lrc(lrc: &str) -> Vec<Line> {
         while let Some(tag_end) = rest.strip_prefix('[').and_then(|r| r.find(']')) {
             let tag = &rest[1..=tag_end];
             if let Some(t) = parse_stamp(tag) {
-                stamps.push(t);
+                if stamps.len() < COLLECT_MAX {
+                    stamps.push(t);
+                }
             } else if let Some(ms) = parse_offset(tag) {
                 offset_ms = ms;
             } else {
@@ -45,36 +54,32 @@ pub fn parse_lrc(lrc: &str) -> Vec<Line> {
         if stamps.is_empty() {
             continue;
         }
-        let text = clean(rest, true);
+        let text = clean(rest);
         for t in stamps {
+            if found.len() >= COLLECT_MAX {
+                break;
+            }
             found.push((t, text.clone()));
         }
     }
     found.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let lines = found
-        .into_iter()
-        .map(|(t, text)| Line {
-            time: Some((t - offset_ms / 1000.0).max(0.0)),
-            text,
-        })
-        .collect();
-    limit(lines)
+    limit(found.into_iter().map(|(t, text)| Line {
+        time: Some((t - offset_ms / 1000.0).max(0.0)),
+        text,
+    }))
 }
 
 /// Uma letra de texto simples: `time` sempre `None`; `\r\n` aceito; as linhas
 /// vazias do fim saem, as do meio ficam como `""`.
 pub fn plain_lines(text: &str) -> Vec<Line> {
-    let mut lines: Vec<Line> = text
-        .lines()
-        .map(|l| Line {
-            time: None,
-            text: clean(l, true),
-        })
-        .collect();
+    let mut lines = limit(text.lines().map(|l| Line {
+        time: None,
+        text: clean(l),
+    }));
     while lines.last().is_some_and(|l| l.text.is_empty()) {
         lines.pop();
     }
-    limit(lines)
+    lines
 }
 
 /// As linhas no formato do tópico `web.lyrics`: `[{time, text}]`, com `time`
@@ -125,20 +130,23 @@ fn parse_offset(tag: &str) -> Option<f64> {
     value.parse::<i64>().ok().map(|v| v as f64)
 }
 
-/// Tira os caracteres de controle (e as pontas, se `trim`).
-fn clean(s: &str, trim: bool) -> String {
-    let s: String = s.chars().filter(|c| !c.is_control()).collect();
-    if trim { s.trim().to_string() } else { s }
+/// Tira os caracteres de controle e as pontas, e corta em
+/// [`LINE_CHARS_MAX`] caracteres sem copiar o resto.
+fn clean(s: &str) -> String {
+    let text: String = s
+        .chars()
+        .filter(|c| !c.is_control())
+        .skip_while(|c| c.is_whitespace())
+        .take(LINE_CHARS_MAX)
+        .collect();
+    text.trim_end().to_string()
 }
 
-/// Aplica os três limites, em ordem.
-fn limit(lines: Vec<Line>) -> Vec<Line> {
+/// Aplica os limites de linhas e de bytes, parando de consumir ao atingi-los.
+fn limit(lines: impl Iterator<Item = Line>) -> Vec<Line> {
     let mut total = 0;
     let mut out = Vec::new();
-    for mut line in lines.into_iter().take(LINES_MAX) {
-        if let Some((end, _)) = line.text.char_indices().nth(LINE_CHARS_MAX) {
-            line.text.truncate(end);
-        }
+    for line in lines.take(LINES_MAX) {
         total += line.text.len();
         if total > TEXT_BYTES_MAX {
             break;
