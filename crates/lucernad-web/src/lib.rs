@@ -5,13 +5,16 @@
 //! [`matching`] decide se a faixa que uma fonte devolveu é a que foi pedida,
 //! o [`http`] faz os pedidos (com prazo, nova tentativa e `Retry-After`) e o
 //! [`endpoints`] diz para onde eles vão; o [`cache`] guarda as respostas em
-//! disco.
+//! disco. As fontes: o [`lyrics`] (a LRCLIB e o Vagalume) e o [`weather`]
+//! (o Open-Meteo).
 
 pub mod cache;
 pub mod endpoints;
 pub mod http;
 pub mod lrc;
+pub mod lyrics;
 pub mod matching;
+pub mod weather;
 
 #[cfg(feature = "testing")]
 pub mod testing;

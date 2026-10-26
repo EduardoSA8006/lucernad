@@ -411,3 +411,98 @@ impl Http for FakeHttp {
         })
     }
 }
+
+/// Uma entrada da LRCLIB (do `get` ou da busca), com as letras dadas (ou
+/// `null`).
+pub fn lrclib_entry(
+    artist: &str,
+    title: &str,
+    duration: f64,
+    plain: Option<&str>,
+    synced: Option<&str>,
+) -> Value {
+    serde_json::json!({
+        "id": 1,
+        "trackName": title,
+        "artistName": artist,
+        "albumName": "Dois",
+        "duration": duration,
+        "instrumental": false,
+        "plainLyrics": plain,
+        "syncedLyrics": synced,
+    })
+}
+
+/// Uma resposta do `search.php` do Vagalume com uma música.
+pub fn vagalume_body(kind: &str, artist: &str, title: &str, url: &str, text: &str) -> Value {
+    serde_json::json!({
+        "type": kind,
+        "art": {"id": "3ade68b3g1f86eda3", "name": artist, "url": "https://www.vagalume.com.br/legiao-urbana/"},
+        "mus": [{"id": "3ade68b6g9e4cfda3", "name": title, "url": url, "lang": 1, "text": text}],
+    })
+}
+
+/// 2026-10-24, em dias desde 1970-01-01.
+const FORECAST_START: i64 = 20_750;
+
+/// A previsão do Open-Meteo de 7 dias, de 24 a 30 de outubro de 2026, em
+/// Cacaulândia (−4 h).
+pub fn forecast_body() -> Value {
+    forecast_body_days(7)
+}
+
+/// A previsão com `days` dias a partir de 2026-10-24.
+pub fn forecast_body_days(days: usize) -> Value {
+    forecast_body_at(FORECAST_START, days)
+}
+
+/// A previsão com `days` dias a partir do dia `start` (em dias desde
+/// 1970-01-01); nascer às 05:41 e pôr às 18:03 em todos.
+fn forecast_body_at(start: i64, days: usize) -> Value {
+    let dates: Vec<String> = (0..days)
+        .map(|i| crate::weather::civil_date(start + i as i64))
+        .collect();
+    let each = |f: &dyn Fn(usize) -> Value| -> Value { (0..days).map(f).collect() };
+    serde_json::json!({
+        "latitude": -10.34,
+        "longitude": -62.9,
+        "utc_offset_seconds": -14400,
+        "timezone": "America/Porto_Velho",
+        "current": {
+            "time": format!("{}T10:00", dates.first().cloned().unwrap_or_default()),
+            "temperature_2m": 31.2,
+            "apparent_temperature": 35.0,
+            "relative_humidity_2m": 58,
+            "weather_code": 2,
+            "wind_speed_10m": 7.6,
+            "is_day": 1,
+        },
+        "daily": {
+            "time": dates,
+            "weather_code": each(&|i| Value::from([95, 3, 61, 2, 1, 80, 0][i % 7])),
+            "temperature_2m_max": each(&|i| Value::from(33.4 - i as f64 * 0.1)),
+            "temperature_2m_min": each(&|i| Value::from(22.1 + i as f64 * 0.1)),
+            "precipitation_probability_max": each(&|i| Value::from(80 - (i as i64 * 10) % 80)),
+            "sunrise": each(&|i| Value::from(format!("{}T05:41", dates[i]))),
+            "sunset": each(&|i| Value::from(format!("{}T18:03", dates[i]))),
+        },
+    })
+}
+
+/// Uma resposta da busca de cidade com `n` cidades (`Cidade 1`…).
+pub fn cities_body(n: usize) -> Value {
+    let results: Vec<Value> = (1..=n)
+        .map(|i| {
+            serde_json::json!({
+                "id": i,
+                "name": format!("Cidade {i}"),
+                "latitude": -10.0 - i as f64 / 10.0,
+                "longitude": -62.0 - i as f64 / 10.0,
+                "country_code": "BR",
+                "country": "Brasil",
+                "admin1": "Rondônia",
+            })
+        })
+        .collect();
+    serde_json::json!({"results": results, "generationtime_ms": 0.5})
+}
