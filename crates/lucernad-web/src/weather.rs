@@ -78,15 +78,7 @@ impl Forecast {
     pub fn to_json(&self) -> Value {
         json!({
             "current": current_json(&self.current),
-            "daily": self.daily.iter().map(|d| json!({
-                "date": d.date,
-                "code": d.code,
-                "min": d.min,
-                "max": d.max,
-                "precipitation": d.precipitation,
-                "sunrise": d.sunrise,
-                "sunset": d.sunset,
-            })).collect::<Vec<_>>(),
+            "daily": self.daily.iter().map(|d| day_json(d, true)).collect::<Vec<_>>(),
             "utcOffset": self.utc_offset,
         })
     }
@@ -144,17 +136,28 @@ impl Forecast {
         let current_day = days.iter().find(|d| d.date == today);
         json!({
             "current": current_json(&self.current),
-            "daily": days.iter().map(|d| json!({
-                "date": d.date,
-                "code": d.code,
-                "min": d.min,
-                "max": d.max,
-                "precipitation": d.precipitation,
-            })).collect::<Vec<_>>(),
+            "daily": days.iter().map(|d| day_json(d, false)).collect::<Vec<_>>(),
             "sunrise": current_day.and_then(|d| d.sunrise.clone()),
             "sunset": current_day.and_then(|d| d.sunset.clone()),
         })
     }
+}
+
+/// Um dia em JSON; `with_sun` põe o nascer e o pôr (o cache guarda; o
+/// tópico não, ele só traz os de hoje).
+fn day_json(d: &Day, with_sun: bool) -> Value {
+    let mut v = json!({
+        "date": d.date,
+        "code": d.code,
+        "min": d.min,
+        "max": d.max,
+        "precipitation": d.precipitation,
+    });
+    if with_sun {
+        v["sunrise"] = json!(d.sunrise);
+        v["sunset"] = json!(d.sunset);
+    }
+    v
 }
 
 fn current_json(c: &Current) -> Value {

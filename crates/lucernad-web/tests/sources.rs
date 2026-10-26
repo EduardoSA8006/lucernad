@@ -231,15 +231,38 @@ async fn search_refuses_the_wrong_song() {
 
 #[tokio::test]
 async fn instrumental_or_empty_is_none() {
+    // O `get` confirmou que é instrumental: encerra, sem busca nem Vagalume.
+    for key in [None, Some("CHAVE")] {
+        let http = FakeHttp::new();
+        let mut entry = lrclib_entry("Legião Urbana", "Tempo Perdido", 201.0, None, None);
+        entry["instrumental"] = json!(true);
+        http.route(&get_url(), answer(200, entry));
+        http.route(&search_url(), |_| panic!("instrumental não busca"));
+        http.route(&vagalume_url(), |_| {
+            panic!("instrumental não vai ao Vagalume")
+        });
+        assert_eq!(
+            find(&http, &want(), key).await.unwrap(),
+            Found::None { vagalume: false }
+        );
+        assert_eq!(urls(&http), vec![get_url()]);
+    }
+
+    // Sem letra nenhuma no `get` e a busca vazia.
     let http = FakeHttp::new();
-    let mut entry = lrclib_entry("Legião Urbana", "Tempo Perdido", 201.0, None, None);
-    entry["instrumental"] = json!(true);
-    http.route(&get_url(), answer(200, entry));
+    http.route(
+        &get_url(),
+        answer(
+            200,
+            lrclib_entry("Legião Urbana", "Tempo Perdido", 201.0, None, None),
+        ),
+    );
     http.route(&search_url(), answer(200, json!([])));
     assert_eq!(
         find(&http, &want(), None).await.unwrap(),
         Found::None { vagalume: false }
     );
+    assert_eq!(http.count(), 2);
 }
 
 fn vagalume_lyrics(url: &str) -> Found {
@@ -372,6 +395,31 @@ async fn network_error_is_an_error_not_none() {
     assert_eq!(
         err,
         "Não consegui falar com a LRCLIB: o servidor respondeu 500."
+    );
+
+    // Só 404 e 400 são "não achou"; outro status é erro, nunca "sem letra".
+    let http = FakeHttp::new();
+    http.route(&get_url(), answer(403, json!({})));
+    assert_eq!(
+        find(&http, &want(), None).await,
+        Err("Não consegui falar com a LRCLIB: o servidor respondeu 403.".to_string())
+    );
+    assert_eq!(http.count(), 1);
+
+    let http = FakeHttp::new();
+    http.route(&get_url(), answer(404, not_found()));
+    http.route(&search_url(), answer(403, json!({})));
+    assert_eq!(
+        find(&http, &want(), None).await,
+        Err("Não consegui falar com a LRCLIB: o servidor respondeu 403.".to_string())
+    );
+
+    let http = FakeHttp::new();
+    http.route(&get_url(), answer(400, json!({})));
+    http.route(&search_url(), answer(400, json!({})));
+    assert_eq!(
+        find(&http, &want(), None).await,
+        Ok(Found::None { vagalume: false })
     );
 
     let http = FakeHttp::new();

@@ -1,12 +1,13 @@
 //! A letra: a LRCLIB (o `get` exato e, se faltar, a busca conferida pelo
 //! [`same_track`]) e, só com a chave, o Vagalume.
 //!
-//! A ordem do [`find`]: o `get` da LRCLIB com `syncedLyrics` acaba ali; com
-//! só `plainLyrics`, o texto fica como reserva e a busca tenta uma
+//! A ordem do [`find`]: o `get` da LRCLIB com `syncedLyrics` acaba ali, e
+//! com `instrumental: true` acaba sem letra; com só `plainLyrics`, o texto fica como reserva e a busca tenta uma
 //! sincronizada que case (achou → ela; não achou ou a busca falhou → a
 //! reserva, sem ir ao Vagalume). Sem nada do `get`, a busca: uma sincronizada
 //! que case, senão uma de texto que case; nada → o Vagalume (com a chave).
-//! Erro de rede é erro, não "sem letra": o `Err` traz o texto do Formato.
+//! Na LRCLIB, só 404 e 400 são "não achou". Erro de rede ou outro status é
+//! erro, não "sem letra": o `Err` traz o texto do Formato.
 
 use std::time::{Duration, SystemTime};
 
@@ -181,14 +182,22 @@ pub async fn find(
         .await
         .map_err(lrclib_err)?;
     let mut reserve = None;
-    if resp.status == 200 {
-        let entry = json_body(&resp).ok_or(LRCLIB_FORMAT)?;
-        let entry = entry.as_object().ok_or(LRCLIB_FORMAT)?;
-        let (synced, plain) = entry_lyrics(entry);
-        if let Some(lines) = synced {
-            return Ok(lrclib(true, lines));
+    match resp.status {
+        200 => {
+            let entry = json_body(&resp).ok_or(LRCLIB_FORMAT)?;
+            let entry = entry.as_object().ok_or(LRCLIB_FORMAT)?;
+            // O próprio `get` confirmou a faixa como instrumental: encerra.
+            if is_instrumental(entry) {
+                return Ok(Found::None { vagalume: false });
+            }
+            let (synced, plain) = entry_lyrics(entry);
+            if let Some(lines) = synced {
+                return Ok(lrclib(true, lines));
+            }
+            reserve = plain;
         }
-        reserve = plain;
+        s if not_found(s) => {}
+        s => return Err(lrclib_err(HttpError::Status(s))),
     }
 
     let search = match fetch(http, &lrclib_search(ep, t), policy).await {
@@ -196,8 +205,8 @@ pub async fn find(
             Some(Value::Array(entries)) => Ok(entries),
             _ => Err(LRCLIB_FORMAT.to_string()),
         },
-        // Um 4xx da busca é "nada achado".
-        Ok(_) => Ok(Vec::new()),
+        Ok(resp) if not_found(resp.status) => Ok(Vec::new()),
+        Ok(resp) => Err(lrclib_err(HttpError::Status(resp.status))),
         Err(e) => Err(lrclib_err(e)),
     };
     match (search, reserve) {
@@ -229,6 +238,16 @@ pub async fn find(
     }
 }
 
+/// Os únicos status da LRCLIB que querem dizer "não achou": 404 e 400 (a
+/// busca recusada). Qualquer outro é erro, nunca "sem letra".
+fn not_found(status: u16) -> bool {
+    matches!(status, 404 | 400)
+}
+
+fn is_instrumental(entry: &Map<String, Value>) -> bool {
+    entry.get("instrumental").and_then(Value::as_bool) == Some(true)
+}
+
 fn lrclib(synced: bool, lines: Vec<Line>) -> Found {
     Found::Lyrics(Lyrics {
         synced,
@@ -254,7 +273,7 @@ fn text<'a>(entry: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
 /// As linhas sincronizadas e as de texto de uma entrada da LRCLIB (vazias
 /// viram `None`; a instrumental não tem letra).
 fn entry_lyrics(entry: &Map<String, Value>) -> (Option<Vec<Line>>, Option<Vec<Line>>) {
-    if entry.get("instrumental").and_then(Value::as_bool) == Some(true) {
+    if is_instrumental(entry) {
         return (None, None);
     }
     let synced = text(entry, "syncedLyrics")
