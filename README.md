@@ -103,7 +103,7 @@ Métodos:
 
 Erros: `-32602` para parâmetro inválido (o texto não ecoa o valor); `1001` "Modo offline ligado: a busca de cidade usa a internet."; `1002` "Sem conexão com a internet."; `1003` "Não consegui falar com o Open-Meteo: …"; `1004` com o módulo indisponível (também o `web.track` e o `web.configure`).
 
-**Cache e limites:** a letra e a previsão ficam em `$XDG_CACHE_HOME/lucerna/web/` (pasta 0700, um arquivo por chave, escrita atômica), até 50 MiB no total (apaga os mais antigos) e 512 KiB por entrada; "sem letra" vale 7 dias, e a falha de rede nunca é guardada. Cada resposta é lida até 4 MiB (acima disso, é recusada); a letra tem até 1000 linhas de 200 caracteres e 128 KiB de texto. Cada pedido tem prazo de 10 s, com até 3 novas tentativas (1, 2 e 4 s, ou o `Retry-After`).
+**Cache e limites:** a letra e a previsão ficam em `$XDG_CACHE_HOME/lucerna/web/` (pasta 0700, um arquivo por chave, escrita atômica), até 50 MiB no total (apaga os mais antigos) e 512 KiB por entrada; "sem letra" vale 7 dias, e a falha de rede nunca é guardada. Cada resposta é lida até 4 MiB (acima disso, é recusada); a letra tem até 1000 linhas de 200 caracteres e 128 KiB de texto. Cada pedido tem prazo de 10 s, com até 3 novas tentativas (1, 2 e 4 s, ou o `Retry-After`); o `get` da LRCLIB tenta só mais uma vez e, se ela estiver sobrecarregada, a busca entra no lugar.
 
 **O Vagalume:** só é usado com a chave **do próprio usuário**, criada no site deles (<https://auth.vagalume.com.br/settings/api/>), mandada no `vagalumeKey` do `web.configure`; sem chave, nunca é consultado. A chave nunca aparece em log, tópico, mensagem de erro nem linha de comando. Os dados do Open-Meteo são CC BY 4.0 ("Weather data by Open-Meteo.com"), de uso livre só não comercial.
 
