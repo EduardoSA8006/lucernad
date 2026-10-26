@@ -176,6 +176,17 @@ async fn errors_never_carry_the_url() {
             assert!(!text.contains("127.0.0.1"), "{text}");
         }
     }
+    // O corpo mais curto que o anunciado cai no `Other`, o caminho em que o
+    // texto do `reqwest` vai para o erro.
+    let short =
+        LocalServer::start(|_| Reply::text(200, "curto").header("Content-Length", "100")).await;
+    let req = Request::new(format!("{}/x", short.base())).param("apikey", "SEGREDO123");
+    let err = http.get(&req).await.expect_err("corpo cortado");
+    assert!(matches!(err, HttpError::Other(_)), "{err:?}");
+    for text in [format!("{err:?}"), err.message()] {
+        assert!(!text.contains("SEGREDO123"), "{text}");
+        assert!(!text.contains("127.0.0.1"), "{text}");
+    }
     let req = Request::new("http://127.0.0.1:9/x")
         .param("q", "a")
         .param("apikey", "SEGREDO123");

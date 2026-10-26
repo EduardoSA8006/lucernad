@@ -74,7 +74,7 @@ impl Reply {
         self
     }
 
-    /// Acrescenta um cabeçalho.
+    /// Acrescenta um cabeçalho; um `Content-Length` substitui o calculado.
     pub fn header(mut self, k: &str, v: &str) -> Reply {
         self.headers.push((k.to_string(), v.to_string()));
         self
@@ -152,11 +152,16 @@ async fn serve(mut stream: TcpStream, handler: Handler, log: Arc<Mutex<Vec<Seen>
     if reply.drop {
         return;
     }
-    let mut head = format!(
-        "HTTP/1.1 {} Lucerna\r\nContent-Length: {}\r\nConnection: close\r\n",
-        reply.status,
-        reply.body.len()
-    );
+    let mut head = format!("HTTP/1.1 {} Lucerna\r\nConnection: close\r\n", reply.status);
+    // Um `Content-Length` dado no `Reply` substitui o calculado (para um
+    // teste mandar um corpo mais curto que o anunciado).
+    if !reply
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+    {
+        head.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
+    }
     for (k, v) in &reply.headers {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -258,7 +263,10 @@ type Route = Arc<dyn Fn(&Request) -> Result<Response, HttpError> + Send + Sync +
 struct FakeState {
     routes: Mutex<HashMap<String, Route>>,
     requests: Mutex<Vec<Request>>,
-    held: watch::Sender<bool>,
+    /// Se os pedidos ficam parados, e a geração do `release` (cada um soma
+    /// 1): o pedido parado sai quando vê uma geração nova, mesmo que um
+    /// `hold` venha logo depois.
+    held: watch::Sender<(bool, u64)>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
     panicking: bool,
@@ -294,7 +302,7 @@ impl FakeHttp {
             state: Arc::new(FakeState {
                 routes: Mutex::new(HashMap::new()),
                 requests: Mutex::new(Vec::new()),
-                held: watch::Sender::new(false),
+                held: watch::Sender::new((false, 0)),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
                 panicking,
@@ -329,12 +337,16 @@ impl FakeHttp {
 
     /// Os pedidos ficam parados até o [`release`](FakeHttp::release).
     pub fn hold(&self) {
-        self.state.held.send_replace(true);
+        self.state.held.send_modify(|(held, _)| *held = true);
     }
 
-    /// Solta os pedidos parados (e os próximos).
+    /// Solta os pedidos parados (mesmo que um `hold` venha logo depois) e os
+    /// próximos, até um novo `hold`.
     pub fn release(&self) {
-        self.state.held.send_replace(false);
+        self.state.held.send_modify(|(held, generation)| {
+            *held = false;
+            *generation += 1;
+        });
     }
 
     /// Quantos pedidos estão em voo agora.
@@ -387,8 +399,11 @@ impl Http for FakeHttp {
             self.state.requests.lock().unwrap().push(req.clone());
             let _guard = InFlight::enter(&self.state);
             let mut held = self.state.held.subscribe();
+            let start = held.borrow_and_update().1;
             // O `Sender` vive no estado: o `wait_for` só termina no `release`.
-            let _ = held.wait_for(|held| !*held).await;
+            let _ = held
+                .wait_for(|&(held, generation)| !held || generation != start)
+                .await;
             if self.state.panicking {
                 panic!("FakeHttp::panicking: pânico no pedido");
             }

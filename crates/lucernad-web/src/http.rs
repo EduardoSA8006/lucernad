@@ -216,6 +216,11 @@ fn classify(e: reqwest::Error) -> HttpError {
     let e = e.without_url();
     if e.is_timeout() {
         HttpError::Timeout
+    // No `reqwest` 0.13, a conexão que cai antes da resposta só aparece como
+    // `is_request()` (o `IncompleteMessage` do hyper, sem `io::Error` por
+    // baixo); distinguir exigiria o `hyper` direto, que o plano não permite.
+    // Por isso todo erro de envio vira `Connect`, de propósito: também a
+    // resposta malformada e o erro de protocolo (ganham nova tentativa).
     } else if e.is_connect() || e.is_request() {
         HttpError::Connect
     } else {
