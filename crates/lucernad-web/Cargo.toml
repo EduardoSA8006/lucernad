@@ -1,0 +1,26 @@
+[package]
+name = "lucernad-web"
+description = "Módulo web do lucernad: a letra das músicas e a previsão do tempo, com cache em disco."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+# Os dublês e os dados de teste, para os testes.
+testing = []
+
+[dependencies]
+serde_json.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+# Os testes deste crate usam o módulo `testing`.
+lucernad-web = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true
