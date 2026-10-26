@@ -1,11 +1,13 @@
 //! Ajudantes para os testes (feature `testing`): o servidor HTTP local
-//! ([`LocalServer`], só em 127.0.0.1) e o [`Http`] falso ([`FakeHttp`]).
+//! ([`LocalServer`], só em 127.0.0.1), o [`Http`] falso ([`FakeHttp`]), a
+//! conectividade falsa ([`FakeLink`]) e a trava da sonda ([`isolated`]).
 //!
 //! Nada aqui sai para a internet: o [`LocalServer`] escuta só no loopback e o
-//! [`FakeHttp`] nunca abre uma conexão.
+//! [`FakeHttp`] nunca abre uma conexão; o [`FakeLink`] nunca fala com o D-Bus.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,6 +19,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::http::{BoxFuture, Http, HttpError, Request, Response};
+use crate::net::{Connectivity, Link};
 
 /// O maior cabeçalho de pedido que o [`LocalServer`] lê.
 const HEAD_MAX: usize = 64 * 1024;
@@ -505,4 +508,44 @@ pub fn cities_body(n: usize) -> Value {
         })
         .collect();
     serde_json::json!({"results": results, "generationtime_ms": 0.5})
+}
+
+/// O dublê do [`Connectivity`]: o teste muda o estado na mão com o
+/// [`FakeLink::set`]. Os clones dividem o mesmo estado.
+#[derive(Clone)]
+pub struct FakeLink {
+    tx: Arc<watch::Sender<Link>>,
+}
+
+impl FakeLink {
+    pub fn new(link: Link) -> FakeLink {
+        FakeLink {
+            tx: Arc::new(watch::Sender::new(link)),
+        }
+    }
+
+    /// Muda o estado (quem acompanha pelo `watch` vê a troca).
+    pub fn set(&self, link: Link) {
+        self.tx.send_replace(link);
+    }
+}
+
+impl Connectivity for FakeLink {
+    fn watch(&self) -> watch::Receiver<Link> {
+        self.tx.subscribe()
+    }
+}
+
+/// A trava da sonda do D-Bus (`tests/sonda.rs`): só passa com
+/// `LUCERNA_ISOLADO=1` **e** dentro de um container (`/.dockerenv` ou
+/// `/run/.containerenv`), que é onde o `tests/isolado.sh` sobe um D-Bus do
+/// sistema de mentira. Fora disso, entra em pânico: a sonda nunca fala com o
+/// NetworkManager da máquina.
+pub fn isolated() {
+    let flag = std::env::var_os("LUCERNA_ISOLADO").is_some_and(|v| v == "1");
+    let container = Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists();
+    assert!(
+        flag && container,
+        "sonda.rs: só roda pelo tests/isolado.sh, num container"
+    );
 }
