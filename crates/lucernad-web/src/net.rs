@@ -64,31 +64,36 @@ pub trait Connectivity: Send + Sync + 'static {
 /// é aberto até o primeiro [`Connectivity::watch`]).
 #[derive(Clone)]
 pub struct NmConnectivity {
-    rx: Arc<Mutex<Option<watch::Receiver<Link>>>>,
+    /// O lado de quem publica, enquanto a tarefa acompanha (`None` antes do
+    /// primeiro `watch`).
+    tx: Arc<Mutex<Option<watch::Sender<Link>>>>,
 }
 
 impl NmConnectivity {
     /// O D-Bus do sistema.
     pub fn system() -> NmConnectivity {
         NmConnectivity {
-            rx: Arc::new(Mutex::new(None)),
+            tx: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 impl Connectivity for NmConnectivity {
     fn watch(&self) -> watch::Receiver<Link> {
-        let mut rx = self
-            .rx
+        let mut tx = self
+            .tx
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(rx) = rx.as_ref() {
-            return rx.clone();
+        // Com algum receptor vivo, a tarefa continua: divide o mesmo `watch`.
+        // Sem nenhum, ela terminou (ou vai terminar, e nunca ganha outro
+        // receptor): começa outra.
+        if let Some(tx) = tx.as_ref().filter(|tx| tx.receiver_count() > 0) {
+            return tx.subscribe();
         }
-        let (tx, fresh) = watch::channel(Link::Unknown);
-        tokio::spawn(follow(tx));
-        *rx = Some(fresh.clone());
-        fresh
+        let (fresh, rx) = watch::channel(Link::Unknown);
+        tokio::spawn(follow(fresh.clone()));
+        *tx = Some(fresh);
+        rx
     }
 }
 
@@ -131,14 +136,17 @@ async fn within<T, E: Into<Failure>>(
 
 /// A tarefa do [`NmConnectivity`]: conecta, acompanha enquanto a conexão
 /// durar e, sem ela, publica [`Link::Unknown`] e tenta de novo em [`RETRY`].
-/// O aviso no log sai só na primeira falha seguida.
+/// O aviso no log sai só na primeira falha seguida. Termina quando todos os
+/// receptores caem.
 async fn follow(tx: watch::Sender<Link>) {
     let mut warned = false;
     loop {
         match within(Connection::system()).await {
             Ok(conn) => {
                 warned = false;
-                follow_on(&conn, &tx).await;
+                if let Ended::Closed = follow_on(&conn, &tx).await {
+                    return;
+                }
             }
             Err(e) => {
                 if !warned {
@@ -151,25 +159,34 @@ async fn follow(tx: watch::Sender<Link>) {
                 }
             }
         }
-        tx.send_if_modified(|link| replace(link, Link::Unknown));
-        if tx.is_closed() {
-            return;
+        publish(&tx, Link::Unknown);
+        tokio::select! {
+            () = tx.closed() => return,
+            () = tokio::time::sleep(RETRY) => {}
         }
-        tokio::time::sleep(RETRY).await;
     }
 }
 
-/// Troca `link` por `now`, dizendo se mudou.
-fn replace(link: &mut Link, now: Link) -> bool {
-    let changed = *link != now;
-    *link = now;
-    changed
+/// Como terminou o acompanhamento numa conexão.
+enum Ended {
+    /// Todos os receptores caíram.
+    Closed,
+    /// A conexão caiu (ou os sinais não deram para assinar).
+    Lost,
+}
+
+/// Manda `now` se mudou.
+fn publish(tx: &watch::Sender<Link>, now: Link) {
+    tx.send_if_modified(|link| {
+        let changed = *link != now;
+        *link = now;
+        changed
+    });
 }
 
 /// Acompanha numa conexão: assina o `NameOwnerChanged` do nome e o
-/// `PropertiesChanged` do caminho, lê o estado e relê a cada sinal. Volta
-/// quando a conexão cai (ou os sinais não dão para assinar).
-async fn follow_on(conn: &Connection, tx: &watch::Sender<Link>) {
+/// `PropertiesChanged` do caminho, lê o estado e relê a cada sinal.
+async fn follow_on(conn: &Connection, tx: &watch::Sender<Link>) -> Ended {
     let mut streams = Vec::new();
     for rule in [owner_rule(), properties_rule()] {
         let stream = match rule {
@@ -180,18 +197,21 @@ async fn follow_on(conn: &Connection, tx: &watch::Sender<Link>) {
             Ok(stream) => streams.push(stream),
             Err(e) => {
                 eprintln!("lucernad: a conectividade: {e}");
-                return;
+                return Ended::Lost;
             }
         }
     }
     // Os sinais assinados antes da leitura: nenhuma troca fica no meio.
-    // Uma leitura incerta (`None`) não publica: fica o último estado.
-    if let Some(now) = current(conn).await {
-        tx.send_if_modified(|link| replace(link, now));
-    }
-    while next_signal(&mut streams).await {
-        if let Some(now) = current(conn).await {
-            tx.send_if_modified(|link| replace(link, now));
+    publish(tx, current(conn).await);
+    loop {
+        tokio::select! {
+            () = tx.closed() => return Ended::Closed,
+            alive = next_signal(&mut streams) => {
+                if !alive {
+                    return Ended::Lost;
+                }
+                publish(tx, current(conn).await);
+            }
         }
     }
 }
@@ -237,15 +257,16 @@ async fn next_signal(streams: &mut [MessageStream]) -> bool {
 
 /// A conectividade agora: sem dono do nome, [`Link::Unknown`] (só pergunta a
 /// quem tem dono: um nome sem dono ativaria o serviço); com dono, o
-/// `Connectivity` dele. `None` quando não deu para saber (um erro ou um prazo
-/// estourado no meio).
-async fn current(conn: &Connection) -> Option<Link> {
-    let dbus = within(DBusProxy::new(conn)).await.ok()?;
-    let name = BusName::try_from(NM).ok()?;
-    if !within(dbus.name_has_owner(name)).await.ok()? {
-        return Some(Link::Unknown);
-    }
+/// `Connectivity` dele. Uma leitura que falha ou estoura o prazo também dá
+/// [`Link::Unknown`]: o módulo tenta a rede em vez de ficar preso num
+/// `Offline` velho com o NetworkManager travado.
+async fn current(conn: &Connection) -> Link {
     let read = async {
+        let dbus = within(DBusProxy::new(conn)).await?;
+        let name = BusName::try_from(NM).map_err(zbus::Error::from)?;
+        if !within(dbus.name_has_owner(name)).await? {
+            return Ok(Link::Unknown);
+        }
         let build = zbus::proxy::Builder::<Proxy<'_>>::new(conn)
             .destination(NM)?
             .path(NM_PATH)?
@@ -253,7 +274,8 @@ async fn current(conn: &Connection) -> Option<Link> {
             .cache_properties(CacheProperties::No)
             .build();
         let nm = within(build).await?;
-        within(nm.get_property::<u32>("Connectivity")).await
+        let value = within(nm.get_property::<u32>("Connectivity")).await?;
+        Ok::<_, Failure>(link_from(value))
     };
-    read.await.ok().map(link_from)
+    read.await.unwrap_or(Link::Unknown)
 }

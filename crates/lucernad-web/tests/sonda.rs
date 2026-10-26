@@ -39,25 +39,40 @@ async fn until(rx: &mut Receiver<Link>, want: Link) {
     assert!(reached, "esperava {want:?}, ficou {:?}", *rx.borrow());
 }
 
+/// Registra o NetworkManager falso com `connectivity`.
+async fn serve(connectivity: Arc<Mutex<u32>>) -> zbus::Connection {
+    Builder::system()
+        .unwrap()
+        .name(NM)
+        .unwrap()
+        .serve_at(NM_PATH, FakeNm { connectivity })
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "só no D-Bus isolado (tests/isolado.sh)"]
+async fn starts_without_network_manager() {
+    isolated();
+    // Sem o nome na partida: desconhecida, e o NameOwnerChanged pega a chegada.
+    let nm = NmConnectivity::system();
+    let mut rx = nm.watch();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(*rx.borrow_and_update(), Link::Unknown);
+    let service = serve(Arc::new(Mutex::new(1))).await;
+    until(&mut rx, Link::Offline).await;
+    service.release_name(NM).await.unwrap();
+    until(&mut rx, Link::Unknown).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "só no D-Bus isolado (tests/isolado.sh)"]
 async fn follows_network_manager() {
     isolated();
     let connectivity = Arc::new(Mutex::new(4));
-    let service = Builder::system()
-        .unwrap()
-        .name(NM)
-        .unwrap()
-        .serve_at(
-            NM_PATH,
-            FakeNm {
-                connectivity: connectivity.clone(),
-            },
-        )
-        .unwrap()
-        .build()
-        .await
-        .unwrap();
+    let service = serve(connectivity.clone()).await;
 
     let nm = NmConnectivity::system();
     let mut rx = nm.watch();
