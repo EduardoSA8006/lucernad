@@ -1247,7 +1247,10 @@ dependencies = [
 name = "lucernad-web"
 version = "0.1.0"
 dependencies = [
+ "lucerna-ipc",
  "lucerna-paths",
+ "lucerna-service",
+ "lucernad-core",
  "lucernad-web",
  "reqwest",
  "rustls",

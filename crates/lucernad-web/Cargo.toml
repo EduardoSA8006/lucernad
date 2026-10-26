@@ -16,6 +16,8 @@ testing = []
 
 [dependencies]
 lucerna-paths.workspace = true
+lucerna-service.workspace = true
+lucernad-core.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde_json.workspace = true
@@ -25,6 +27,7 @@ unicode-normalization.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]
+lucerna-ipc.workspace = true
 tempfile.workspace = true
 # Os testes deste crate usam o módulo `testing`.
 lucernad-web = { path = ".", features = ["testing"] }

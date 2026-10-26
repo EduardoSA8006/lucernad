@@ -1,6 +1,8 @@
 //! Ajudantes para os testes (feature `testing`): o servidor HTTP local
 //! ([`LocalServer`], só em 127.0.0.1), o [`Http`] falso ([`FakeHttp`]), a
-//! conectividade falsa ([`FakeLink`]) e a trava da sonda ([`isolated`]).
+//! conectividade falsa ([`FakeLink`]), a trava da sonda ([`isolated`]), os
+//! dados de teste das fontes e as configurações do módulo para os testes
+//! ([`fake_config`], com os dublês, e [`quiet_config`], para o binário).
 //!
 //! Nada aqui sai para a internet: o [`LocalServer`] escuta só no loopback e o
 //! [`FakeHttp`] nunca abre uma conexão; o [`FakeLink`] nunca fala com o D-Bus.
@@ -10,7 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,7 +20,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::http::{BoxFuture, Http, HttpError, Request, Response};
+use crate::WebConfig;
+use crate::cache::{CACHE_LIMIT, Cache};
+use crate::endpoints::Endpoints;
+use crate::http::{
+    BoxFuture, Http, HttpError, Network, REQUEST_TIMEOUT, Request, ReqwestHttp, Response,
+    RetryPolicy,
+};
 use crate::net::{Connectivity, Link};
 
 /// O maior cabeçalho de pedido que o [`LocalServer`] lê.
@@ -459,6 +467,35 @@ pub fn forecast_body_days(days: usize) -> Value {
     forecast_body_at(FORECAST_START, days)
 }
 
+/// A previsão de 7 dias seguidos a partir de `first` (`AAAA-MM-DD`), em
+/// Cacaulândia (−4 h). Com o [`forecast_today`], a previsão não envelhece.
+pub fn forecast_body_from(first: &str) -> Value {
+    let start = days_from_civil(first).expect("data AAAA-MM-DD");
+    forecast_body_at(start, 7)
+}
+
+/// A data de hoje em Cacaulândia (−4 h, o fuso da previsão de teste), em
+/// `AAAA-MM-DD`.
+pub fn forecast_today() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    crate::weather::civil_date((now - 4 * 3600).div_euclid(86_400))
+}
+
+/// Os dias desde 1970-01-01 da data `AAAA-MM-DD` (o `days_from_civil` de
+/// Howard Hinnant).
+fn days_from_civil(date: &str) -> Option<i64> {
+    let mut parts = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (parts.next()??, parts.next()??, parts.next()??);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
 /// A previsão com `days` dias a partir do dia `start` (em dias desde
 /// 1970-01-01); nascer às 05:41 e pôr às 18:03 em todos.
 fn forecast_body_at(start: i64, days: usize) -> Value {
@@ -548,4 +585,104 @@ pub fn isolated() {
         flag && container,
         "sonda.rs: só roda pelo tests/isolado.sh, num container"
     );
+}
+
+/// A base das rotas do [`fake_config`]: nada escuta nela, o [`FakeHttp`]
+/// responde.
+const FAKE_BASE: &str = "http://127.0.0.1:1";
+
+/// Os dublês de um [`fake_config`].
+pub struct Fakes {
+    pub http: FakeHttp,
+    pub link: FakeLink,
+}
+
+/// A política dos testes: 1 nova tentativa, 1 ms de espera, `Retry-After`
+/// até 50 ms.
+fn quick_policy() -> RetryPolicy {
+    RetryPolicy {
+        retries: 1,
+        base: Duration::from_millis(1),
+        retry_after_max: Duration::from_millis(50),
+    }
+}
+
+/// O módulo com os dublês: o [`FakeHttp`] sob `http://127.0.0.1:1`, o
+/// [`FakeLink`] em [`Link::Unknown`], o cache em `dir/cache` e os prazos
+/// curtos (`settle` 20 ms, `weather_retry` 100 ms, um minuto do `refresh`
+/// = 10 ms). As rotas: a LRCLIB com "Tempo Perdido" da "Legião Urbana"
+/// (sincronizada) e 404 para o resto; a previsão de 7 dias a partir de hoje
+/// ([`forecast_body_from`] com o [`forecast_today`]); três cidades na busca.
+pub fn fake_config(dir: &Path) -> (WebConfig, Fakes) {
+    let http = FakeHttp::new();
+    http.route(FAKE_BASE, |_| Ok(json(404, not_found())));
+    http.route(&format!("{FAKE_BASE}/lrclib"), |req| {
+        let get = req.url.ends_with("/api/get");
+        let arg = |k: &str| {
+            req.query
+                .iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.as_str())
+        };
+        if get
+            && arg("track_name") == Some("Tempo Perdido")
+            && arg("artist_name") == Some("Legião Urbana")
+        {
+            let entry = lrclib_entry(
+                "Legião Urbana",
+                "Tempo Perdido",
+                201.0,
+                Some("Todos os dias quando acordo"),
+                Some("[00:12.50]Todos os dias quando acordo\n[00:17.00]"),
+            );
+            return Ok(json(200, entry));
+        }
+        Ok(json(404, not_found()))
+    });
+    http.route(&format!("{FAKE_BASE}/forecast"), |_| {
+        Ok(json(200, forecast_body_from(&forecast_today())))
+    });
+    http.route(&format!("{FAKE_BASE}/geocoding"), |_| {
+        Ok(json(200, cities_body(3)))
+    });
+    let link = FakeLink::new(Link::Unknown);
+    let cfg = WebConfig {
+        http: Arc::new(http.clone()),
+        endpoints: Endpoints::under(FAKE_BASE),
+        base_error: None,
+        cache: Some(Cache::new(dir.join("cache"), CACHE_LIMIT)),
+        link: Arc::new(link.clone()),
+        policy: quick_policy(),
+        search_policy: quick_policy(),
+        settle: Duration::from_millis(20),
+        weather_retry: Duration::from_millis(100),
+        minute: Duration::from_millis(10),
+    };
+    (cfg, Fakes { http, link })
+}
+
+/// O 404 da LRCLIB.
+fn not_found() -> Value {
+    serde_json::json!({"statusCode": 404, "name": "TrackNotFound", "message": "Failed to find specified track"})
+}
+
+/// O módulo para o binário nos testes: o [`ReqwestHttp`] de verdade em
+/// [`Network::Loopback`] contra `base` (um [`LocalServer`]), o [`FakeLink`]
+/// em [`Link::Unknown`] (nada do D-Bus), o cache em `dir` e os prazos de
+/// verdade.
+pub fn quiet_config(dir: &Path, base: &str) -> WebConfig {
+    let http =
+        ReqwestHttp::new(REQUEST_TIMEOUT, Network::Loopback).expect("o cliente HTTP de teste");
+    WebConfig {
+        http: Arc::new(http),
+        endpoints: Endpoints::under(base),
+        base_error: None,
+        cache: Some(Cache::new(dir.to_path_buf(), CACHE_LIMIT)),
+        link: Arc::new(FakeLink::new(Link::Unknown)),
+        policy: RetryPolicy::standard(),
+        search_policy: RetryPolicy::short(),
+        settle: crate::TRACK_SETTLE,
+        weather_retry: crate::WEATHER_RETRY,
+        minute: Duration::from_secs(60),
+    }
 }
