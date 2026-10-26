@@ -18,6 +18,8 @@ use lucernad_power::testing::quiet_config as power_config;
 use lucernad_spectrum::testing::quiet_config;
 #[cfg(feature = "system")]
 use lucernad_system::testing::machine_config;
+#[cfg(feature = "web")]
+use lucernad_web::testing::quiet_config as web_config;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
@@ -45,6 +47,8 @@ pub async fn start() -> Running {
         clipboard: clipboard_config(dir.path()),
         #[cfg(feature = "power")]
         power: power_config(dir.path()),
+        #[cfg(feature = "web")]
+        web: web_config(dir.path(), "http://127.0.0.1:1"),
     });
     d.service.idle_timeout(Duration::from_secs(60));
     let service = d.service;
@@ -63,6 +67,8 @@ pub async fn start() -> Running {
             d.clipboard_task,
             #[cfg(feature = "power")]
             d.power_task,
+            #[cfg(feature = "web")]
+            d.web_task,
         ],
         task,
     }

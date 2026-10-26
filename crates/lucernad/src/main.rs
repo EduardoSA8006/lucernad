@@ -1,5 +1,5 @@
-//! O binário `lucernad`: `serve` roda o daemon; `status`, `watch`, `player`, `historico`, `copiar` e `brilho`
-//! falam com ele. Sem argumentos (ou com `tui …`), mostra a ajuda: não há TUI.
+//! O binário `lucernad`: `serve` roda o daemon; `status`, `watch`, `player`, `historico`, `copiar`, `brilho`,
+//! `faixa`, `cidade` e `rede` falam com ele. Sem argumentos (ou com `tui …`), mostra a ajuda: não há TUI.
 
 use std::fmt::Display;
 use std::process::ExitCode;
@@ -25,6 +25,8 @@ async fn main() -> ExitCode {
             let _clipboard_task = d.clipboard_task;
             #[cfg(feature = "power")]
             let _power_task = d.power_task;
+            #[cfg(feature = "web")]
+            let _web_task = d.web_task;
             report(d.service.run().await)
         }
         Ok(Invocation::Cli(run)) => cli.run_from_env(run).await,

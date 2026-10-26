@@ -1,6 +1,6 @@
 [package]
 name = "lucernad"
-description = "O daemon do Lucerna: um binário com um módulo por área (system, spectrum, clipboard e power)."
+description = "O daemon do Lucerna: um binário com um módulo por área (system, spectrum, clipboard, power e web)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ authors.workspace = true
 publish.workspace = true
 
 [features]
-default = ["system", "spectrum", "clipboard", "power"]
+default = ["system", "spectrum", "clipboard", "power", "web"]
 # O módulo `system`: CPU, memória, rede, temperatura, discos e GPUs.
 system = ["dep:lucernad-system", "dep:lucernad-core"]
 # O módulo `spectrum`: o espectro do som do player exibido, pelo PipeWire.
@@ -20,6 +20,8 @@ spectrum = ["dep:lucernad-spectrum", "dep:lucernad-core", "dep:serde_json"]
 clipboard = ["dep:lucernad-clipboard", "dep:lucernad-core", "dep:serde_json"]
 # O módulo power: o brilho das telas, o histórico de consumo e os perfis.
 power = ["dep:lucernad-power", "dep:lucernad-core", "dep:serde_json"]
+# O módulo web: a letra das músicas e a previsão do tempo.
+web = ["dep:lucernad-web", "dep:lucernad-core", "dep:serde_json"]
 
 [lib]
 name = "lucernad"
@@ -38,6 +40,7 @@ lucernad-clipboard = { workspace = true, optional = true }
 lucernad-power = { workspace = true, optional = true }
 lucernad-spectrum = { workspace = true, optional = true }
 lucernad-system = { workspace = true, optional = true }
+lucernad-web = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio.workspace = true
 
@@ -46,6 +49,7 @@ lucernad-clipboard = { workspace = true, features = ["testing"] }
 lucernad-power = { workspace = true, features = ["testing"] }
 lucernad-spectrum = { workspace = true, features = ["testing"] }
 lucernad-system = { workspace = true, features = ["testing"] }
+lucernad-web = { workspace = true, features = ["testing"] }
 lucerna-ipc.workspace = true
 lucerna-manifest.workspace = true
 tempfile.workspace = true

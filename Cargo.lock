@@ -1159,6 +1159,7 @@ dependencies = [
  "lucernad-power",
  "lucernad-spectrum",
  "lucernad-system",
+ "lucernad-web",
  "serde_json",
  "tempfile",
  "tokio",

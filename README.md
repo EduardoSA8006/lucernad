@@ -2,9 +2,9 @@
 
 # lucernad
 
-Daemon em Rust com a lógica do shell Lucerna (espectro de áudio, sistema, área de transferência, energia e mais); o shell fica só com a interface.
+Daemon em Rust com a lógica do shell Lucerna (espectro de áudio, sistema, área de transferência, energia, letra e clima e mais); o shell fica só com a interface.
 
-**Situação:** quatro módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs), o `spectrum` (o espectro do som do player exibido, pelo PipeWire), o `clipboard` (o histórico da área de transferência do Wayland) e o `power` (o brilho das telas, o histórico de consumo e os perfis de energia).
+**Situação:** cinco módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs), o `spectrum` (o espectro do som do player exibido, pelo PipeWire), o `clipboard` (o histórico da área de transferência do Wayland) o `power` (o brilho das telas, o histórico de consumo e os perfis de energia) e o `web` (a letra das músicas e a previsão do tempo).
 
 ## Módulos
 
@@ -80,6 +80,35 @@ Erros: `-32602` para parâmetro inválido, `1001` para tela que não existe, `10
 
 O i2c só abre barramentos de placa de vídeo (classe PCI `0x03*`): SMBus, sensores e touchpad nunca são tocados. O `LUCERNAD_POWER_ROOT` é **só de teste**: aponta o módulo para uma árvore falsa (fora do `/sys`, do `/dev` e do `/proc`), sem logind nem DDC, sem o uevent do kernel (mudanças de fora na árvore só aparecem relendo: num assinante novo ou num método) e sem o UPower e os perfis (histórico vazio, perfis indisponíveis); em container, sem ele, o módulo fica indisponível.
 
+### `web`
+
+Busca a letra da música que está tocando e a previsão do tempo da cidade escolhida, sem nenhum processo externo (nada de `curl`): HTTPS próprio, com os certificados do sistema. A letra vem da [LRCLIB](https://lrclib.net) (sincronizada, ou só o texto) e, só com a chave do usuário, do Vagalume; o clima e a busca de cidade, do [Open-Meteo](https://open-meteo.com).
+
+**O que vai para cada serviço:** às fontes de letra, só o título, o artista, o álbum e a duração da faixa; ao Open-Meteo, só o nome pesquisado (na busca de cidade) e a cidade e as coordenadas escolhidas (na previsão). Nada mais sai: nenhum identificador, nenhum dado da máquina; o `User-Agent` é `lucernad/<versão> (Lucerna; https://github.com/lucerna-desktop/lucernad)`.
+
+Roda **só com assinante** (a letra, só com assinante de `web.lyrics`; o clima, só com cidade escolhida) e **nada vai à rede antes do primeiro `web.configure`**: o daemon sobe antes do shell dizer se está offline, então o módulo começa offline (lê só o cache). Com `offline: true`, nenhum pedido novo sai e a resposta em voo não é publicada. Sem conexão (o NetworkManager diz que não há rede) também não tenta; sem NetworkManager, tenta. Ao voltar a conexão, refaz a letra com erro e o clima velho. A faixa sem artista ou sem título não busca nada.
+
+| Tópico | O que traz | Quando muda |
+| --- | --- | --- |
+| `web.lyrics` | `{"key","state","synced","lines":[{"time","text"}],"source","url"?,"error"?}`: `state` `found`, `searching`, `none` ou `error`; `time` em segundos (`null` na letra sem tempo); `source` `lrclib` ou `vagalume` (o `url` só com o Vagalume); `null` até o primeiro `web.track` com assinante | a cada faixa e a cada resultado |
+| `web.weather` | `{"location","state","updatedAt","current","daily","sunrise","sunset","error"?}`: `state` `none`, `loading`, `ready` ou `error` (com os dados guardados); `daily` só de hoje em diante, na data local da cidade; °C, km/h e %; `null` até o primeiro `web.configure` | a cada atualização e a cada virada de dia |
+| `web.status` | `{"available","error","online"}`; `available` `false` com o motivo se o módulo não puder rodar | quando o estado ou a conectividade muda |
+
+Métodos:
+
+- `web.track {artist, title, album?, duration?}` → `{}`: a faixa tocando (o shell manda a cada troca; a busca espera 500 ms sem nova troca, e pular faixas em sequência não faz uma busca por faixa).
+- `web.configure {offline, vagalumeKey?, location?, refresh?}` → `{}`: substitui **toda** a configuração (campo opcional ausente volta ao padrão; `refresh` de 5 a 1440 minutos, padrão 30). `location` é `{name, latitude, longitude}`.
+- `web.searchCity {query}` → `{"results":[{"name","state","country","countryCode","latitude","longitude"}]}`: até 5 cidades.
+- `web.refresh {}` → `{}`: busca o clima já e refaz a letra com erro.
+
+Erros: `-32602` para parâmetro inválido (o texto não ecoa o valor); `1001` "Modo offline ligado: a busca de cidade usa a internet."; `1002` "Sem conexão com a internet."; `1003` "Não consegui falar com o Open-Meteo: …"; `1004` com o módulo indisponível (também o `web.track` e o `web.configure`).
+
+**Cache e limites:** a letra e a previsão ficam em `$XDG_CACHE_HOME/lucerna/web/` (pasta 0700, um arquivo por chave, escrita atômica), até 50 MiB no total (apaga os mais antigos) e 512 KiB por entrada; "sem letra" vale 7 dias, e a falha de rede nunca é guardada. Cada resposta lida passa de no máximo 4 MiB; a letra tem até 1000 linhas de 200 caracteres e 128 KiB de texto. Cada pedido tem prazo de 10 s, com até 3 novas tentativas (1, 2 e 4 s, ou o `Retry-After`).
+
+**O Vagalume:** só é usado com a chave **do próprio usuário**, criada no site deles (<https://auth.vagalume.com.br/settings/api/>), mandada no `vagalumeKey` do `web.configure`; sem chave, nunca é consultado. A chave nunca aparece em log, tópico, mensagem de erro nem linha de comando. Os dados do Open-Meteo são CC BY 4.0 ("Weather data by Open-Meteo.com"), de uso livre só não comercial.
+
+O `LUCERNAD_WEB_BASE` é **só de teste**: `http://127.0.0.1:<porta>` (ou `http://[::1]:<porta>`) aponta as quatro fontes para um servidor local, com o cache numa subpasta própria e sem redirecionamento; qualquer outro valor deixa o módulo indisponível, nunca na rede de verdade.
+
 ## Instalação
 
 Para compilar: o `gcc` (o SQLite do histórico é compilado junto), `libpipewire`, `clang` e `pkgconf` (Arch) ou `libpipewire-0.3-dev`, `libclang-dev` e `pkg-config` (Debian/Ubuntu). O espectro precisa do PipeWire com o WirePlumber rodando.
@@ -115,6 +144,9 @@ O socket fica em `$XDG_RUNTIME_DIR/lucerna/lucernad.sock`; o systemd sobe o daem
 - `lucernad historico [busca]`: os 20 itens mais recentes da área de transferência (com busca, só os que casam).
 - `lucernad copiar ID`: põe um item do histórico na área de transferência.
 - `lucernad brilho [ID PERCENT|+N|-N]`: as telas com brilho ajustável (com ID e PERCENT, ajusta uma; `+N` e `-N` somam ao valor atual).
+- `lucernad faixa ARTISTA TÍTULO [SEGUNDOS] [--album ÁLBUM]`: diz ao módulo de rede qual faixa está tocando (a letra só é buscada com assinante de `web.lyrics`; `lucernad watch web.lyrics` mostra).
+- `lucernad cidade BUSCA`: procura uma cidade no Open-Meteo (até 5 resultados, com as coordenadas).
+- `lucernad rede [--offline] [--cidade NOME --lat LAT --lon LON] [--atualizar MIN]`: configura o módulo de rede. Ele **substitui** a configuração que o shell mandou (o shell manda a dele de novo só ao reconectar). A chave do Vagalume vem só do ambiente (`LUCERNAD_VAGALUME_KEY=… lucernad rede`), nunca de argumento: fica fora do histórico do terminal e do `ps`.
 - `--json` (antes do subcomando): a saída em JSON, uma linha por estado.
 
 ## Desenvolvimento
@@ -129,8 +161,17 @@ cargo clippy -p lucernad --no-default-features --features system --all-targets -
 cargo clippy -p lucernad --no-default-features --features spectrum --all-targets --locked -- -D warnings
 cargo clippy -p lucernad --no-default-features --features clipboard --all-targets --locked -- -D warnings
 cargo clippy -p lucernad --no-default-features --features power --all-targets --locked -- -D warnings
+cargo clippy -p lucernad --no-default-features --features web --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
+
+Nenhum teste vai à internet: os testes do `web` usam só um servidor em 127.0.0.1. A prova é rodar a suíte inteira num namespace de rede sem saída para fora:
+
+```sh
+U=$(id -u) G=$(id -g); unshare -rn sh -c "ip link set lo up && exec unshare --map-user=$U --map-group=$G env TMPDIR=/tmp cargo test --workspace --locked --offline"
+```
+
+O `-rn` cria o namespace de rede (só com o loopback) mas mapeia o usuário para o root, e como root os testes de permissão (`crates/lucernad-clipboard/tests/store.rs`) falham; por isso o uid e o gid são lidos **antes** (dentro do namespace já valem 0) e o segundo `unshare` volta ao usuário de sempre, sem perder o namespace de rede.
 
 Para rodar o daemon sem o systemd: `cargo run -p lucernad -- serve`.
 
@@ -140,6 +181,14 @@ A sonda do D-Bus do `power` (`crates/lucernad-power/tests/sonda.rs`) também só
 docker run --rm -v "$PWD:/src:ro" -v <toolchain>:/tc:ro archlinux:latest \
   bash -c 'pacman -Syu --noconfirm --needed dbus gcc > /dev/null \
     && useradd -m t && runuser -u t -- env PATH=/tc/bin:$PATH bash /src/crates/lucernad-power/tests/isolado.sh'
+```
+
+A sonda do D-Bus do `web` (`crates/lucernad-web/tests/sonda.rs`, a conectividade pelo NetworkManager) só roda num container, num D-Bus do sistema de mentira com um NetworkManager falso, nunca no da máquina: o `tests/isolado.sh` sobe o `dbus-daemon` (o cabeçalho do script traz o `docker run`).
+
+```sh
+docker run --rm -v "$PWD:/src:ro" -v <toolchain>:/tc:ro archlinux:latest \
+  bash -c 'pacman -Syu --noconfirm --needed dbus gcc > /dev/null \
+    && useradd -m t && runuser -u t -- env PATH=/tc/bin:$PATH bash /src/crates/lucernad-web/tests/isolado.sh'
 ```
 
 A sonda do backend Wayland (`crates/lucernad-clipboard/tests/sonda.rs`) só roda num compositor isolado, nunca na sessão do usuário: o `tests/isolado.sh` sobe um sway headless dentro de um container (o cabeçalho do script traz o `docker run`).
