@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lucerna_ipc::{Client, ClientError, Topic};
+use lucerna_ipc::raw::RawConn;
+use lucerna_ipc::{Client, ClientError};
 use lucerna_service::ServerBuilder;
 use lucernad_web::cache::{CACHE_LIMIT, Cache, Kind};
 use lucernad_web::endpoints::base_from_env;
@@ -16,7 +17,7 @@ use lucernad_web::lyrics::{Found, Lyrics, Source};
 use lucernad_web::matching::Track;
 use lucernad_web::net::Link;
 use lucernad_web::testing::{
-    FakeHttp, Fakes, fake_config, forecast_body_from, forecast_today, json as reply,
+    FakeHttp, Fakes, fake_config, forecast_body_from, forecast_today, json as reply, lrclib_entry,
 };
 use lucernad_web::weather::{Forecast, Location, parse_forecast};
 use lucernad_web::{WebConfig, WebTopics, register};
@@ -160,8 +161,12 @@ async fn wait_until(within: Duration, what: &str, mut cond: impl FnMut() -> bool
     }
 }
 
-/// Guarda cada estado novo de um tópico (pelo `seq`), olhando a cada 1 ms:
-/// a sequência do que foi publicado, para os testes do que **nunca** aparece.
+/// Guarda cada estado de um tópico, na ordem: uma conexão crua inscrita
+/// nele lendo cada linha `lucerna.state` (o retrato da inscrição primeiro).
+/// Sem amostragem e sem o mapa do `Client` (que funde os estados que chegam
+/// juntos): toda publicação separada da seguinte por um `.await` do laço
+/// chega aqui (o runtime do teste roda o escritor da conexão antes de
+/// voltar ao laço). A inscrição conta como assinante do tópico.
 struct Seq {
     states: Arc<Mutex<Vec<Value>>>,
     task: JoinHandle<()>,
@@ -183,19 +188,56 @@ impl Seq {
     }
 }
 
-fn record(topic: &Topic) -> Seq {
+/// Guarda um `lucerna.state` (ou o retrato da inscrição) com `seq` novo.
+fn keep(log: &Mutex<Vec<Value>>, last: &mut u64, state: &Value) {
+    let seq = state["seq"].as_u64().unwrap_or(0);
+    if seq > *last || log.lock().unwrap().is_empty() {
+        *last = seq;
+        log.lock().unwrap().push(state["data"].clone());
+    }
+}
+
+async fn record(path: &Path, topic: &str) -> Seq {
+    let mut conn = RawConn::connect(path).await.unwrap();
+    conn.hello("lucernad").await.unwrap();
+    conn.send(
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "lucerna.subscribe",
+                      "params": {"topics": [topic]}}),
+    )
+    .await
+    .unwrap();
     let states = Arc::new(Mutex::new(Vec::new()));
-    let log = states.clone();
-    let topic = topic.clone();
-    let task = tokio::spawn(async move {
-        let mut seen = None;
-        loop {
-            let now = topic.current();
-            if seen != Some(now.seq) {
-                seen = Some(now.seq);
-                log.lock().unwrap().push(now.data);
+    let mut last = 0;
+    // Até a resposta da inscrição: o retrato vem nela.
+    let mut early = Vec::new();
+    loop {
+        let msg = conn.recv().await.unwrap().expect("a conexão do gravador");
+        if msg["id"] == 1 {
+            for state in msg["result"]["states"].as_array().unwrap() {
+                keep(&states, &mut last, state);
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            break;
+        }
+        if msg["method"] == "lucerna.state" {
+            early.push(msg["params"].clone());
+        }
+    }
+    for state in &early {
+        keep(&states, &mut last, state);
+    }
+    let log = states.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            match conn.recv().await {
+                Ok(Some(msg)) if msg["method"] == "lucerna.state" => {
+                    keep(&log, &mut last, &msg["params"]);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return,
+                // O `recv` desiste em 5 s sem mensagem; o gravador continua.
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("o gravador: {e}"),
+            }
         }
     });
     Seq { states, task }
@@ -398,7 +440,7 @@ async fn lyrics_found_and_cached() {
         let c = client(&r.path).await;
         online(&c).await;
         c.subscribe(&["web.lyrics"]).await.unwrap();
-        let seq = record(&r.t.lyrics);
+        let seq = record(&r.path, "web.lyrics").await;
         track(&c, &tempo_perdido()).await;
         let (i, _) = wait_seq(&seq, 0, "procurando", |v| is(v, &key, "searching")).await;
         let (_, found) = wait_seq(&seq, i, "achada", |v| is(v, &key, "found")).await;
@@ -441,7 +483,7 @@ async fn cached_track_never_passes_through_searching() {
     let c = client(&r.path).await;
     online(&c).await;
     c.subscribe(&["web.lyrics"]).await.unwrap();
-    let seq = record(&r.t.lyrics);
+    let seq = record(&r.path, "web.lyrics").await;
     track(&c, &missing("Outra")).await;
     let (i, _) = wait_seq(&seq, 0, "a outra procurando", |v| v["state"] == "searching").await;
     track(&c, &tempo_perdido()).await;
@@ -468,7 +510,7 @@ async fn none_is_cached_and_failure_is_not() {
     let c = client(&r.path).await;
     online(&c).await;
     c.subscribe(&["web.lyrics"]).await.unwrap();
-    let seq = record(&r.t.lyrics);
+    let seq = record(&r.path, "web.lyrics").await;
     let nothing = missing("Não Existe");
     let tp = tempo_perdido().key();
 
@@ -512,19 +554,33 @@ async fn none_is_cached_and_failure_is_not() {
 #[tokio::test]
 async fn skipping_tracks_never_shows_old_lyrics() {
     let dir = tempfile::tempdir().unwrap();
-    let r = rig_on(dir.path(), |cfg| cfg.settle = Duration::from_millis(200));
+    let r = rig_on(dir.path(), |_| {});
+    // Toda faixa tem letra: uma busca antiga que escapasse publicaria a dela.
+    r.f.http.route(&format!("{BASE}/lrclib"), |q| {
+        let artist = param(q, "artist_name").unwrap_or_default();
+        let title = param(q, "track_name").unwrap_or_default();
+        let entry = lrclib_entry(artist, title, 180.0, None, Some("[00:01.00]Letra"));
+        Ok(reply(200, entry))
+    });
     let c = client(&r.path).await;
     online(&c).await;
-    c.subscribe(&["web.lyrics"]).await.unwrap();
-    let seq = record(&r.t.lyrics);
-    for i in 0..9 {
-        track(&c, &missing(&format!("Faixa {i}"))).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let seq = record(&r.path, "web.lyrics").await;
+    // Cada troca chega com a busca da faixa anterior em voo (parada).
+    r.f.http.hold();
+    let skipped: Vec<Track> = (0..9).map(|i| missing(&format!("Faixa {i}"))).collect();
+    for (i, t) in skipped.iter().enumerate() {
+        track(&c, t).await;
+        wait_until(LONG, &format!("a busca da faixa {i} em voo"), || {
+            r.f.http.count() == i + 1
+        })
+        .await;
     }
     track(&c, &tempo_perdido()).await;
     let key = tempo_perdido().key();
+    wait_until(LONG, "a busca da última em voo", || r.f.http.count() == 10).await;
+    r.f.http.release();
     wait_seq(&seq, 0, "a última achada", |v| is(v, &key, "found")).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(is(&r.t.lyrics.current().data, &key, "found"));
     let all = seq.all();
     assert!(
@@ -534,13 +590,8 @@ async fn skipping_tracks_never_shows_old_lyrics() {
         "uma letra de outra faixa foi publicada: {all:?}"
     );
     assert_eq!(r.f.http.max_in_flight(), 1);
-    let reqs = r.f.http.requests();
-    assert!(
-        reqs.iter()
-            .all(|q| param(q, "track_name") == Some("Tempo Perdido")),
-        "pedidos das faixas puladas: {reqs:?}"
-    );
-    assert!(requests_to(&r.f, "/api/get").len() <= 1);
+    assert_eq!(requests_to(&r.f, "/api/get").len(), 10);
+    assert_eq!(r.f.http.count(), 10, "uma faixa pulada seguiu buscando");
 }
 
 #[tokio::test]
@@ -569,9 +620,9 @@ async fn vagalume_key_never_leaks() {
     r.f.http
         .route(&format!("{BASE}/vagalume"), |_| Err(HttpError::Connect));
     let c = client(&r.path).await;
-    let lyrics = record(&r.t.lyrics);
-    let weather = record(&r.t.weather);
-    let status = record(&r.t.status);
+    let lyrics = record(&r.path, "web.lyrics").await;
+    let weather = record(&r.path, "web.weather").await;
+    let status = record(&r.path, "web.status").await;
     ok(
         &c,
         "web.configure",
@@ -611,7 +662,6 @@ async fn weather_cached_is_published_at_once_and_refreshed_in_background() {
         .unwrap();
     let r = rig_on(dir.path(), |_| {});
     let c = client(&r.path).await;
-    let seq = record(&r.t.weather);
     r.f.http.hold();
     ok(
         &c,
@@ -620,10 +670,12 @@ async fn weather_cached_is_published_at_once_and_refreshed_in_background() {
     )
     .await;
     // Sem assinante, o guardado fica publicado e nada é pedido.
-    let (i, _) = wait_seq(&seq, 0, "o guardado", |v| !v.is_null()).await;
+    assert_eq!(r.t.weather.current().data["state"], "ready");
     assert_eq!(r.f.http.count(), 0);
-    let states = c.subscribe(&["web.weather"]).await.unwrap();
-    let first = states[0].data.clone();
+    // A inscrição do gravador é o assinante: o primeiro estado é o retrato.
+    let seq = record(&r.path, "web.weather").await;
+    let (i, first) = wait_seq(&seq, 0, "a primeira", |v| !v.is_null()).await;
+    assert_eq!(i, 0);
     assert_eq!(first["state"], "ready");
     assert_eq!(first["updatedAt"], unix(old));
     assert_eq!(first["location"], loc_json(&cacau()));
@@ -677,7 +729,7 @@ async fn weather_error_keeps_the_old_data() {
     r.f.http
         .route(&format!("{BASE}/forecast"), |_| Err(HttpError::Status(500)));
     let c = client(&r.path).await;
-    let seq = record(&r.t.weather);
+    let seq = record(&r.path, "web.weather").await;
     c.subscribe(&["web.weather"]).await.unwrap();
     ok(
         &c,
@@ -768,8 +820,8 @@ async fn going_offline_mid_fetch_sends_nothing_more() {
     let dir = tempfile::tempdir().unwrap();
     let r = rig_on(dir.path(), |_| {});
     let c = client(&r.path).await;
-    let lyrics = record(&r.t.lyrics);
-    let weather = record(&r.t.weather);
+    let lyrics = record(&r.path, "web.lyrics").await;
+    let weather = record(&r.path, "web.weather").await;
     r.f.http.hold();
     ok(
         &c,
@@ -816,7 +868,7 @@ async fn changing_city_mid_fetch_publishes_only_the_new_one() {
         Ok(reply(200, body))
     });
     let c = client(&r.path).await;
-    let seq = record(&r.t.weather);
+    let seq = record(&r.path, "web.weather").await;
     r.f.http.hold();
     c.subscribe(&["web.weather"]).await.unwrap();
     ok(

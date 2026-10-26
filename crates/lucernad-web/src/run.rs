@@ -65,10 +65,18 @@ pub(crate) struct Parts {
     pub reach: watch::Sender<Reach>,
 }
 
-/// Uma busca em voo: a chave de quem pediu e a tarefa.
+/// Uma busca em voo: a chave de quem pediu e a tarefa. Largar aborta a
+/// tarefa: ao trocar de busca, ao sair do laço e no pânico dele, nenhuma
+/// busca fica órfã.
 struct Flight<T> {
     key: String,
     handle: JoinHandle<T>,
+}
+
+impl<T> Drop for Flight<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 type LyricsOutcome = Result<Found, String>;
@@ -192,8 +200,8 @@ async fn joined<T>(slot: &mut Option<Flight<T>>) -> (String, Result<T, JoinError
         return pending().await;
     };
     let r = (&mut flight.handle).await;
-    let flight = slot.take().expect("a busca em voo");
-    (flight.key, r)
+    let mut flight = slot.take().expect("a busca em voo");
+    (std::mem::take(&mut flight.key), r)
 }
 
 async fn until(due: Option<Instant>) {
@@ -456,9 +464,8 @@ impl Loop {
     }
 
     fn abort_lyrics(&mut self) {
-        if let Some(f) = self.lyrics.take() {
-            f.handle.abort();
-        }
+        // O `Drop` do `Flight` aborta.
+        self.lyrics = None;
     }
 
     /// A letra da faixa atual: aborta a busca em voo; o cache responde na
@@ -552,9 +559,8 @@ impl Loop {
     }
 
     fn abort_weather(&mut self) {
-        if let Some(f) = self.weather.take() {
-            f.handle.abort();
-        }
+        // O `Drop` do `Flight` aborta.
+        self.weather = None;
     }
 
     async fn on_weather_subscribers(&mut self) {
