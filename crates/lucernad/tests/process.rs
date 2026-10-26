@@ -532,17 +532,7 @@ fn invalid_web_base_makes_the_module_unavailable() {
         assert!(start.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(10));
     }
-    let out = lucernad(t.path())
-        .args(["--json", "watch", "web.status"])
-        .env("LUCERNAD_WEB_BASE", "https://example.com")
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut out = Serve(out);
-    let stdout = out.child().stdout.take().unwrap();
-    let mut first = String::new();
-    BufReader::new(stdout).read_line(&mut first).unwrap();
-    let v: Value = serde_json::from_str(&first).unwrap();
+    let (_watch, _rx, v) = watch_json(t.path(), "web.status");
     assert_eq!(v["data"]["available"], false, "{v}");
     assert_eq!(
         v["data"]["error"],

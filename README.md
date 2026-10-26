@@ -4,7 +4,7 @@
 
 Daemon em Rust com a lógica do shell Lucerna (espectro de áudio, sistema, área de transferência, energia, letra e clima e mais); o shell fica só com a interface.
 
-**Situação:** cinco módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs), o `spectrum` (o espectro do som do player exibido, pelo PipeWire), o `clipboard` (o histórico da área de transferência do Wayland) o `power` (o brilho das telas, o histórico de consumo e os perfis de energia) e o `web` (a letra das músicas e a previsão do tempo).
+**Situação:** cinco módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs), o `spectrum` (o espectro do som do player exibido, pelo PipeWire), o `clipboard` (o histórico da área de transferência do Wayland), o `power` (o brilho das telas, o histórico de consumo e os perfis de energia) e o `web` (a letra das músicas e a previsão do tempo).
 
 ## Módulos
 
@@ -86,12 +86,12 @@ Busca a letra da música que está tocando e a previsão do tempo da cidade esco
 
 **O que vai para cada serviço:** às fontes de letra, só o título, o artista, o álbum e a duração da faixa; ao Open-Meteo, só o nome pesquisado (na busca de cidade) e a cidade e as coordenadas escolhidas (na previsão). Nada mais sai: nenhum identificador, nenhum dado da máquina; o `User-Agent` é `lucernad/<versão> (Lucerna; https://github.com/lucerna-desktop/lucernad)`.
 
-Roda **só com assinante** (a letra, só com assinante de `web.lyrics`; o clima, só com cidade escolhida) e **nada vai à rede antes do primeiro `web.configure`**: o daemon sobe antes do shell dizer se está offline, então o módulo começa offline (lê só o cache). Com `offline: true`, nenhum pedido novo sai e a resposta em voo não é publicada. Sem conexão (o NetworkManager diz que não há rede) também não tenta; sem NetworkManager, tenta. Ao voltar a conexão, refaz a letra com erro e o clima velho. A faixa sem artista ou sem título não busca nada.
+Roda **só com assinante** (a letra, só com assinante de `web.lyrics`; o clima, só com cidade escolhida e assinante de `web.weather`, ou pelo `web.refresh`) e **nada vai à rede antes do primeiro `web.configure`**: o daemon sobe antes do shell dizer se está offline, então o módulo começa offline (lê só o cache). Com `offline: true`, nenhum pedido novo sai e a resposta em voo não é publicada. Sem conexão (o NetworkManager diz que não há rede) também não tenta; sem NetworkManager, tenta. Ao voltar a conexão, refaz a letra com erro e o clima velho. A faixa sem artista ou sem título não busca nada.
 
 | Tópico | O que traz | Quando muda |
 | --- | --- | --- |
 | `web.lyrics` | `{"key","state","synced","lines":[{"time","text"}],"source","url"?,"error"?}`: `state` `found`, `searching`, `none` ou `error`; `time` em segundos (`null` na letra sem tempo); `source` `lrclib` ou `vagalume` (o `url` só com o Vagalume); `null` até o primeiro `web.track` com assinante | a cada faixa e a cada resultado |
-| `web.weather` | `{"location","state","updatedAt","current","daily","sunrise","sunset","error"?}`: `state` `none`, `loading`, `ready` ou `error` (com os dados guardados); `daily` só de hoje em diante, na data local da cidade; °C, km/h e %; `null` até o primeiro `web.configure` | a cada atualização e a cada virada de dia |
+| `web.weather` | `{"location","state","updatedAt","current","daily","sunrise","sunset","error"?}`: `state` `none`, `loading`, `ready` ou `error` (com os dados guardados); `daily` só de hoje em diante, na data local da cidade; °C, km/h e %; `null` até o primeiro `web.configure` | a cada atualização |
 | `web.status` | `{"available","error","online"}`; `available` `false` com o motivo se o módulo não puder rodar | quando o estado ou a conectividade muda |
 
 Métodos:
@@ -103,7 +103,7 @@ Métodos:
 
 Erros: `-32602` para parâmetro inválido (o texto não ecoa o valor); `1001` "Modo offline ligado: a busca de cidade usa a internet."; `1002` "Sem conexão com a internet."; `1003` "Não consegui falar com o Open-Meteo: …"; `1004` com o módulo indisponível (também o `web.track` e o `web.configure`).
 
-**Cache e limites:** a letra e a previsão ficam em `$XDG_CACHE_HOME/lucerna/web/` (pasta 0700, um arquivo por chave, escrita atômica), até 50 MiB no total (apaga os mais antigos) e 512 KiB por entrada; "sem letra" vale 7 dias, e a falha de rede nunca é guardada. Cada resposta lida passa de no máximo 4 MiB; a letra tem até 1000 linhas de 200 caracteres e 128 KiB de texto. Cada pedido tem prazo de 10 s, com até 3 novas tentativas (1, 2 e 4 s, ou o `Retry-After`).
+**Cache e limites:** a letra e a previsão ficam em `$XDG_CACHE_HOME/lucerna/web/` (pasta 0700, um arquivo por chave, escrita atômica), até 50 MiB no total (apaga os mais antigos) e 512 KiB por entrada; "sem letra" vale 7 dias, e a falha de rede nunca é guardada. Cada resposta é lida até 4 MiB (acima disso, é recusada); a letra tem até 1000 linhas de 200 caracteres e 128 KiB de texto. Cada pedido tem prazo de 10 s, com até 3 novas tentativas (1, 2 e 4 s, ou o `Retry-After`).
 
 **O Vagalume:** só é usado com a chave **do próprio usuário**, criada no site deles (<https://auth.vagalume.com.br/settings/api/>), mandada no `vagalumeKey` do `web.configure`; sem chave, nunca é consultado. A chave nunca aparece em log, tópico, mensagem de erro nem linha de comando. Os dados do Open-Meteo são CC BY 4.0 ("Weather data by Open-Meteo.com"), de uso livre só não comercial.
 
