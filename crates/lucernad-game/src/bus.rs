@@ -89,9 +89,13 @@ pub fn gamemode_reply(code: i32) -> Result<(), BusError> {
 
 /// O perfil de energia e o GameMode.
 pub trait GameBus: Send + Sync + 'static {
-    /// Segura o perfil "desempenho"; devolve o cookie.
+    /// Segura o perfil "desempenho"; devolve o cookie. Cada etapa tem o
+    /// próprio prazo: quem chama não põe outro por fora (cortar o futuro
+    /// depois de o pedido sair perderia o cookie). Se a resposta não chega,
+    /// a implementação larga a conexão (o serviço solta a retenção com ela).
     fn hold_performance(&self) -> BoxFuture<'_, Result<u32, BusError>>;
-    /// Solta a retenção `cookie`.
+    /// Solta a retenção `cookie`; se não der, larga a conexão (o serviço
+    /// solta a retenção com ela).
     fn release(&self, cookie: u32) -> BoxFuture<'_, Result<(), BusError>>;
     /// Se o GameMode está no barramento da sessão.
     fn gamemode_present(&self) -> BoxFuture<'_, Result<bool, BusError>>;
@@ -127,6 +131,11 @@ impl Lazy {
         };
         *conn = Some(fresh.clone());
         Ok(fresh)
+    }
+
+    /// Larga a conexão guardada: sem outros clones vivos, ela fecha.
+    async fn forget(&self) {
+        *self.conn.lock().await = None;
     }
 
     async fn forget_on(&self, e: &zbus::Error) {
@@ -214,14 +223,24 @@ impl GameBus for ZbusGame {
                 if !has_owner(&conn, name).await? {
                     continue;
                 }
-                let cookie: u32 = Self::call(
+                drop(conn);
+                let held: Result<u32, BusError> = Self::call(
                     &self.system,
                     name,
                     path,
                     "HoldProfile",
                     &("performance", "Modo jogo do Lucerna", "lucernad"),
                 )
-                .await?;
+                .await;
+                let cookie = match held {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // O pedido pode ter chegado sem a resposta: larga a
+                        // conexão para o serviço soltar uma retenção órfã.
+                        self.system.forget().await;
+                        return Err(e);
+                    }
+                };
                 *self.holder.lock().await = Some(name);
                 return Ok(cookie);
             }
@@ -239,7 +258,13 @@ impl GameBus for ZbusGame {
                 .find(|(n, _)| *n == name)
                 .map(|(_, p)| *p)
                 .unwrap_or_default();
-            Self::call::<()>(&self.system, name, path, "ReleaseProfile", &(cookie,)).await
+            let released =
+                Self::call::<()>(&self.system, name, path, "ReleaseProfile", &(cookie,)).await;
+            if released.is_err() {
+                // O cookie se perdeu: a conexão caindo solta a retenção.
+                self.system.forget().await;
+            }
+            released
         })
     }
 

@@ -566,3 +566,18 @@ async fn shutdown_restores_even_with_a_retry_scheduled() {
     assert_eq!(r.store.load(), None);
     assert_eq!(r.work.pending(), 0);
 }
+
+#[tokio::test]
+async fn slow_hold_is_still_released() {
+    // O serviço de perfis segura o perfil e demora a devolver o cookie
+    // (mais que o prazo de uma chamada): o cookie não pode se perder.
+    let r = rig();
+    r.bus
+        .slow_hold(lucernad_game::bus::DBUS_TIMEOUT + Duration::from_millis(300));
+    let c = r.client().await;
+    r.call(&c, "game.set", json!({"on": true})).await;
+    assert!(r.bus.held().is_some());
+    r.call(&c, "game.set", json!({"on": false})).await;
+    state_until(&c, |v| !active(v)).await;
+    assert_eq!(r.bus.held(), None, "a retenção ficou presa");
+}

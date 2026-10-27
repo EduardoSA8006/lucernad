@@ -552,7 +552,9 @@ impl Run {
         if want {
             if self.cookie.is_none() && !self.profile_tried {
                 self.profile_tried = true;
-                match timed(self.bus.hold_performance()).await {
+                // Sem prazo de fora: as etapas têm o delas, e cortar o futuro
+                // depois de o pedido sair perderia o cookie com a retenção feita.
+                match self.bus.hold_performance().await {
                     Ok(c) => {
                         self.cookie = Some(c);
                         self.profile = Ok(());
@@ -572,7 +574,7 @@ impl Run {
         self.profile_tried = false;
         self.profile = Ok(());
         if let Some(c) = self.cookie.take()
-            && let Err(e) = timed(self.bus.release(c)).await
+            && let Err(e) = self.bus.release(c).await
         {
             eprintln!("lucernad: o modo jogo não soltou o perfil de desempenho: {e}");
         }

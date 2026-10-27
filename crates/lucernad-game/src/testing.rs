@@ -78,6 +78,7 @@ struct FakeBusState {
     no_profiles: bool,
     no_gamemode: bool,
     hang: bool,
+    slow_hold: Option<std::time::Duration>,
     fail_next: Vec<BusError>,
     calls: Vec<String>,
     held: Option<u32>,
@@ -115,6 +116,12 @@ impl FakeGameBus {
     /// A próxima chamada falha com `e`.
     pub fn fail_next(&self, e: BusError) {
         self.state.lock().unwrap().fail_next.push(e);
+    }
+
+    /// O `hold` segura o perfil na hora (como o serviço que recebeu o
+    /// pedido) e só responde depois de `d`.
+    pub fn slow_hold(&self, d: std::time::Duration) {
+        self.state.lock().unwrap().slow_hold = Some(d);
     }
 
     /// Toda chamada fica sem resposta.
@@ -160,13 +167,19 @@ impl GameBus for FakeGameBus {
     fn hold_performance(&self) -> BoxFuture<'_, Result<u32, BusError>> {
         Box::pin(async move {
             self.enter("hold".into()).await?;
-            let mut s = self.state.lock().unwrap();
-            if s.no_profiles {
-                return Err(BusError::Absent);
+            let (c, slow) = {
+                let mut s = self.state.lock().unwrap();
+                if s.no_profiles {
+                    return Err(BusError::Absent);
+                }
+                let c = s.next_cookie;
+                s.next_cookie += 1;
+                s.held = Some(c);
+                (c, s.slow_hold)
+            };
+            if let Some(d) = slow {
+                tokio::time::sleep(d).await;
             }
-            let c = s.next_cookie;
-            s.next_cookie += 1;
-            s.held = Some(c);
             Ok(c)
         })
     }
