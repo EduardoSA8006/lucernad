@@ -311,6 +311,7 @@ pub struct FakeHypr {
     model: Mutex<Model>,
     requests: Mutex<Vec<String>>,
     fail_next: Mutex<Vec<HyprError>>,
+    fail_on: Mutex<Vec<(String, HyprError)>>,
     unreachable: Mutex<bool>,
     hang: Mutex<Vec<String>>,
     instance: Mutex<Option<String>>,
@@ -332,6 +333,7 @@ impl FakeHypr {
             model: Mutex::new(Model::default()),
             requests: Mutex::new(Vec::new()),
             fail_next: Mutex::new(Vec::new()),
+            fail_on: Mutex::new(Vec::new()),
             unreachable: Mutex::new(false),
             hang: Mutex::new(Vec::new()),
             instance: Mutex::new(Some("fake_1".into())),
@@ -402,6 +404,11 @@ impl FakeHypr {
         self.fail_next.lock().unwrap().push(e);
     }
 
+    /// O próximo pedido que começa com `prefix` falha com `e` (uma vez).
+    pub fn fail_on(&self, prefix: &str, e: HyprError) {
+        self.fail_on.lock().unwrap().push((prefix.to_string(), e));
+    }
+
     /// Com `true`, todo pedido dá `Unreachable` (o Hyprland fora do ar).
     pub fn set_unreachable(&self, down: bool) {
         *self.unreachable.lock().unwrap() = down;
@@ -440,6 +447,10 @@ impl Hypr for FakeHypr {
                 let mut f = self.fail_next.lock().unwrap();
                 if !f.is_empty() {
                     return Err(f.remove(0));
+                }
+                let mut on = self.fail_on.lock().unwrap();
+                if let Some(i) = on.iter().position(|(p, _)| command.starts_with(p.as_str())) {
+                    return Err(on.remove(i).1);
                 }
             }
             Ok(self.model.lock().unwrap().handle(&command))
