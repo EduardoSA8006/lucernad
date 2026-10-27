@@ -92,9 +92,16 @@ impl Store {
     }
 }
 
+/// Grava com modo 0600 (o `.tmp` sobrado de antes é trocado).
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
     f.write_all(bytes)?;
     f.sync_all()
 }

@@ -29,6 +29,8 @@ fn save_load_and_clear() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o700, "a pasta é privada");
+    let file = std::fs::metadata(store.path()).unwrap().permissions().mode();
+    assert_eq!(file & 0o777, 0o600, "o arquivo também");
     assert!(store.path().ends_with("lucerna/game/restore.json"));
     assert!(!dir.path().join("lucerna/game/restore.json.tmp").exists());
     store.clear();
