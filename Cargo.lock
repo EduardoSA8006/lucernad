@@ -1156,6 +1156,7 @@ dependencies = [
  "lucerna-service",
  "lucernad-clipboard",
  "lucernad-core",
+ "lucernad-hyprland",
  "lucernad-power",
  "lucernad-spectrum",
  "lucernad-system",

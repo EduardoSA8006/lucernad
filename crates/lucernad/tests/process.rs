@@ -18,7 +18,8 @@
     feature = "spectrum",
     feature = "clipboard",
     feature = "power",
-    feature = "web"
+    feature = "web",
+    feature = "hyprland"
 ))]
 
 use std::io::{BufRead, BufReader};
@@ -96,7 +97,8 @@ fn web_base() -> String {
     WEB.with(WebServer::base)
 }
 
-/// O binário com um ambiente limpo: `HOME`, `XDG_RUNTIME_DIR`, `PATH` e, para
+/// O binário com um ambiente limpo (sem `HYPRLAND_INSTANCE_SIGNATURE` e sem
+/// Hyprland no `XDG_RUNTIME_DIR`): `HOME`, `XDG_RUNTIME_DIR`, `PATH` e, para
 /// o `power`, a árvore falsa em `dir/power` e um D-Bus do sistema que não
 /// existe; para o `web`, o `LUCERNAD_WEB_BASE` do servidor local do teste.
 fn lucernad(dir: &Path) -> Command {
@@ -424,6 +426,19 @@ fn cli_help_status_and_exit_codes() {
             "stderr: {err}"
         );
         assert_eq!(std::fs::read_to_string(&brightness).unwrap(), "lixo\n");
+    }
+    #[cfg(feature = "hyprland")]
+    {
+        // Sem Hyprland no XDG_RUNTIME_DIR temporário: indisponível, com o motivo.
+        let (_w, rx, mut v) = watch_json(t.path(), "hyprland.status");
+        while !v["data"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("não está rodando")
+        {
+            v = line(&rx);
+        }
+        assert_eq!(v["data"]["available"], false, "{v}");
     }
 }
 

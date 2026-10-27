@@ -49,6 +49,10 @@ pub async fn start() -> Running {
         power: power_config(dir.path()),
         #[cfg(feature = "web")]
         web: web_config(dir.path(), "http://127.0.0.1:1"),
+        #[cfg(feature = "hyprland")]
+        hyprland: lucernad_hyprland::HyprlandConfig {
+            hypr: std::sync::Arc::new(lucernad_hyprland::testing::FakeHypr::new()),
+        },
     });
     d.service.idle_timeout(Duration::from_secs(60));
     let service = d.service;
@@ -69,6 +73,8 @@ pub async fn start() -> Running {
             d.power_task,
             #[cfg(feature = "web")]
             d.web_task,
+            #[cfg(feature = "hyprland")]
+            d.hyprland_task,
         ],
         task,
     }

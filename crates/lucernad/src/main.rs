@@ -27,6 +27,8 @@ async fn main() -> ExitCode {
             let _power_task = d.power_task;
             #[cfg(feature = "web")]
             let _web_task = d.web_task;
+            #[cfg(feature = "hyprland")]
+            let _hyprland_task = d.hyprland_task;
             report(d.service.run().await)
         }
         Ok(Invocation::Cli(run)) => cli.run_from_env(run).await,

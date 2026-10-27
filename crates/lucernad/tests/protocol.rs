@@ -5,7 +5,8 @@
     feature = "spectrum",
     feature = "clipboard",
     feature = "power",
-    feature = "web"
+    feature = "web",
+    feature = "hyprland"
 ))]
 
 mod common;
@@ -17,7 +18,8 @@ use serde_json::Value;
     feature = "spectrum",
     feature = "clipboard",
     feature = "power",
-    feature = "web"
+    feature = "web",
+    feature = "hyprland"
 ))]
 use serde_json::json;
 
@@ -139,5 +141,28 @@ async fn the_daemon_serves_the_web_module() {
         lucerna_ipc::ClientError::Rpc(e) => assert_eq!(e.code, 1001, "{}", e.message),
         other => panic!("esperava o 1001: {other:?}"),
     }
+    r.stop().await;
+}
+
+#[cfg(feature = "hyprland")]
+#[tokio::test]
+async fn the_daemon_serves_the_hyprland_module() {
+    let r = start().await;
+    let c = r.client().await;
+    assert!(
+        c.hello().topics.iter().any(|x| x == "hyprland.status"),
+        "falta o hyprland.status"
+    );
+    let mut s = c.subscribe(&["hyprland.status"]).await.unwrap()[0]
+        .data
+        .clone();
+    while s["available"] != json!(true) {
+        s = tokio::time::timeout(std::time::Duration::from_secs(5), c.next_state())
+            .await
+            .unwrap()
+            .unwrap()
+            .data;
+    }
+    assert_eq!(s["version"], json!("0.56.2"));
     r.stop().await;
 }

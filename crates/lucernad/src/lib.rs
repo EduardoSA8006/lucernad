@@ -1,7 +1,7 @@
 //! O `lucernad`: o daemon do Lucerna, um binário com um módulo por área.
 //!
 //! Cada módulo é um crate ligado por uma feature (`system`, `spectrum`,
-//! `clipboard`, `power` e `web`, as cinco padrão) e se registra no mesmo serviço. [`lucernad`] monta o serviço
+//! `clipboard`, `power`, `web` e `hyprland`, todas padrão) e se registra no mesmo serviço. [`lucernad`] monta o serviço
 //! com os módulos ligados; [`cli`] é a linha de comando: os subcomandos comuns
 //! do SDK (`status` e `watch`) e, com o `spectrum`, o `player`; com o
 //! `clipboard`, o `historico` e o `copiar`; com o `power`, o `brilho`; com o
@@ -30,6 +30,9 @@ pub struct Modules {
     /// O módulo `web`.
     #[cfg(feature = "web")]
     pub web: lucernad_web::WebConfig,
+    /// O módulo `hyprland`.
+    #[cfg(feature = "hyprland")]
+    pub hyprland: lucernad_hyprland::HyprlandConfig,
 }
 
 impl Modules {
@@ -46,6 +49,8 @@ impl Modules {
             power: lucernad_power::PowerConfig::system(),
             #[cfg(feature = "web")]
             web: lucernad_web::WebConfig::system(),
+            #[cfg(feature = "hyprland")]
+            hyprland: lucernad_hyprland::HyprlandConfig::system(),
         }
     }
 }
@@ -88,6 +93,12 @@ pub struct Lucernad {
     /// O laço do módulo `web`; soltá-lo encerra as buscas em voo.
     #[cfg(feature = "web")]
     pub web_task: lucernad_core::ModuleTask,
+    /// Os tópicos do módulo `hyprland`.
+    #[cfg(feature = "hyprland")]
+    pub hyprland: lucernad_hyprland::HyprlandTopics,
+    /// O laço do módulo `hyprland`; soltá-lo encerra a leitura dos eventos.
+    #[cfg(feature = "hyprland")]
+    pub hyprland_task: lucernad_core::ModuleTask,
 }
 
 /// Monta o serviço com os módulos ligados. Chame dentro do runtime: começa as
@@ -100,7 +111,8 @@ pub fn lucernad(modules: Modules) -> Lucernad {
             feature = "spectrum",
             feature = "clipboard",
             feature = "power",
-            feature = "web"
+            feature = "web",
+            feature = "hyprland"
         )),
         allow(unused_mut)
     )]
@@ -117,12 +129,15 @@ pub fn lucernad(modules: Modules) -> Lucernad {
     let power = lucernad_power::register(service.server(), modules.power, work);
     #[cfg(feature = "web")]
     let web = lucernad_web::register(service.server(), modules.web);
+    #[cfg(feature = "hyprland")]
+    let hyprland = lucernad_hyprland::register(service.server(), modules.hyprland);
     #[cfg(not(any(
         feature = "system",
         feature = "spectrum",
         feature = "clipboard",
         feature = "power",
-        feature = "web"
+        feature = "web",
+        feature = "hyprland"
     )))]
     let Modules {} = modules;
     Lucernad {
@@ -147,6 +162,10 @@ pub fn lucernad(modules: Modules) -> Lucernad {
         web: web.topics.clone(),
         #[cfg(feature = "web")]
         web_task: web.spawn(),
+        #[cfg(feature = "hyprland")]
+        hyprland: hyprland.topics.clone(),
+        #[cfg(feature = "hyprland")]
+        hyprland_task: hyprland.spawn(),
     }
 }
 
@@ -156,7 +175,7 @@ pub fn cli() -> CliApp {
         APP,
         "lucernad",
         env!("CARGO_PKG_VERSION"),
-        "O daemon do Lucerna: os dados do sistema, o espectro do som, o histórico da área de transferência, o brilho das telas e a letra e o clima para o shell.",
+        "O daemon do Lucerna: os dados do sistema, o espectro do som, o histórico da área de transferência, o brilho das telas, a letra e o clima e o estado do compositor (Hyprland) para o shell.",
     );
     #[cfg(feature = "spectrum")]
     let app = app.command(player_command());
