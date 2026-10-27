@@ -166,3 +166,28 @@ async fn the_daemon_serves_the_hyprland_module() {
     assert_eq!(s["version"], json!("0.56.2"));
     r.stop().await;
 }
+
+#[cfg(feature = "game")]
+#[tokio::test]
+async fn the_daemon_serves_the_game_module() {
+    let r = start().await;
+    let c = r.client().await;
+    for t in ["game.state", "game.status"] {
+        assert!(c.hello().topics.iter().any(|x| x == t), "falta {t}");
+    }
+    for m in ["game.set", "game.toggle", "game.configure", "game.get"] {
+        assert!(c.hello().methods.iter().any(|x| x == m), "falta {m}");
+    }
+    let s = c.call("game.get", Some(json!({}))).await.unwrap();
+    assert_eq!(s["active"], json!(false));
+    // Ligado na mão, o compositor do Hyprland falso do módulo hyprland.
+    c.call("game.set", Some(json!({"on": true}))).await.unwrap();
+    let s = c.call("game.get", Some(json!({}))).await.unwrap();
+    assert_eq!(s["active"], json!(true), "{s}");
+    assert_eq!(s["effects"]["compositor"], json!("ok"), "{s}");
+    assert_eq!(s["effects"]["light"], json!("ok"), "{s}");
+    c.call("game.set", Some(json!({"on": false})))
+        .await
+        .unwrap();
+    r.stop().await;
+}

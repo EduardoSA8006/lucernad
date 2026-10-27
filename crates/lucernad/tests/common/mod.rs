@@ -53,6 +53,16 @@ pub async fn start() -> Running {
         hyprland: lucernad_hyprland::HyprlandConfig {
             hypr: std::sync::Arc::new(lucernad_hyprland::testing::FakeHypr::new()),
         },
+        // Sem `hypr`: o do módulo hyprland (o falso de cima).
+        #[cfg(feature = "game")]
+        game: lucernad_game::GameConfig {
+            hypr: None,
+            bus: std::sync::Arc::new(lucernad_game::testing::FakeGameBus::new()),
+            proc: lucernad_game::detect::ProcRoot::at(&dir.path().join("proc"), 1000),
+            journal: Some(lucernad_game::journal::Store::new(dir.path().join("game"))),
+            light: None,
+            timing: lucernad_game::Timing::default(),
+        },
     });
     d.service.idle_timeout(Duration::from_secs(60));
     let service = d.service;
@@ -75,6 +85,8 @@ pub async fn start() -> Running {
             d.web_task,
             #[cfg(feature = "hyprland")]
             d.hyprland_task,
+            #[cfg(feature = "game")]
+            d.game_task,
         ],
         task,
     }

@@ -82,6 +82,8 @@ jobs:
           cargo clippy -p lucernad --no-default-features --features clipboard --all-targets --locked -- -D warnings
           cargo clippy -p lucernad --no-default-features --features power --all-targets --locked -- -D warnings
           cargo clippy -p lucernad --no-default-features --features web --all-targets --locked -- -D warnings
+          cargo clippy -p lucernad --no-default-features --features hyprland --all-targets --locked -- -D warnings
+          cargo clippy -p lucernad --no-default-features --features game --all-targets --locked -- -D warnings
 
       - name: test
         if: matrix.job == 'test'

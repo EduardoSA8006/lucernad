@@ -1,6 +1,6 @@
 [package]
 name = "lucernad"
-description = "O daemon do Lucerna: um binário com um módulo por área (system, spectrum, clipboard, power, web e hyprland)."
+description = "O daemon do Lucerna: um binário com um módulo por área (system, spectrum, clipboard, power, web, hyprland e game)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ authors.workspace = true
 publish.workspace = true
 
 [features]
-default = ["system", "spectrum", "clipboard", "power", "web", "hyprland"]
+default = ["system", "spectrum", "clipboard", "power", "web", "hyprland", "game"]
 # O módulo `system`: CPU, memória, rede, temperatura, discos e GPUs.
 system = ["dep:lucernad-system", "dep:lucernad-core"]
 # O módulo `spectrum`: o espectro do som do player exibido, pelo PipeWire.
@@ -24,6 +24,8 @@ power = ["dep:lucernad-power", "dep:lucernad-core", "dep:serde_json"]
 web = ["dep:lucernad-web", "dep:lucernad-core", "dep:serde_json"]
 # O módulo hyprland: o socket do compositor (o mínimo do modo jogo).
 hyprland = ["dep:lucernad-hyprland", "dep:lucernad-core", "dep:serde_json"]
+# O módulo game: o modo jogo (depende do hyprland).
+game = ["hyprland", "dep:lucernad-game"]
 
 [lib]
 name = "lucernad"
@@ -44,6 +46,7 @@ lucernad-spectrum = { workspace = true, optional = true }
 lucernad-system = { workspace = true, optional = true }
 lucernad-web = { workspace = true, optional = true }
 lucernad-hyprland = { workspace = true, optional = true }
+lucernad-game = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio.workspace = true
 
@@ -54,6 +57,7 @@ lucernad-spectrum = { workspace = true, features = ["testing"] }
 lucernad-system = { workspace = true, features = ["testing"] }
 lucernad-web = { workspace = true, features = ["testing"] }
 lucernad-hyprland = { workspace = true, features = ["testing"] }
+lucernad-game = { workspace = true, features = ["testing"] }
 lucerna-ipc.workspace = true
 lucerna-manifest.workspace = true
 tempfile.workspace = true

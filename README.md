@@ -4,7 +4,7 @@
 
 Daemon em Rust com a lógica do shell Lucerna (espectro de áudio, sistema, área de transferência, energia, letra e clima e mais); o shell fica só com a interface.
 
-**Situação:** cinco módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs), o `spectrum` (o espectro do som do player exibido, pelo PipeWire), o `clipboard` (o histórico da área de transferência do Wayland), o `power` (o brilho das telas, o histórico de consumo e os perfis de energia) e o `web` (a letra das músicas e a previsão do tempo).
+**Situação:** sete módulos prontos: o `system` (CPU, temperatura, memória, swap, rede, tempo ligado, máquina, discos e GPUs), o `spectrum` (o espectro do som do player exibido, pelo PipeWire), o `clipboard` (o histórico da área de transferência do Wayland), o `power` (o brilho das telas, o histórico de consumo e os perfis de energia), o `web` (a letra das músicas e a previsão do tempo), o `hyprland` (o mínimo do socket do compositor) e o `game` (o modo jogo).
 
 ## Módulos
 
@@ -109,6 +109,38 @@ Erros: `-32602` para parâmetro inválido (o texto não ecoa o valor); `1001` "M
 
 O `LUCERNAD_WEB_BASE` é **só de teste**: `http://127.0.0.1:<porta>` (ou `http://[::1]:<porta>`) aponta as quatro fontes para um servidor local, com o cache numa subpasta própria e sem redirecionamento; qualquer outro valor deixa o módulo indisponível, nunca na rede de verdade.
 
+### `hyprland`
+
+O mínimo do socket do Hyprland que o modo jogo usa, sem processo externo (nada de `hyprctl`): os pedidos pelo `.socket.sock` (uma conexão por pedido, prazo de 2 s, resposta até 4 MiB) e os eventos pelo `.socket2.sock` (reconecta com espera de 1, 2, 4… até 30 s). A instância vem do `HYPRLAND_INSTANCE_SIGNATURE`; sem ele (o serviço do systemd nem sempre o herda), é a mais nova viva em `$XDG_RUNTIME_DIR/hypr/`, refeita quando o socket some. As opções são mudadas pelo `eval` com `hl.config({...})` (o Lucerna exige a config em Lua). O módulo Hyprland completo (atalhos, monitores, entrada) fica para depois.
+
+| Tópico | O que traz | Quando muda |
+| --- | --- | --- |
+| `hyprland.status` | `{"available","instance","version","error"}`: `available` `false` com o motivo sem Hyprland | a cada conexão e queda dos eventos (indisponível, relido a cada 5 s) |
+
+### `game`
+
+O modo jogo: junta num estado só o que deixa o jogo mais leve e **desfaz exatamente** o que fez ao sair. Entra sozinho por uma janela em tela cheia de verdade (depois de 1 s estável, num workspace à mostra), por um jogo detectado (o processo da janela, ou um ancestral até 8 níveis, com `SteamAppId`/`SteamGameId`, o `gamescope`, o Wine ou o `lutris-wrapper`; só processos do próprio usuário são lidos, e só fica o "é jogo / não é") e pela lista "sempre"; sai 3 s depois do último gatilho. A lista "nunca" tira a janela de tudo e já vem com os players e navegadores comuns (`mpv`, `vlc`, `firefox`, `chromium`, `brave-browser`, `zen`…), para um vídeo em tela cheia não ligar o modo. Ligado na mão, só sai na mão; desligado na mão com o jogo aberto, fica desligado até os gatilhos sumirem. Antes do primeiro `game.configure` (o shell manda), só a entrada manual funciona.
+
+Enquanto ativo: desfoque, sombras e animações desligados (`decoration:blur:enabled`, `decoration:shadow:enabled`, `animations:enabled`); `misc:vrr` de 0 para 2 (nunca reduz o que o usuário escolheu); o tearing, só se pedido (`general:allow_tearing` e o `immediate` nas janelas do jogo); o perfil de energia "desempenho" pelo `HoldProfile` do power-profiles-daemon (solto ao sair; o daemon de perfis solta sozinho se o `lucernad` cair); o jogo registrado no [GameMode](https://github.com/FeralInteractive/gamemode) da Feral, **se estiver instalado** (opcional: sem ele, o item fica "unavailable"); e o próprio `lucernad` mais leve (o `system` amostra no mínimo a cada 5 s, o `spectrum` pausa a captura, o `clipboard` guarda as cópias na memória e as processa ao sair).
+
+**Restauração garantida:** antes de mexer no compositor, o módulo grava um diário (`$XDG_RUNTIME_DIR/lucerna/game/restore.json`, pasta 0700) com a instância do Hyprland e o valor de antes de cada opção. Ao sair, só volta a opção que ainda está com o valor que o modo jogo pôs (a mudança do usuário no meio vence); um reload do Hyprland no meio refaz o "antes" pelos valores do arquivo. O serviço parando desfaz tudo antes de sair; o `ExecStopPost=/usr/bin/lucernad restaurar-jogo` do unit desfaz pelo diário mesmo depois de um `kill -9` (sem daemon, direto no socket do Hyprland); o daemon que sobe desfaz o diário que achar antes de tudo; o diário de outra instância (o Hyprland reiniciou) é só apagado. Enquanto ativo (ou com diário pendente), o daemon não sai por ociosidade.
+
+Para o serviço do systemd achar o Hyprland, o ambiente da sessão precisa do `HYPRLAND_INSTANCE_SIGNATURE`: com o uwsm já vem; sem ele, `systemctl --user import-environment HYPRLAND_INSTANCE_SIGNATURE` no começo da sessão (sem a variável, o módulo usa a instância mais nova viva).
+
+| Tópico | O que traz | Quando muda |
+| --- | --- | --- |
+| `game.state` | `{"active","manual","reasons","windows","since","effects"}`: `manual` `"on"`, `"off"` ou `null`; `reasons` ⊂ `["manual","fullscreen","game","always"]`; `windows` `[{"address","class","title","reason"}]`; `since` em ms desde a época (ou `null`); `effects` `{"compositor","vrr","tearing","profile","gamemode","light"}`, cada um `"ok"`, `"off"`, `"unavailable"` ou `"error: …"` | a cada mudança |
+| `game.status` | `{"available","error"}` | quando o módulo para |
+
+Métodos:
+
+- `game.set {on}` → `{}`: liga (e prende ligado) ou desliga na mão.
+- `game.toggle {}` → `{"active"}`.
+- `game.configure {auto: {fullscreen, games}, always: [classe], never: [classe], compositor: {effects, vrr, tearing}, system: {profile, gamemode, light}}` → `{}`: substitui **toda** a configuração (campo ausente = padrão: tudo ligado menos o tearing, `always` vazia, `never` a de fábrica; até 100 classes de até 128 caracteres, comparadas inteiras e sem distinguir maiúsculas).
+- `game.get {}` → o `game.state` atual (para a linha de comando).
+
+Erros: `-32602` para parâmetro inválido; `1002` com o módulo parado.
+
 ## Instalação
 
 Para compilar: o `gcc` (o SQLite do histórico é compilado junto), `libpipewire`, `clang` e `pkgconf` (Arch) ou `libpipewire-0.3-dev`, `libclang-dev` e `pkg-config` (Debian/Ubuntu). O espectro precisa do PipeWire com o WirePlumber rodando.
@@ -147,6 +179,8 @@ O socket fica em `$XDG_RUNTIME_DIR/lucerna/lucernad.sock`; o systemd sobe o daem
 - `lucernad faixa ARTISTA TÍTULO [SEGUNDOS] [--album ÁLBUM]`: diz ao módulo de rede qual faixa está tocando (a letra só é buscada com assinante de `web.lyrics`; `lucernad watch web.lyrics` mostra).
 - `lucernad cidade BUSCA`: procura uma cidade no Open-Meteo (até 5 resultados, com as coordenadas).
 - `lucernad rede [--offline] [--cidade NOME --lat LAT --lon LON] [--atualizar MIN]`: configura o módulo de rede. Ele **substitui** a configuração que o shell mandou (o shell manda a dele de novo só ao reconectar). A chave do Vagalume vem só do ambiente (`LUCERNAD_VAGALUME_KEY=… lucernad rede`), nunca de argumento: fica fora do histórico do terminal e do `ps`.
+- `lucernad jogo [ligar|desligar|alternar]`: o modo jogo (sem argumento, o estado: `ligado (tela cheia, jogo) há 12 min` ou `desligado`); o que liga aqui só sai aqui (ou pela chave do shell).
+- `lucernad restaurar-jogo` (escondido, o `ExecStopPost` do serviço): desfaz o modo jogo pelo diário, sem daemon; sai 0 sem diário.
 - `--json` (antes do subcomando): a saída em JSON, uma linha por estado.
 
 ## Desenvolvimento
@@ -162,10 +196,12 @@ cargo clippy -p lucernad --no-default-features --features spectrum --all-targets
 cargo clippy -p lucernad --no-default-features --features clipboard --all-targets --locked -- -D warnings
 cargo clippy -p lucernad --no-default-features --features power --all-targets --locked -- -D warnings
 cargo clippy -p lucernad --no-default-features --features web --all-targets --locked -- -D warnings
+cargo clippy -p lucernad --no-default-features --features hyprland --all-targets --locked -- -D warnings
+cargo clippy -p lucernad --no-default-features --features game --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-Nenhum teste vai à internet: os testes do `web` usam só um servidor em 127.0.0.1. A prova é rodar a suíte inteira num namespace de rede sem saída para fora:
+Nenhum teste vai à internet: os testes do `web` usam só um servidor em 127.0.0.1. Nenhum teste toca o Hyprland, o D-Bus ou o `/proc` de verdade: o `hyprland` e o `game` usam um Hyprland falso (em memória ou por socket numa pasta temporária), um D-Bus falso e um `/proc` falso; a sonda dos barramentos de verdade do `game` (`crates/lucernad-game/tests/sonda.rs`) é ignorada por padrão e só roda à mão. A prova é rodar a suíte inteira num namespace de rede sem saída para fora:
 
 ```sh
 U=$(id -u) G=$(id -g); unshare -rn sh -c "ip link set lo up && exec unshare --map-user=$U --map-group=$G env TMPDIR=/tmp cargo test --workspace --locked --offline"

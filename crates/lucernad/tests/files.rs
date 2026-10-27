@@ -27,4 +27,6 @@ fn units_match_the_paths_rules() {
             && svc.contains("Requires=lucerna-lucernad.socket\n")
             && svc.contains("After=lucerna-lucernad.socket\n")
     );
+    // O modo jogo desfeito pelo diário mesmo com o daemon morto.
+    assert!(svc.contains("ExecStopPost=/usr/bin/lucernad restaurar-jogo\n"));
 }
