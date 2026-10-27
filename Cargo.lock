@@ -1198,6 +1198,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucernad-game"
+version = "0.1.0"
+dependencies = [
+ "lucerna-ipc",
+ "lucerna-paths",
+ "lucerna-service",
+ "lucernad-core",
+ "lucernad-game",
+ "lucernad-hyprland",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "lucernad-hyprland"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,36 @@
+[package]
+name = "lucernad-game"
+description = "Módulo game do lucernad: o modo jogo (detecção, decisão, efeitos no Hyprland e no sistema, restauração garantida)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+# Os dublês (o /proc falso, o D-Bus falso), para os testes.
+testing = ["dep:tempfile", "lucernad-hyprland/testing"]
+
+[dependencies]
+lucerna-paths.workspace = true
+lucerna-service.workspace = true
+lucernad-core.workspace = true
+lucernad-hyprland.workspace = true
+rustix = { workspace = true, features = ["process"] }
+serde.workspace = true
+serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
+tokio.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+lucerna-ipc.workspace = true
+tempfile.workspace = true
+# Os testes deste crate usam o módulo `testing`.
+lucernad-game = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true
