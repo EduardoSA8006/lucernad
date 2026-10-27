@@ -159,3 +159,16 @@ O binário cria o `GameSignal` e o passa ao `system`, ao `spectrum` e ao `clipbo
 
 - **Custo:** no container, o script de medição do desfoque (`dev/bench-blur.sh` como base) ganha uma irmã `dev/bench-game.sh` no shell: com um `kitty` em tela cheia rodando um laço que escreve a cada 16 ms e o papel animado, mede a CPU do Hyprland, do `qs` e do `lucernad` com o modo desligado e ligado (`lucernad jogo ligar/desligar`), e devolve o estado de antes. Esperado: Hyprland e `lucernad` claramente abaixo com o modo ligado. O usuário pode rodar o mesmo script numa sessão Hyprland de verdade quando tiver uma.
 - **Restauração:** o mesmo script (e a fumaça) compara o `getoption` das cinco opções antes de ligar e depois de desligar; qualquer diferença reprova.
+
+## Pendências da revisão final (lucernad)
+
+Ficaram de fora das correções da revisão (2026-10-27); nenhuma deixa os efeitos desligados no caso comum.
+
+- **M1, corrida do reload:** o `apply_after_reload` toma os valores lidos como o novo "antes" (D5). Se um `reconcile` comum roda entre o reload e o `configreloaded` (um `configure` ou uma troca das janelas do tearing nesse intervalo de milissegundos), ou se o `configreloaded` se perde num `Lagged`, os valores lidos são os do modo jogo, e ao sair os efeitos ficam desligados. A correção simples (no modo fresco, manter o `before` do diário quando `cur == applied && before != applied`) troca a D5: um arquivo editado para `blur = false` durante o jogo voltaria a `true` ao sair. É uma decisão do usuário.
+- **M2, reaplicação por cima da mudança do usuário no meio do modo:** um `game.configure` ou uma troca das janelas do tearing desliga de novo o que o usuário ligou durante o jogo. Ao sair, o resultado está certo. Ideia: guardar as opções "devolvidas ao usuário" e não replanejá-las até o modo sair.
+- **M3, restauração pendente que pisa numa escolha posterior:** com a restauração em nova tentativa, se o usuário (ou um reload) põe a opção no mesmo valor que o modo jogo tinha posto, a nova tentativa a devolve ao `before`. É raro.
+- **M8, texto da D11 e do README:** o GameMode limpa o registro pelo pid do **jogo**, não do chamador. Com o `lucernad` morto e o jogo vivo, o registro fica até o jogo fechar. É inofensivo, mas o texto "se soltam sozinhos com a queda do processo" está impreciso para o GameMode. Os pids ≤ 0 já não são enviados.
+- **M9, `immediate` depois do reload:** no modo fresco, as janelas já marcadas não recebem o `immediate 1` de novo. Se o reload zera as propriedades das janelas (não conferido no 0.56.2), o tearing não volta nelas.
+- **M10, horário das cópias adiadas:** as cópias do modo jogo entram no histórico com o horário da descarga (`now + i`), não o da cópia. A ordem fica certa, mas o "copiado há X" mente. Basta guardar o `now_ms()` no `defer`.
+- **M7, resto:** uma falha `Unreachable` no `j/clients` (o socket sumiu) ainda vale como "sem gatilhos" e solta a trava "desligado na mão"; só os soluços (prazo, resposta estranha) mantêm os gatilhos de antes.
+
