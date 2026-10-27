@@ -437,7 +437,14 @@ impl Run {
                 let cache = &mut self.cache;
                 triggers(&w, &ws, |pid| cache.is_game(proc, pid), &self.settings)
             }
-            Err(_) => Vec::new(),
+            // Sem Hyprland (o socket sumiu): sem gatilhos.
+            Err(HyprError::Unreachable(_)) => Vec::new(),
+            // Um soluço (prazo, resposta estranha): ficam os gatilhos de
+            // antes, sem soltar a trava "desligado na mão".
+            Err(e) => {
+                eprintln!("lucernad: o modo jogo não leu as janelas: {e}");
+                return;
+            }
         };
         self.machine.update(found, Instant::now());
     }

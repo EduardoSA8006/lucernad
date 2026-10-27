@@ -622,3 +622,29 @@ async fn window_without_pid_is_not_sent_to_gamemode() {
         r.bus.calls()
     );
 }
+
+#[tokio::test]
+async fn clients_failure_keeps_the_manual_off_latch() {
+    let r = rig();
+    let c = r.client().await;
+    r.call(&c, "game.configure", json!({})).await;
+    r.a_game(500);
+    r.windows(vec![win("0xg", 500, "dota2", 0)]);
+    state_until(&c, active).await;
+    r.call(&c, "game.set", json!({"on": false})).await;
+    state_until(&c, |v| v["manual"] == json!("off")).await;
+    // Um soluço do socket (sem resposta no prazo) por mais que a espera da
+    // saída: os gatilhos de antes ficam.
+    for _ in 0..3 {
+        r.hypr.fail_on("j/clients", HyprError::TimedOut);
+    }
+    for _ in 0..3 {
+        r.hypr.emit("openwindow", "x");
+        tokio::time::sleep(Duration::from_millis(170)).await;
+    }
+    r.hypr.emit("openwindow", "x");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let s = state_until(&c, |_| true).await;
+    assert!(!active(&s), "religou contra o pedido: {s}");
+    assert_eq!(s["manual"], json!("off"));
+}
