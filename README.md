@@ -20,7 +20,7 @@ Lê tudo do `/proc` e do `/sys`, sem nenhum processo externo, e só mede enquant
 | `system.gpus` | `{"gpus":[{"card","vendor","pci","state","name","usage","temp","freq","maxFreq"}]}`; placa suspensa não é lida (`usage`/`temp`/`freq` `null`) | quando o valor muda; `null` até a primeira amostra |
 | `system.status` | `{"available":true,"error":null}`; `false` com o motivo se o módulo não puder rodar | quando o módulo para |
 
-Método: `system.configure {"interval_ms": n}` → `{}`, com `n` inteiro de `500` a `10000` (padrão `2000`); vale o último pedido.
+Método: `system.configure {"interval_ms": n}` → `{}`, com `n` inteiro de `500` a `10000` (padrão `2000`); vale o último pedido. No modo jogo, a amostragem é no mínimo a cada 5 s.
 
 ### `spectrum`
 
@@ -29,7 +29,7 @@ Captura pelo PipeWire **só o som do player exibido** (não a saída inteira), c
 | Tópico | O que traz | Quando muda |
 | --- | --- | --- |
 | `spectrum.bands` | `{"bands":[40 números de 0 a 1, com até 3 casas]}`, dos graves aos agudos | a cada quadro (até 60 por segundo) enquanto captura, só quando muda; ao parar, um quadro de zeros; `null` até o primeiro quadro |
-| `spectrum.status` | `{"available","capturing","player","error"}`: `available` diz se a última conexão com o PipeWire deu certo, `capturing` se há um nó do player sendo capturado, `player` o configurado e `error` o último erro (`null` depois de uma conexão boa) | quando o estado muda |
+| `spectrum.status` | `{"available","capturing","paused","player","error"}`: `available` diz se a última conexão com o PipeWire deu certo, `capturing` se há um nó do player sendo capturado, `paused` se o modo jogo pausou a captura (a sessão com o PipeWire fecha), `player` o configurado e `error` o último erro (`null` depois de uma conexão boa) | quando o estado muda |
 
 Método: `spectrum.configure {"player": "org.mpris.MediaPlayer2.<…>" | null}` → `{}`; outro valor dá `-32602`. Vale o último pedido.
 
@@ -47,6 +47,8 @@ Observa a área de transferência pelo protocolo de controle de dados do Wayland
 | --- | --- | --- |
 | `clipboard.history` | `{"revision","count","pinned"}`; `null` até o histórico abrir | a cada item novo, remoção, fixação ou limpeza |
 | `clipboard.status` | `{"available","error"}`: `available` diz que a última abertura da sessão deu certo e o banco abriu; `false` com o motivo em `error` (sem sessão Wayland, compositor sem o controle, banco que não abriu); `false` com `error` `null` enquanto ainda não foi tentado | quando o estado muda |
+
+No modo jogo, as cópias continuam sendo lidas (a seleção de um app some se não for lida na hora), mas esperam na memória, até 50 (a mais velha cai, com um aviso no log), sem miniatura, sem banco e sem publicar; ao sair, vão ao histórico na ordem, publicadas uma vez.
 
 Métodos:
 

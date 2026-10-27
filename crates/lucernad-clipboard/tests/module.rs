@@ -1084,3 +1084,73 @@ async fn echo_queue_skips_only_our_sources() {
     wait_count(&r.t, 4).await;
     assert_eq!(list(&c, images).await["total"], 2);
 }
+
+/// O [`rig`] com o sinal do modo jogo.
+fn light_rig() -> (Rig, tokio::sync::watch::Sender<bool>) {
+    let (light, game) = lucernad_core::GameSignal::channel();
+    let r = rig_with(FakeBackend::new(), |cfg| cfg.game = game);
+    (r, light)
+}
+
+#[tokio::test]
+async fn light_mode_defers_copies_in_order() {
+    let (r, light) = light_rig();
+    let c = ready(&r).await;
+    copied(&r, "antes", 1).await;
+    let rev = revision(&r.t);
+    light.send(true).unwrap();
+    tick().await;
+    for (i, s) in ["um", "dois", "três"].iter().enumerate() {
+        text(&r.fake, s);
+        read_started(&r, 2 + i).await;
+        tick().await;
+    }
+    // Lidas (a seleção de um app some se não for lida), mas nada no banco
+    // nem publicado.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(count(&r.t), 1);
+    assert_eq!(revision(&r.t), rev);
+    assert_eq!(previews(&list_all(&c).await), ["antes"]);
+    // Ao sair, as três na ordem, publicadas uma vez.
+    light.send(false).unwrap();
+    wait_count(&r.t, 4).await;
+    assert_eq!(revision(&r.t), rev + 1);
+    assert_eq!(
+        previews(&list_all(&c).await),
+        ["três", "dois", "um", "antes"]
+    );
+}
+
+#[tokio::test]
+async fn light_mode_queue_drops_oldest_after_fifty() {
+    assert_eq!(lucernad_clipboard::DEFERRED_MAX, 50);
+    let (r, light) = light_rig();
+    let c = ready(&r).await;
+    light.send(true).unwrap();
+    tick().await;
+    for i in 0..52 {
+        text(&r.fake, &format!("c{i}"));
+        read_started(&r, i + 1).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(count(&r.t), 0);
+    light.send(false).unwrap();
+    wait_count(&r.t, 50).await;
+    let page = list_all(&c).await;
+    let got = previews(&page);
+    assert_eq!(got.first().map(String::as_str), Some("c51"));
+    assert_eq!(got.last().map(String::as_str), Some("c2"), "c0 e c1 caíram");
+}
+
+#[tokio::test]
+async fn copy_from_history_works_during_light_mode() {
+    let (r, light) = light_rig();
+    let c = ready(&r).await;
+    copied(&r, "antigo", 1).await;
+    let id = ids(&list_all(&c).await)[0];
+    light.send(true).unwrap();
+    tick().await;
+    call(&c, "clipboard.copy", json!({"id": id})).await.unwrap();
+    assert_eq!(r.fake.paste(TEXT).as_deref(), Some(&b"antigo"[..]));
+    light.send(false).unwrap();
+}

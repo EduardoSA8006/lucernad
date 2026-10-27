@@ -115,7 +115,8 @@ pub struct Lucernad {
     /// Desfaz o modo jogo antes de o processo sair.
     #[cfg(feature = "game")]
     pub game_handle: lucernad_game::GameHandle,
-    /// O sinal do modo leve (ligado pelo `game`; sempre desligado sem ele).
+    /// O sinal do modo leve (ligado pelo `game`; sempre desligado sem ele),
+    /// já passado ao `system`, ao `spectrum` e ao `clipboard`.
     #[cfg(any(feature = "system", feature = "spectrum", feature = "clipboard"))]
     pub game_signal: lucernad_core::GameSignal,
 }
@@ -136,10 +137,7 @@ pub fn lucernad(modules: Modules) -> Lucernad {
         allow(unused_mut)
     )]
     let mut service = ServiceBuilder::new(APP, env!("CARGO_PKG_VERSION"));
-    #[cfg(feature = "system")]
-    let system = lucernad_system::register(service.server(), modules.system);
-    #[cfg(feature = "spectrum")]
-    let spectrum = lucernad_spectrum::register(service.server(), modules.spectrum);
+
     // O sinal do modo leve: o `game` liga, os outros módulos seguem.
     #[cfg(feature = "game")]
     let (light, game_signal) = lucernad_core::GameSignal::channel();
@@ -155,6 +153,23 @@ pub fn lucernad(modules: Modules) -> Lucernad {
     drop(game_signal);
     #[cfg(any(feature = "clipboard", feature = "power", feature = "game"))]
     let work = service.work();
+    // Os módulos que ficam mais leves no modo jogo seguem o sinal.
+    #[cfg(any(feature = "system", feature = "spectrum", feature = "clipboard"))]
+    let mut modules = modules;
+    #[cfg(feature = "system")]
+    let system = {
+        modules.system.game = game_signal.clone();
+        lucernad_system::register(service.server(), modules.system)
+    };
+    #[cfg(feature = "spectrum")]
+    let spectrum = {
+        modules.spectrum.game = game_signal.clone();
+        lucernad_spectrum::register(service.server(), modules.spectrum)
+    };
+    #[cfg(feature = "clipboard")]
+    {
+        modules.clipboard.game = game_signal.clone();
+    }
     #[cfg(feature = "clipboard")]
     let clipboard = lucernad_clipboard::register(service.server(), modules.clipboard, work.clone());
     #[cfg(feature = "power")]

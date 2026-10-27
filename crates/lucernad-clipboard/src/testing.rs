@@ -390,6 +390,7 @@ pub fn fake_config(backend: FakeBackend, dir: &Path) -> ClipboardConfig {
         display_env: Some("wayland-teste".to_string()),
         configure_wait: Duration::from_millis(200),
         retry: Duration::from_millis(100),
+        game: lucernad_core::GameSignal::never(),
     }
 }
 

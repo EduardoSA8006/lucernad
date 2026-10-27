@@ -304,6 +304,7 @@ pub fn fake_config(backend: FakeBackend, bus: FakeBus) -> SpectrumConfig {
         procfs: testdata("proc"),
         dbus_timeout: Duration::from_millis(100),
         retry: Duration::from_millis(100),
+        game: lucernad_core::GameSignal::never(),
     }
 }
 

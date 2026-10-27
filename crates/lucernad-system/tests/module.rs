@@ -339,3 +339,45 @@ async fn dropping_the_task_stops_sampling() {
         "parar não é erro"
     );
 }
+
+/// Quantas amostras do `system.stats` chegam em `window`.
+async fn samples_in(topic: &Topic, window: Duration) -> u64 {
+    let start = topic.current().seq;
+    tokio::time::sleep(window).await;
+    topic.current().seq - start
+}
+
+#[tokio::test]
+async fn light_mode_spaces_sampling_to_five_seconds() {
+    assert_eq!(lucernad_system::LIGHT_INTERVAL, Duration::from_secs(5));
+    // Na escala do teste: amostra a cada 50 ms; no modo leve, a cada 400 ms.
+    let (light, game) = lucernad_core::GameSignal::channel();
+    let (_d, path, topics, ..) = serve(SystemConfig {
+        game,
+        light_interval: Duration::from_millis(400),
+        ..machine_config()
+    })
+    .await;
+    let c = client(&path).await;
+    c.subscribe(&["system.stats"]).await.unwrap();
+    wait_seq(&topics.stats, 2).await;
+    light.send(true).unwrap();
+    // Sem amostra fora do ritmo ao entrar; depois, uma a cada 400 ms.
+    let n = samples_in(&topics.stats, Duration::from_millis(1000)).await;
+    assert!((1..=3).contains(&n), "{n} amostras em 1 s no modo leve");
+    light.send(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let n = samples_in(&topics.stats, Duration::from_millis(500)).await;
+    assert!(n >= 5, "{n} amostras em 500 ms fora do modo leve");
+}
+
+#[test]
+fn light_mode_keeps_longer_interval() {
+    use lucernad_system::effective_interval;
+    let five = Duration::from_secs(5);
+    let two = Duration::from_secs(2);
+    let ten = Duration::from_secs(10);
+    assert_eq!(effective_interval(two, false, five), two);
+    assert_eq!(effective_interval(two, true, five), five);
+    assert_eq!(effective_interval(ten, true, five), ten);
+}

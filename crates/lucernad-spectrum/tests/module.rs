@@ -168,12 +168,12 @@ async fn handshake_lists_topics_streams_and_method() {
 #[tokio::test]
 async fn status_follows_the_probe() {
     let (_d, _p, t, _s) = serve(fake_config(FakeBackend::new(), FakeBus::new())).await;
-    let ok = json!({"available": true, "capturing": false, "player": null, "error": null});
+    let ok = json!({"available": true, "capturing": false, "paused": false, "player": null, "error": null});
     wait_until(Duration::from_secs(1), "a sonda boa", || status(&t) == ok).await;
 
     let msg = "Não consegui conectar ao PipeWire: sem socket.";
     let (_d, _p, t, _s) = serve(fake_config(FakeBackend::failing(msg), FakeBus::new())).await;
-    let bad = json!({"available": false, "capturing": false, "player": null, "error": msg});
+    let bad = json!({"available": false, "capturing": false, "paused": false, "player": null, "error": msg});
     wait_until(Duration::from_secs(1), "a sonda que falha", || {
         status(&t) == bad
     })
@@ -257,7 +257,7 @@ async fn captures_the_player_and_publishes_bands() {
     }
     assert_eq!(
         status(&t),
-        json!({"available": true, "capturing": true, "player": SPOTIFY, "error": null})
+        json!({"available": true, "capturing": true, "paused": false, "player": SPOTIFY, "error": null})
     );
 }
 
@@ -435,7 +435,7 @@ async fn null_player_closes_the_session() {
     })
     .await;
     wait_until(Duration::from_secs(1), "o status sem player", || {
-        status(&t) == json!({"available": true, "capturing": false, "player": null, "error": null})
+        status(&t) == json!({"available": true, "capturing": false, "paused": false, "player": null, "error": null})
     })
     .await;
 }
@@ -453,7 +453,7 @@ async fn pipewire_drop_becomes_state_and_retries() {
     backend.disconnect(why);
     let dropped = json!({
         "available": false,
-        "capturing": false,
+        "capturing": false, "paused": false,
         "player": SPOTIFY,
         "error": why
     });
@@ -468,7 +468,7 @@ async fn pipewire_drop_becomes_state_and_retries() {
     .await;
     wait_until(Duration::from_secs(1), "o status de volta", || {
         status(&t)
-            == json!({"available": true, "capturing": true, "player": SPOTIFY, "error": null})
+            == json!({"available": true, "capturing": true, "paused": false, "player": SPOTIFY, "error": null})
     })
     .await;
 }
@@ -512,7 +512,7 @@ async fn panic_marks_the_module_unavailable() {
         status(&t),
         json!({
             "available": false,
-            "capturing": false,
+            "capturing": false, "paused": false,
             "player": null,
             "error": "O módulo de espectro parou por um erro interno."
         })
@@ -697,6 +697,51 @@ async fn a_match_finishing_after_the_switch_is_ignored() {
     unblock(&stat, text, false).await;
     wait_until(Duration::from_secs(2), "a captura do Spotify", || {
         backend.capturing() == [121]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn light_mode_pauses_capture() {
+    let backend = backend_with_nodes();
+    let (light, game) = lucernad_core::GameSignal::channel();
+    let cfg = SpectrumConfig {
+        game,
+        ..fake_config(backend.clone(), spotify())
+    };
+    let (_d, path, t, _s) = serve(cfg).await;
+    let c = client(&path).await;
+    c.subscribe(&["spectrum.bands"]).await.unwrap();
+    configure(&c, json!({ "player": SPOTIFY })).await.unwrap();
+    wait_until(Duration::from_secs(1), "a captura", || {
+        backend.capturing() == [121]
+    })
+    .await;
+    assert_eq!(status(&t)["paused"], json!(false));
+    // O modo jogo: a sessão com o PipeWire fecha e o estado diz que pausou.
+    light.send(true).unwrap();
+    wait_until(Duration::from_secs(1), "a sessão fechada", || {
+        backend.sessions() == 0
+    })
+    .await;
+    wait_until(Duration::from_secs(1), "o paused", || {
+        status(&t)
+            == json!({"available": true, "capturing": false, "paused": true,
+                      "player": SPOTIFY, "error": null})
+    })
+    .await;
+    // Com o player trocado no meio, continua pausado.
+    configure(&c, json!({ "player": BRAVE })).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(backend.sessions(), 0);
+    // Volta: reabre, com assinante e player.
+    light.send(false).unwrap();
+    wait_until(Duration::from_secs(1), "a sessão reaberta", || {
+        backend.sessions() == 1
+    })
+    .await;
+    wait_until(Duration::from_secs(1), "sem pausa", || {
+        status(&t)["paused"] == json!(false)
     })
     .await;
 }
