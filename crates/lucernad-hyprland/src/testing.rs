@@ -314,6 +314,7 @@ pub struct FakeHypr {
     fail_on: Mutex<Vec<(String, HyprError)>>,
     unreachable: Mutex<bool>,
     hang: Mutex<Vec<String>>,
+    panic_on: Mutex<Vec<String>>,
     instance: Mutex<Option<String>>,
     events: broadcast::Sender<Event>,
 }
@@ -336,6 +337,7 @@ impl FakeHypr {
             fail_on: Mutex::new(Vec::new()),
             unreachable: Mutex::new(false),
             hang: Mutex::new(Vec::new()),
+            panic_on: Mutex::new(Vec::new()),
             instance: Mutex::new(Some("fake_1".into())),
             events,
         }
@@ -419,6 +421,12 @@ impl FakeHypr {
         self.hang.lock().unwrap().push(prefix.to_string());
     }
 
+    /// O próximo pedido que começa com `prefix` entra em pânico (uma vez):
+    /// para testar o pânico de quem chama.
+    pub fn panic_on(&self, prefix: &str) {
+        self.panic_on.lock().unwrap().push(prefix.to_string());
+    }
+
     /// Troca a assinatura da instância (o Hyprland reiniciou).
     pub fn set_instance(&self, sig: Option<&str>) {
         *self.instance.lock().unwrap() = sig.map(str::to_string);
@@ -437,6 +445,15 @@ impl Hypr for FakeHypr {
                 .any(|p| command.starts_with(p.as_str()));
             if hang {
                 std::future::pending::<()>().await;
+            }
+            let boom = {
+                let mut p = self.panic_on.lock().unwrap();
+                p.iter()
+                    .position(|x| command.starts_with(x.as_str()))
+                    .map(|i| p.remove(i))
+            };
+            if let Some(prefix) = boom {
+                panic!("pânico de teste em {prefix}");
             }
             if *self.unreachable.lock().unwrap() {
                 return Err(HyprError::Unreachable(

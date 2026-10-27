@@ -648,3 +648,20 @@ async fn clients_failure_keeps_the_manual_off_latch() {
     assert!(!active(&s), "religou contra o pedido: {s}");
     assert_eq!(s["manual"], json!("off"));
 }
+
+#[tokio::test]
+async fn loop_panic_still_undoes_the_effects() {
+    let r = rig();
+    let c = r.client().await;
+    r.call(&c, "game.set", json!({"on": true})).await;
+    state_until(&c, active).await;
+    assert!(*r.light.borrow());
+    // O laço entra em pânico no meio do jogo.
+    r.hypr.panic_on("j/clients");
+    let _ = c.call("game.configure", Some(json!({}))).await;
+    until("o diário apagado", || r.store.load().is_none()).await;
+    assert_eq!(r.hypr.options(), default_options());
+    assert!(!*r.light.borrow(), "o modo leve desligado");
+    let st = c.subscribe(&["game.status"]).await.unwrap();
+    assert_eq!(st[0].data["available"], json!(false));
+}

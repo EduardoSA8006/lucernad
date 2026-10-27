@@ -221,7 +221,35 @@ impl Game {
         };
         let status = self.topics.status.clone();
         let run = Run::new(self.cfg, self.topics, self.work);
-        let task = tokio::spawn(run.run(self.requests, stop_rx));
+        let rescue = (run.hypr.clone(), run.store.clone(), run.light.clone());
+        let inner = tokio::spawn(run.run(self.requests, stop_rx));
+        // Com o laço em pânico, os efeitos não ficam para a próxima subida:
+        // o diário é desfeito e o modo leve desligado aqui, e o pânico segue
+        // para o supervisor (o `game.status` indisponível). O perfil e o
+        // GameMode se soltam com a conexão do D-Bus, que cai com o laço.
+        let task = tokio::spawn(async move {
+            let _abort = AbortOnDrop(inner.abort_handle());
+            match inner.await {
+                Ok(()) => {}
+                Err(e) if e.is_panic() => {
+                    let payload = e.into_panic();
+                    let (hypr, store, light) = rescue;
+                    if let Some(tx) = light {
+                        tx.send_replace(false);
+                    }
+                    if let (Some(h), Some(store)) = (hypr, store)
+                        && let Some(j) = store.load()
+                        && let Err(e) = restore(&*h, &store, &j).await
+                    {
+                        eprintln!(
+                            "lucernad: não consegui desfazer o modo jogo depois do pânico: {e}"
+                        );
+                    }
+                    std::panic::resume_unwind(payload);
+                }
+                Err(_) => {}
+            }
+        });
         let task = supervise(
             task,
             status,
@@ -232,13 +260,22 @@ impl Game {
     }
 }
 
+/// Aborta a tarefa ao ser largado (o laço morre junto com quem o vigia).
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// O estado do laço.
 struct Run {
     hypr: Option<Arc<dyn Hypr>>,
     bus: Arc<dyn GameBus>,
     proc: ProcRoot,
     store: Option<Store>,
-    light: Option<watch::Sender<bool>>,
+    light: Option<Arc<watch::Sender<bool>>>,
     timing: Timing,
     topics: GameTopics,
     work: WorkTracker,
@@ -278,7 +315,7 @@ impl Run {
             bus: cfg.bus,
             proc: cfg.proc,
             store: cfg.journal,
-            light: cfg.light,
+            light: cfg.light.map(Arc::new),
             timing: cfg.timing,
             topics,
             work,
