@@ -67,3 +67,35 @@ async fn events_reconnect_after_drop() {
     assert_eq!(next_named(&mut rx, "fullscreen").await.data, "1");
     assert_eq!(hypr.instance().as_deref(), Some("sig_1"));
 }
+
+/// Uma instância morta: a pasta e o `.socket.sock` ficaram (o Hyprland caiu),
+/// mas ninguém atende.
+fn dead_instance(run: &std::path::Path, sig: &str) {
+    let dir = run.join("hypr").join(sig);
+    std::fs::create_dir_all(&dir).unwrap();
+    let l = std::os::unix::net::UnixListener::bind(dir.join(".socket.sock")).unwrap();
+    drop(l);
+    std::os::unix::net::UnixListener::bind(dir.join(".socket2.sock"))
+        .map(drop)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dead_signature_falls_back_to_the_live_instance() {
+    let run = tempfile::tempdir().unwrap();
+    dead_instance(run.path(), "morta_1");
+    let live = run.path().join("hypr/viva_2");
+    std::fs::create_dir_all(&live).unwrap();
+    let fake = FakeSockets::start(&live);
+    // O daemon ficou com a assinatura da sessão que caiu.
+    let hypr = SocketHypr::at(run.path(), Some("morta_1"));
+    let v = lucernad_hyprland::version(&hypr).await.unwrap();
+    assert_eq!(v, "0.56.2");
+    assert_eq!(hypr.instance().as_deref(), Some("viva_2"));
+    // E os eventos também vão para a viva.
+    let mut rx = hypr.events();
+    let c = next_named(&mut rx, CONNECTED).await;
+    assert_eq!(c.data, "viva_2");
+    fake.emit("fullscreen>>1");
+    assert_eq!(next_named(&mut rx, "fullscreen").await.data, "1");
+}

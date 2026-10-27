@@ -37,6 +37,16 @@ impl Instance {
 /// Acha a instância em `runtime_dir` (o `XDG_RUNTIME_DIR`): a da
 /// `signature`, ou a mais nova viva. O erro é um texto em pt-BR.
 pub fn find(runtime_dir: &Path, signature: Option<&str>) -> Result<Instance, String> {
+    find_except(runtime_dir, signature, &[])
+}
+
+/// O [`find`] sem as instâncias `dead` (as que deixaram o socket e não
+/// atendem mais: o Hyprland caiu e a pasta ficou).
+pub fn find_except(
+    runtime_dir: &Path,
+    signature: Option<&str>,
+    dead: &[String],
+) -> Result<Instance, String> {
     let hypr = runtime_dir.join("hypr");
     if let Some(sig) = signature {
         let valid = !sig.is_empty() && sig != "." && sig != ".." && !sig.contains('/');
@@ -66,6 +76,9 @@ pub fn find(runtime_dir: &Path, signature: Option<&str>) -> Result<Instance, Str
         let Some(signature) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
+        if dead.contains(&signature) {
+            continue;
+        }
         let when = std::fs::metadata(dir.join("hyprland.lock"))
             .or_else(|_| std::fs::metadata(&dir))
             .and_then(|m| m.modified())

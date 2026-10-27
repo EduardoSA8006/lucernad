@@ -135,12 +135,15 @@ struct Inner {
     runtime: Option<PathBuf>,
     signature: Option<String>,
     current: Mutex<Option<Instance>>,
+    /// As instâncias que não atendem mais (o socket ficou, o Hyprland não).
+    dead: Mutex<Vec<String>>,
     events: broadcast::Sender<Event>,
 }
 
 impl Inner {
     /// A instância guardada, ou achada agora: a da assinatura e, sem ela
-    /// (ou com ela morta, o Hyprland reiniciou), a mais nova viva.
+    /// (ou com ela morta: o Hyprland caiu e a pasta ficou), a mais nova viva
+    /// fora das que já não atenderam.
     fn instance(&self) -> Result<Instance, HyprError> {
         if let Some(i) = self.current.lock().unwrap().clone() {
             return Ok(i);
@@ -149,12 +152,26 @@ impl Inner {
             .runtime
             .as_deref()
             .ok_or_else(|| HyprError::Unreachable("sem o XDG_RUNTIME_DIR".into()))?;
-        let found = match self.signature.as_deref() {
-            Some(sig) => {
-                instance::find(runtime, Some(sig)).or_else(|_| instance::find(runtime, None))
-            }
-            None => instance::find(runtime, None),
+        // As mortas ficam de fora; sem nenhuma outra, volta a tentar todas
+        // (uma falha passageira não deixa o daemon sem instância).
+        let dead = self.dead.lock().unwrap().clone();
+        let preferred = self
+            .signature
+            .as_deref()
+            .filter(|s| !dead.iter().any(|d| d == s));
+        let found = match preferred {
+            Some(sig) => instance::find(runtime, Some(sig))
+                .or_else(|_| instance::find_except(runtime, None, &dead)),
+            None => instance::find_except(runtime, None, &dead),
         }
+        .or_else(|e| {
+            if dead.is_empty() {
+                return Err(e);
+            }
+            self.dead.lock().unwrap().clear();
+            instance::find(runtime, self.signature.as_deref())
+                .or_else(|_| instance::find(runtime, None))
+        })
         .map_err(HyprError::Unreachable)?;
         *self.current.lock().unwrap() = Some(found.clone());
         Ok(found)
@@ -162,6 +179,16 @@ impl Inner {
 
     fn forget(&self) {
         *self.current.lock().unwrap() = None;
+    }
+
+    /// A instância `i` não atende: esquece e não volta a ela.
+    fn mark_dead(&self, i: &Instance) {
+        let mut dead = self.dead.lock().unwrap();
+        if !dead.contains(&i.signature) {
+            dead.push(i.signature.clone());
+        }
+        drop(dead);
+        self.forget();
     }
 }
 
@@ -201,6 +228,7 @@ impl SocketHypr {
                 runtime,
                 signature,
                 current: Mutex::new(None),
+                dead: Mutex::new(Vec::new()),
                 events,
             }),
             reader: Mutex::new(None),
@@ -222,9 +250,9 @@ impl Hypr for SocketHypr {
             let first = self.inner.instance()?;
             match request(&first.request_path(), &command, HYPR_TIMEOUT).await {
                 Err(HyprError::Unreachable(e)) => {
-                    // O socket sumiu: acha de novo e, se for outra instância,
-                    // tenta uma vez nela.
-                    self.inner.forget();
+                    // O socket sumiu ou não atende: acha de novo (sem esta) e,
+                    // se houver outra instância, tenta uma vez nela.
+                    self.inner.mark_dead(&first);
                     let again = self.inner.instance()?;
                     if again == first {
                         return Err(HyprError::Unreachable(e));
@@ -262,10 +290,13 @@ async fn read_events(inner: Arc<Inner>) {
     let mut delay = Duration::from_secs(1);
     loop {
         let connected = match inner.instance() {
-            Ok(i) => UnixStream::connect(i.events_path())
-                .await
-                .ok()
-                .map(|s| (i, s)),
+            Ok(i) => match UnixStream::connect(i.events_path()).await {
+                Ok(s) => Some((i, s)),
+                Err(_) => {
+                    inner.mark_dead(&i);
+                    None
+                }
+            },
             Err(_) => None,
         };
         match connected {
