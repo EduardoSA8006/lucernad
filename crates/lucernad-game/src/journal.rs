@@ -10,6 +10,8 @@ use lucerna_paths::{AppPaths, Env, create_private_dir};
 use lucernad_hyprland::options::OptionValue;
 use serde::{Deserialize, Serialize};
 
+use crate::compositor::OPTIONS;
+
 /// O nome do arquivo do diário.
 pub const FILE: &str = "restore.json";
 
@@ -67,8 +69,19 @@ impl Store {
     /// O diário, se há um; o estragado é apagado (com um aviso no log).
     pub fn load(&self) -> Option<Journal> {
         let text = std::fs::read_to_string(self.path()).ok()?;
-        match serde_json::from_str(&text) {
-            Ok(j) => Some(j),
+        match serde_json::from_str::<Journal>(&text) {
+            Ok(mut j) => {
+                // Só as opções que o modo jogo toca: um nome estranho no
+                // arquivo nunca vira pedido ao Hyprland.
+                let before = j.entries.len();
+                j.entries.retain(|e| OPTIONS.contains(&e.option.as_str()));
+                if j.entries.len() != before {
+                    eprintln!(
+                        "lucernad: o diário do modo jogo tinha opções desconhecidas: ignoradas"
+                    );
+                }
+                Some(j)
+            }
             Err(e) => {
                 eprintln!("lucernad: o diário do modo jogo estava estragado ({e}): apagado");
                 self.clear();
