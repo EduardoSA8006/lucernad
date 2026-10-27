@@ -51,7 +51,7 @@ Tomadas porque o usuário pulou as perguntas; cada uma pode ser revista sem muda
 14. **Shell:** o não perturbe do modo jogo é um segundo interruptor que não grava nada (`Notifications.doNotDisturb` = o do usuário **ou** o do modo jogo). O resumo ao sair é calculado das notificações ainda na lista com `receivedAt ≥ since` (o `since` vem do tópico), então sobrevive a um reinício do shell; ele aparece como um cartão próprio na pilha de popups ("Enquanto você jogava: 4 notificações — Discord, Steam"), que abre o painel de notificações ao clicar, e não aparece com zero. O aviso de entrar e sair é um OSD novo (tipo `game`). O ícone é um controle (`sports_esports`) na área de status da barra, à esquerda do sino; clicar desliga (pelo `game.set`).
 15. **Atalho:** uma ação nova do shell, `game` ("Ligar/desligar o modo jogo"), na lista de Atalhos (grupo "Painéis e sessão"), sem tecla padrão; e uma ação nova `bar` ("Mostrar/esconder a barra"), também sem tecla padrão, que revela a barra na tela com foco (fora e dentro do modo jogo) e a esconde no segundo toque ou como a revelação pelo mouse. Pelo terminal: `lucernad jogo [ligar|desligar|alternar]` e `qs -c lucerna ipc call game toggle|on|off|get`.
 16. **Configuração antes do shell:** até o primeiro `game.configure`, só a entrada manual funciona (com os itens padrão); a automática espera o shell dizer o que quer.
-17. **Padrões de fábrica:** todos os itens ligados, menos o tearing; listas "sempre" e "nunca" vazias.
+17. **Padrões de fábrica:** todos os itens ligados, menos o tearing; lista "sempre" vazia; lista "nunca" com os players e navegadores comuns (D24).
 
 Da conferência do construtor (releitura do spec sem poder perguntar):
 
@@ -60,6 +60,11 @@ Da conferência do construtor (releitura do spec sem poder perguntar):
 20. **O resumo conta** as notificações não críticas ainda na lista com `receivedAt ≥ since` (as críticas já apareceram como popup), agrupadas pelo nome do app (até três nomes, depois "e mais N").
 21. **`spectrum.status` ganha `paused`** (falso fora do modo leve); o adaptador do shell só ignora o campo (as barras param, como sem som). O `system` e o `clipboard` não mudam de formato.
 22. **O `lucernad` sem Hyprland** (o PC do usuário em KDE, a fumaça no `sway`): o `hyprland.status` fica indisponível com o motivo, o `game` funciona sem gatilhos automáticos e sem o compositor (`effects.compositor`, `vrr` e `tearing` = `unavailable`), e a entrada manual ainda aplica o perfil, o GameMode, o modo leve e a parte do shell.
+
+Das duas perguntas que ficaram em aberto (o usuário pediu para pular; respondidas pelo assistente em 2026-10-27):
+
+23. **Jogo fora de foco:** um jogo detectado mantém o modo ligado **enquanto a janela existir**, mesmo fora de foco ou em outro workspace (reforça a D8). Só a tela cheia depende de a janela estar à mostra.
+24. **Vídeo em tela cheia também liga o modo** (a tela cheia não distingue jogo de vídeo), mas a lista "nunca" **já vem preenchida** com os players e navegadores comuns, e o usuário pode tirar qualquer item dela. A lista de fábrica (classes do Hyprland, comparadas inteiras e sem distinguir maiúsculas): `mpv`, `vlc`, `io.github.celluloid_player.celluloid`, `org.gnome.totem`, `org.kde.haruna`, `smplayer`, `firefox`, `firefox-esr`, `librewolf`, `floorp`, `zen`, `zen-browser`, `chromium`, `google-chrome`, `brave-browser`, `vivaldi-stable`, `microsoft-edge`, `opera`. No `game.configure`, `never` ausente = essa lista; `never: []` = lista vazia (o usuário tirou tudo). A lista de fábrica sai do `lucernad` (`config::DEFAULT_NEVER`), e o shell a mostra como ponto de partida na página.
 
 ## Objetivos
 
