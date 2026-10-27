@@ -59,18 +59,22 @@ pub async fn apply(
     s: &GameSettings,
     tearing_windows: &[String],
 ) -> Result<Option<Journal>, HyprError> {
-    reconcile(hypr, store, s, tearing_windows, false).await
+    reconcile(hypr, store, s, tearing_windows).await
 }
 
-/// O [`apply`] depois de um `configreloaded`: o reload já pôs tudo de volta
-/// ao arquivo, então os valores lidos agora são o novo "antes" (D5).
+/// O [`apply`] depois de um `configreloaded`: o reload pôs tudo de volta ao
+/// arquivo, então a opção com outro valor ganha o novo "antes"; a que voltou
+/// no mesmo valor que o modo jogo pôs fica com o "antes" do diário (D5,
+/// decisão do usuário: do lado seguro, mesmo com a corrida entre o reload e o
+/// evento). Hoje é o mesmo cálculo do [`apply`]; fica separado como a porta
+/// do reload.
 pub async fn apply_after_reload(
     hypr: &dyn Hypr,
     store: &Store,
     s: &GameSettings,
     tearing_windows: &[String],
 ) -> Result<Option<Journal>, HyprError> {
-    reconcile(hypr, store, s, tearing_windows, true).await
+    reconcile(hypr, store, s, tearing_windows).await
 }
 
 fn save(store: &Store, j: &Journal) -> Result<(), HyprError> {
@@ -84,7 +88,6 @@ async fn reconcile(
     store: &Store,
     s: &GameSettings,
     tearing_windows: &[String],
-    fresh: bool,
 ) -> Result<Option<Journal>, HyprError> {
     let mut now = Vec::new();
     for o in OPTIONS {
@@ -94,10 +97,11 @@ async fn reconcile(
         .instance()
         .ok_or_else(|| HyprError::Unreachable("sem instância do Hyprland".into()))?;
     let prev = store.load().filter(|j| j.instance == instance);
-    let prev_entries: &[Entry] = match (&prev, fresh) {
-        (Some(j), false) => &j.entries,
-        _ => &[],
-    };
+    // O "antes" do diário vale para a opção que está com o valor posto,
+    // inclusive depois de um reload (D5, decisão do usuário): um reload que
+    // devolve o mesmo valor, ou um reconcile que já reaplicou antes do
+    // `configreloaded`, nunca apaga o valor de antes.
+    let prev_entries: &[Entry] = prev.as_ref().map_or(&[], |j| &j.entries[..]);
     let ours = |o: &str, cur: &OptionValue| {
         prev_entries
             .iter()

@@ -498,7 +498,9 @@ async fn reload_mid_game_reapplies() {
     until("reaplicado", || r.hypr.option(ANIM) == Some(Bool(false))).await;
     r.call(&c, "game.set", json!({"on": false})).await;
     state_until(&c, |v| !active(v)).await;
-    assert_eq!(r.hypr.option(BLUR), Some(Bool(false)), "como o arquivo diz");
+    // O desfoque voltou do reload no valor que o modo jogo pôs: fica o antes
+    // do diário (D5, decisão do usuário).
+    assert_eq!(r.hypr.option(BLUR), Some(Bool(true)), "do lado seguro");
     assert_eq!(r.hypr.option(ANIM), Some(Bool(true)));
     assert_eq!(r.hypr.option(VRR), Some(Int(0)));
 }

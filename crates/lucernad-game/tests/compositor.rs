@@ -191,15 +191,14 @@ async fn reload_mid_game_resnapshots_and_reapplies() {
         .unwrap()
         .unwrap();
     assert_eq!(store.load().as_ref(), Some(&j), "um diário só");
-    assert_eq!(
-        names(&j.entries),
-        vec![SHADOW, ANIM],
-        "o antes é o do arquivo"
-    );
+    // O VRR do arquivo (1) é o novo antes e sai do plano; o desfoque voltou
+    // no valor que o modo jogo pôs: fica o antes do diário (D5).
+    assert_eq!(names(&j.entries), vec![BLUR, SHADOW, ANIM]);
+    assert_eq!(j.entries[0].before, Bool(true));
     assert_eq!(h.option(ANIM), Some(Bool(false)), "reaplicado");
     assert_eq!(h.option(SHADOW), Some(Bool(false)));
     restore(&h, &store, &j).await.unwrap();
-    assert_eq!(h.option(BLUR), Some(Bool(false)));
+    assert_eq!(h.option(BLUR), Some(Bool(true)), "do lado seguro (D5)");
     assert_eq!(h.option(SHADOW), Some(Bool(true)));
     assert_eq!(h.option(ANIM), Some(Bool(true)));
     assert_eq!(h.option(VRR), Some(Int(1)));
@@ -300,4 +299,31 @@ async fn restore_cli_without_daemon() {
     std::fs::remove_file(inst.join(".socket.sock")).unwrap();
     assert_eq!(restore_cli_at(&store, &run).await, 0);
     assert_eq!(store.load(), None);
+}
+
+#[tokio::test]
+async fn reload_race_keeps_the_original_before() {
+    // A corrida: entre o reload e o `configreloaded`, um `apply` comum já
+    // pôs os efeitos de novo (ou o evento chegou atrasado): o
+    // `apply_after_reload` lê os valores do modo jogo. O "antes" do diário
+    // não pode se perder, senão os efeitos ficam desligados ao sair.
+    let (_d, store) = store();
+    let h = FakeHypr::new();
+    let s = GameSettings::default();
+    apply(&h, &store, &s, &[]).await.unwrap();
+    h.reload(
+        &default_options()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect::<Vec<_>>(),
+    );
+    apply(&h, &store, &s, &[]).await.unwrap();
+    let j = apply_after_reload(&h, &store, &s, &[])
+        .await
+        .unwrap()
+        .unwrap();
+    restore(&h, &store, &j).await.unwrap();
+    assert_eq!(h.options(), default_options());
 }
