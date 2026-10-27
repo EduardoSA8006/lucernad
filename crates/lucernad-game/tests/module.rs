@@ -606,3 +606,19 @@ async fn journal_left_at_startup_holds_the_work_guard() {
     until("o WorkGuard solto", || r.work.pending() == 0).await;
     assert_eq!(r.hypr.options(), default_options());
 }
+
+#[tokio::test]
+async fn window_without_pid_is_not_sent_to_gamemode() {
+    let r = rig();
+    let c = r.client().await;
+    r.call(&c, "game.configure", json!({"always": ["osu!"]}))
+        .await;
+    r.windows(vec![win("0xo", 0, "osu!", 0), win("0xn", -1, "osu!", 0)]);
+    let s = state_until(&c, active).await;
+    assert_eq!(s["effects"]["gamemode"], json!("ok"), "{s}");
+    assert!(
+        !r.bus.calls().iter().any(|c| c.starts_with("register")),
+        "{:?}",
+        r.bus.calls()
+    );
+}

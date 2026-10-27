@@ -585,9 +585,11 @@ impl Run {
     async fn sync_gamemode(&mut self, active: bool) {
         let want_on = active && self.settings.gamemode;
         let want: BTreeSet<i32> = if want_on {
+            // Janela sem pid conhecido não vai ao GameMode.
             self.trigger_windows()
                 .iter()
                 .map(|t| t.window.pid)
+                .filter(|pid| *pid > 0)
                 .collect()
         } else {
             BTreeSet::new()
