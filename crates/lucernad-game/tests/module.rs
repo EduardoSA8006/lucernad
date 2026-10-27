@@ -581,3 +581,28 @@ async fn slow_hold_is_still_released() {
     state_until(&c, |v| !active(v)).await;
     assert_eq!(r.bus.held(), None, "a retenção ficou presa");
 }
+
+#[tokio::test]
+async fn journal_left_at_startup_holds_the_work_guard() {
+    // O diário de um daemon que caiu e o Hyprland ainda sem responder ao
+    // eval: o daemon não pode sair por ociosidade com o diário no disco.
+    let r = rig_with(Opts {
+        before_spawn: Box::new(|h, store| {
+            left_journal(h, store);
+            h.fail_on("eval", HyprError::TimedOut);
+        }),
+        ..Opts::default()
+    });
+    let c = r.client().await;
+    state_until(&c, |v| {
+        v["effects"]["compositor"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("error: "))
+    })
+    .await;
+    assert!(r.store.load().is_some());
+    assert_eq!(r.work.pending(), 1, "o WorkGuard com o diário pendente");
+    until("o diário apagado", || r.store.load().is_none()).await;
+    until("o WorkGuard solto", || r.work.pending() == 0).await;
+    assert_eq!(r.hypr.options(), default_options());
+}

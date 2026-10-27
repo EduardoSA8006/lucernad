@@ -457,7 +457,9 @@ impl Run {
     /// Acerta os efeitos com a decisão e publica.
     async fn finish(&mut self) {
         let active = self.active();
-        if active && self.guard.is_none() {
+        // O WorkGuard: com o modo ativo ou com um diário pendente (inclusive
+        // o achado na subida), o daemon não sai por ociosidade (D18).
+        if (active || self.journal.is_some()) && self.guard.is_none() {
             self.guard = Some(self.work.hold());
         }
         if active {
