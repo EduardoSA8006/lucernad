@@ -1,6 +1,7 @@
 //! O comum dos módulos do `lucernad`: o trabalho com prazo numa thread solta
 //! ([`detached`]), o supervisor do laço de um módulo ([`supervise`]) e a
-//! publicação só do que mudou ([`publish_changed`]).
+//! publicação só do que mudou ([`publish_changed`]) e o sinal do modo jogo
+//! ([`GameSignal`]), que deixa os módulos mais leves durante um jogo.
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -8,8 +9,43 @@ use std::time::Duration;
 
 use lucerna_service::Topic;
 use serde_json::Value;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
+
+/// O sinal do modo jogo: ligado enquanto o módulo `game` quer o `lucernad`
+/// mais leve (coleta espaçada, espectro pausado, cópias adiadas). Clonar dá
+/// outra alça para o mesmo sinal.
+#[derive(Clone)]
+pub struct GameSignal {
+    rx: watch::Receiver<bool>,
+}
+
+impl GameSignal {
+    /// Um sinal desligado e quem o liga.
+    pub fn channel() -> (watch::Sender<bool>, GameSignal) {
+        let (tx, rx) = watch::channel(false);
+        (tx, GameSignal { rx })
+    }
+
+    /// Um sinal sempre desligado (sem o módulo `game`).
+    pub fn never() -> GameSignal {
+        let (_tx, rx) = watch::channel(false);
+        GameSignal { rx }
+    }
+
+    /// Se o sinal está ligado agora.
+    pub fn is_on(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    /// Volta quando o sinal muda. Sem quem o ligue (o [`GameSignal::never`],
+    /// ou o emissor largado), nunca volta.
+    pub async fn changed(&mut self) {
+        if self.rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
 /// O laço e o supervisor de um módulo; largar aborta os dois.
 #[must_use = "largar o ModuleTask para o módulo"]
@@ -148,6 +184,35 @@ pub async fn detached_with<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn game_signal_never_is_off() {
+        let mut s = GameSignal::never();
+        assert!(!s.is_on());
+        let waited = tokio::time::timeout(Duration::from_millis(50), s.changed()).await;
+        assert!(waited.is_err(), "o never não pode mudar");
+    }
+
+    #[tokio::test]
+    async fn game_signal_follows_sender() {
+        let (tx, mut s) = GameSignal::channel();
+        let mut other = s.clone();
+        assert!(!s.is_on());
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), s.changed())
+            .await
+            .unwrap();
+        assert!(s.is_on() && other.is_on());
+        tx.send(false).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), other.changed())
+            .await
+            .unwrap();
+        assert!(!other.is_on());
+        s.changed().await;
+        drop(tx);
+        let waited = tokio::time::timeout(Duration::from_millis(50), s.changed()).await;
+        assert!(waited.is_err(), "sem emissor, o changed fica parado");
+    }
 
     #[tokio::test]
     async fn detached_returns_times_out_and_catches_panics() {

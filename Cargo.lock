@@ -1197,6 +1197,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucernad-hyprland"
+version = "0.1.0"
+dependencies = [
+ "lucerna-ipc",
+ "lucerna-service",
+ "lucernad-core",
+ "lucernad-hyprland",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lucernad-power"
 version = "0.1.0"
 dependencies = [

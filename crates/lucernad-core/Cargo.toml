@@ -1,6 +1,6 @@
 [package]
 name = "lucernad-core"
-description = "O comum dos módulos do lucernad: trabalho com prazo e supervisor."
+description = "O comum dos módulos do lucernad: trabalho com prazo, supervisor e o sinal do modo jogo."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
