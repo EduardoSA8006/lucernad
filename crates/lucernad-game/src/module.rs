@@ -346,6 +346,10 @@ impl Run {
                 s = stop.recv(), if stop_open => match s {
                     Some(s) => {
                         self.stopping = true;
+                        // A última chance: uma nova tentativa agendada não
+                        // adia a restauração.
+                        self.retry_at = None;
+                        self.comp_key = None;
                         self.finish().await;
                         let _ = s.send(());
                         return;
@@ -483,7 +487,7 @@ impl Run {
         if !want {
             self.comp_key = None;
             self.comp_error = None;
-            if self.journal.is_some() && self.retry_at.is_none() {
+            if self.journal.is_some() && (self.retry_at.is_none() || self.stopping) {
                 self.try_restore().await;
             }
             return;

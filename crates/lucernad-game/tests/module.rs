@@ -549,3 +549,20 @@ async fn bad_params_are_32602() {
         }
     }
 }
+
+#[tokio::test]
+async fn shutdown_restores_even_with_a_retry_scheduled() {
+    let r = rig();
+    let c = r.client().await;
+    r.call(&c, "game.set", json!({"on": true})).await;
+    state_until(&c, active).await;
+    // A restauração falha uma vez: a nova tentativa fica para daqui a 200 ms.
+    r.hypr.fail_on("eval", HyprError::TimedOut);
+    r.call(&c, "game.set", json!({"on": false})).await;
+    assert!(r.store.load().is_some());
+    // O serviço para antes da nova tentativa: o shutdown restaura assim mesmo.
+    r.handle.shutdown().await;
+    assert_eq!(r.hypr.options(), default_options());
+    assert_eq!(r.store.load(), None);
+    assert_eq!(r.work.pending(), 0);
+}
