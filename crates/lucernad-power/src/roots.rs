@@ -6,6 +6,10 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+pub(crate) use lucernad_core::test_root::forbidden;
+pub use lucernad_core::test_root::in_container;
+use lucernad_core::test_root::test_base;
+
 /// O maior EDID lido do sysfs (o `stat` dá tamanho 0: só lendo se sabe).
 pub const EDID_MAX: u64 = 32 * 1024;
 
@@ -17,9 +21,6 @@ pub const ROOT_INVALID: &str = "LUCERNAD_POWER_ROOT inválido: precisa ser uma p
 
 /// O texto do `power.status.error` em container sem o `LUCERNAD_POWER_ROOT`.
 pub const CONTAINER_REFUSED: &str = "Em container, o módulo de energia só roda com LUCERNAD_POWER_ROOT (uma árvore falsa): sem ela, o brilho do host mudaria.";
-
-/// As pastas que uma raiz de teste nunca pode ser nem estar dentro.
-const FORBIDDEN: [&str; 3] = ["/sys", "/dev", "/proc"];
 
 /// Onde ficam o sysfs e o `/dev`.
 #[derive(Clone, Debug)]
@@ -55,22 +56,12 @@ impl Roots {
 /// e cujos `sys` e `dev`, se existem, também não levam a eles; senão, [`ROOT_INVALID`]. Nunca volta à máquina de verdade com a variável
 /// definida.
 pub fn root_from_env(value: Option<&OsStr>, in_container: bool) -> Result<Option<Roots>, String> {
-    let value = value.filter(|v| !v.is_empty());
-    let Some(value) = value else {
-        return if in_container {
-            Err(CONTAINER_REFUSED.to_string())
-        } else {
-            Ok(None)
-        };
+    let base = match test_base(value) {
+        Ok(Some(base)) => base,
+        Ok(None) if in_container => return Err(CONTAINER_REFUSED.to_string()),
+        Ok(None) => return Ok(None),
+        Err(()) => return Err(ROOT_INVALID.to_string()),
     };
-    let path = Path::new(value);
-    if !path.is_absolute() {
-        return Err(ROOT_INVALID.to_string());
-    }
-    let base = path.canonicalize().map_err(|_| ROOT_INVALID.to_string())?;
-    if forbidden(&base) || !base.is_dir() {
-        return Err(ROOT_INVALID.to_string());
-    }
     // O `sys` e o `dev` da raiz também: um link para o /sys ou o /dev reais
     // levaria o módulo à máquina de verdade.
     let roots = Roots::at(&base);
@@ -83,27 +74,6 @@ pub fn root_from_env(value: Option<&OsStr>, in_container: bool) -> Result<Option
         }
     }
     Ok(Some(roots))
-}
-
-/// Se um caminho canônico é o `/` ou fica dentro do `/sys`, do `/dev` ou do
-/// `/proc` (por componente).
-pub(crate) fn forbidden(path: &Path) -> bool {
-    path == Path::new("/") || FORBIDDEN.iter().any(|f| path.starts_with(f))
-}
-
-/// Se o daemon roda num container: o `/.dockerenv` do Docker (o container do
-/// `dev/test.sh`), o `/run/.containerenv` do Podman, o
-/// `/run/host/container-manager` do toolbox e do distrobox e o
-/// `/run/systemd/container` do systemd-nspawn (e de outros que o seguem).
-pub fn in_container() -> bool {
-    [
-        "/.dockerenv",
-        "/run/.containerenv",
-        "/run/host/container-manager",
-        "/run/systemd/container",
-    ]
-    .iter()
-    .any(|marker| Path::new(marker).exists())
 }
 
 /// Um arquivo pequeno do sysfs (até 4 KiB), sem espaços nas pontas.

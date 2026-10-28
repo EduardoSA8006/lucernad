@@ -1,7 +1,10 @@
 //! O comum dos módulos do `lucernad`: o trabalho com prazo numa thread solta
 //! ([`detached`]), o supervisor do laço de um módulo ([`supervise`]) e a
 //! publicação só do que mudou ([`publish_changed`]) e o sinal do modo jogo
-//! ([`GameSignal`]), que deixa os módulos mais leves durante um jogo.
+//! ([`GameSignal`]), que deixa os módulos mais leves durante um jogo; e a
+//! raiz de teste do `LUCERNAD_POWER_ROOT` ([`test_root`]).
+
+pub mod test_root;
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
