@@ -219,3 +219,46 @@ fn no_bus_has_no_history_nor_profiles() {
         }
     );
 }
+
+/// Os perfis da raiz de teste: o falso do `power-profiles` (o mesmo que o
+/// modo jogo segura), relido a cada volta; nunca o D-Bus.
+#[test]
+fn tree_bus_follows_the_fake_profiles() {
+    use lucernad_power::bus::TreeBus;
+    use std::time::Duration;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = TempDir::new().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let bus = TreeBus::new(base.clone()).with_poll(Duration::from_millis(20));
+    assert_eq!(rt.block_on(bus.history()), Ok(vec![]));
+    rt.block_on(async {
+        let mut rx = bus.watch_profiles();
+        async fn wait(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Profiles>) -> Profiles {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        let none = Profiles {
+            available: false,
+            performance: false,
+        };
+        let present = Profiles {
+            available: true,
+            performance: true,
+        };
+        assert_eq!(wait(&mut rx).await, none);
+        std::fs::create_dir(base.join("power-profiles")).unwrap();
+        assert_eq!(wait(&mut rx).await, present);
+        std::fs::remove_dir(base.join("power-profiles")).unwrap();
+        assert_eq!(wait(&mut rx).await, none);
+        // Um link para fora da raiz conta como ausente.
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), base.join("power-profiles")).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err(), "nada muda");
+    });
+}

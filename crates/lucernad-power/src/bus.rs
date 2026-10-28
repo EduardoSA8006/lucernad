@@ -30,6 +30,8 @@ use zbus::proxy::CacheProperties;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::{Connection, MatchRule, MessageStream, Proxy};
 
+use lucernad_core::test_root::{PROFILES_DIR, inner_dir};
+
 use crate::roots::{Roots, forbidden};
 
 /// Um futuro em caixa, para os traits serem usados como objeto.
@@ -182,8 +184,7 @@ pub trait PowerBus: Send + Sync + 'static {
     fn watch_profiles(&self) -> UnboundedReceiver<Profiles>;
 }
 
-/// Nenhum D-Bus: sem histórico e sem serviço de perfis (a raiz de teste do
-/// `LUCERNAD_POWER_ROOT`, que nunca fala com o UPower da máquina).
+/// Nenhum D-Bus: sem histórico e sem serviço de perfis.
 pub struct NoBus;
 
 impl PowerBus for NoBus {
@@ -194,6 +195,63 @@ impl PowerBus for NoBus {
     fn watch_profiles(&self) -> UnboundedReceiver<Profiles> {
         let (tx, rx) = unbounded_channel();
         let _ = tx.send(NO_PROFILES);
+        rx
+    }
+}
+
+/// De quanto em quanto tempo o [`TreeBus`] relê o serviço de perfis falso.
+pub const TREE_POLL: Duration = Duration::from_secs(2);
+
+/// A raiz de teste do `LUCERNAD_POWER_ROOT`: sem histórico, e os perfis do
+/// power-profiles-daemon falso em arquivos (o mesmo que o modo jogo segura):
+/// o serviço existe enquanto a pasta `power-profiles` da raiz existir (e,
+/// resolvida, não sair dela), com o perfil de desempenho. Relê a cada
+/// [`TREE_POLL`]; nunca fala com o D-Bus.
+pub struct TreeBus {
+    base: PathBuf,
+    poll: Duration,
+}
+
+impl TreeBus {
+    /// O falso sob `base` (já canônica).
+    pub fn new(base: PathBuf) -> TreeBus {
+        TreeBus {
+            base,
+            poll: TREE_POLL,
+        }
+    }
+
+    /// Outro intervalo de releitura (os testes).
+    pub fn with_poll(mut self, poll: Duration) -> TreeBus {
+        self.poll = poll;
+        self
+    }
+}
+
+impl PowerBus for TreeBus {
+    fn history(&self) -> BoxFuture<'_, Result<Vec<Point>, String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn watch_profiles(&self) -> UnboundedReceiver<Profiles> {
+        let (tx, rx) = unbounded_channel();
+        let base = self.base.clone();
+        let poll = self.poll;
+        tokio::spawn(async move {
+            let mut last = None;
+            loop {
+                let available = inner_dir(&base, PROFILES_DIR).is_some();
+                let now = Profiles {
+                    available,
+                    performance: available,
+                };
+                publish(&tx, &mut last, now);
+                tokio::select! {
+                    () = tx.closed() => return,
+                    () = tokio::time::sleep(poll) => {}
+                }
+            }
+        });
         rx
     }
 }
