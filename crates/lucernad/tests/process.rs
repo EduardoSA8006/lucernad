@@ -13,7 +13,8 @@
 //! o brilho, o logind e o i2c da máquina nunca são tocados. O `web` roda
 //! contra um servidor local (`LUCERNAD_WEB_BASE`): nenhum processo daqui vai à
 //! internet. O `hyprland` e o `game` falam com um Hyprland falso numa pasta
-//! temporária (ou com nenhum), e os perfis e o GameMode ficam sem D-Bus.
+//! temporária (ou com nenhum), e o perfil e o GameMode do `game` são os
+//! falsos em arquivos da raiz do `LUCERNAD_POWER_ROOT`, sem D-Bus.
 #![cfg(any(
     feature = "system",
     feature = "spectrum",
@@ -145,7 +146,7 @@ fn fake_panel(dir: &Path) -> std::path::PathBuf {
 }
 
 /// Espera o arquivo ter `want`, até 2 s.
-#[cfg(feature = "power")]
+#[cfg(any(feature = "power", feature = "game"))]
 fn wait_file(path: &Path, want: &str) {
     let start = Instant::now();
     loop {
@@ -726,6 +727,25 @@ fn jogo_cli_round_trip() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(64), "uso errado");
+}
+
+/// Com o `LUCERNAD_POWER_ROOT`, o perfil de energia do modo jogo é o falso
+/// em arquivos da raiz (`power/power-profiles`): o D-Bus do sistema nunca é
+/// tocado, mesmo com um power-profiles-daemon de verdade na máquina.
+#[cfg(feature = "game")]
+#[test]
+fn jogo_holds_the_fake_profile_under_the_test_root() {
+    let t = tempfile::tempdir().unwrap();
+    let profiles = t.path().join("power/power-profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(profiles.join("active"), "power-saver\n").unwrap();
+    let _hypr = FakeHyprland::start(t.path());
+    let _srv = serve(t.path(), 60_000);
+    run_ok(t.path(), &["jogo", "ligar"]);
+    wait_file(&profiles.join("active"), "performance");
+    assert!(profiles.join("holds/1").exists());
+    run_ok(t.path(), &["jogo", "desligar"]);
+    wait_file(&profiles.join("active"), "power-saver");
 }
 
 #[cfg(feature = "game")]

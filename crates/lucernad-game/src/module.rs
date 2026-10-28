@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use lucerna_service::{RpcError, ServerBuilder, Topic, WorkGuard, WorkTracker};
+use lucernad_core::test_root::{GAMEMODE_DIR, POWER_ROOT, PROFILES_DIR};
 use lucernad_core::{ModuleTask, publish_changed, supervise};
 use lucernad_hyprland::events::{CONNECTED, DISCONNECTED, Event};
 use lucernad_hyprland::socket::HyprError;
@@ -20,7 +21,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use crate::bus::{BusError, GameBus, ZbusGame, timed};
+use crate::bus::{BusChoice, BusError, GameBus, NoGameBus, TreeGame, ZbusGame, choose, timed};
 use crate::compositor::{apply, apply_after_reload, restore};
 use crate::config::{GameSettings, parse};
 use crate::detect::{GameCache, ProcRoot};
@@ -90,11 +91,34 @@ pub struct GameConfig {
 }
 
 impl GameConfig {
-    /// A máquina de verdade, com o Hyprland `hypr` e o sinal `light`.
+    /// A máquina de verdade, com o Hyprland `hypr` e o sinal `light`. Com o
+    /// `LUCERNAD_POWER_ROOT`, o perfil e o GameMode são os falsos em arquivos
+    /// dessa raiz ([`TreeGame`]); com ela inválida, ou num container sem
+    /// ela, nenhum ([`NoGameBus`]): o D-Bus do host nunca é tocado.
     pub fn system(hypr: Option<Arc<dyn Hypr>>, light: Option<watch::Sender<bool>>) -> GameConfig {
+        let value = std::env::var_os(POWER_ROOT);
+        let bus: Arc<dyn GameBus> = match choose(
+            value.as_deref(),
+            lucernad_core::test_root::in_container(),
+        ) {
+            BusChoice::Real => Arc::new(ZbusGame::system()),
+            BusChoice::Tree(base) => {
+                eprintln!(
+                    "lucernad: {POWER_ROOT}={}: o perfil de energia e o GameMode do modo jogo são de teste (arquivos em {}/{PROFILES_DIR} e {}/{GAMEMODE_DIR}, sem D-Bus)",
+                    base.display(),
+                    base.display(),
+                    base.display()
+                );
+                Arc::new(TreeGame::new(base))
+            }
+            BusChoice::Off(e) => {
+                eprintln!("lucernad: {e}");
+                Arc::new(NoGameBus)
+            }
+        };
         GameConfig {
             hypr,
-            bus: Arc::new(ZbusGame::system()),
+            bus,
             proc: ProcRoot::system(),
             journal: Store::from_env().ok(),
             light,

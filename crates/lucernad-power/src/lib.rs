@@ -29,7 +29,8 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bus::{
-    BacklightWriter, LogindWriter, NoBus, Point, PowerBus, TreeWriter, ZbusPower, clip_error,
+    BacklightWriter, LogindWriter, NoBus, Point, PowerBus, TreeBus, TreeWriter, ZbusPower,
+    clip_error,
 };
 use crate::ddc::DdcTiming;
 use crate::i2c::{I2cOpener, LinuxI2c};
@@ -99,7 +100,8 @@ pub struct PowerConfig {
 impl PowerConfig {
     /// A máquina de verdade, ou a árvore falsa do `LUCERNAD_POWER_ROOT`
     /// (gravada direto no arquivo, sem logind nem DDC, sem o uevent do kernel
-    /// e sem o D-Bus do sistema). Uma raiz inválida, ou
+    /// e sem o D-Bus do sistema: os perfis são os do falso em arquivos da
+    /// raiz, o [`TreeBus`]). Uma raiz inválida, ou
     /// um container sem ela, deixa o módulo indisponível: nunca volta à
     /// máquina de verdade com a variável definida.
     pub fn system() -> PowerConfig {
@@ -112,7 +114,7 @@ impl PowerConfig {
             root_error: None,
             writer: Arc::new(TreeWriter { roots: nowhere }),
             i2c: None,
-            bus: Arc::new(ZbusPower::system()),
+            bus: Arc::new(NoBus),
             uevents: Arc::new(KernelUevents),
             timing: DdcTiming::standard(),
             op_timeout: OP_TIMEOUT,
@@ -124,6 +126,7 @@ impl PowerConfig {
         match root_from_env(value.as_deref(), in_container()) {
             Ok(None) => {
                 cfg.roots = Roots::system();
+                cfg.bus = Arc::new(ZbusPower::system());
                 cfg.writer = Arc::new(LogindWriter::system());
                 cfg.i2c = Some(Arc::new(LinuxI2c {
                     roots: Roots::system(),
@@ -140,9 +143,12 @@ impl PowerConfig {
                 });
                 cfg.roots = roots;
                 // Nada da máquina na raiz de teste: nem o uevent do kernel,
-                // nem o UPower e os perfis do D-Bus do sistema.
+                // nem o UPower e os perfis do D-Bus do sistema (os perfis
+                // são os do falso em arquivos, o mesmo do modo jogo).
                 cfg.uevents = Arc::new(NoUevents::default());
-                cfg.bus = Arc::new(NoBus);
+                if let Some(base) = cfg.roots.sysfs.parent() {
+                    cfg.bus = Arc::new(TreeBus::new(base.to_path_buf()));
+                }
             }
             Err(e) => {
                 eprintln!("lucernad: {e}");
