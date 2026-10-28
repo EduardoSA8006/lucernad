@@ -1,5 +1,6 @@
 //! O binário `lucernad`: `serve` roda o daemon; `status`, `watch`, `player`, `historico`, `copiar`, `brilho`,
-//! `faixa`, `cidade` e `rede` falam com ele. Sem argumentos (ou com `tui …`), mostra a ajuda: não há TUI.
+//! `faixa`, `cidade`, `rede` e `jogo` falam com ele. Sem argumentos (ou com `tui …`), mostra a ajuda: não há TUI.
+//! O escondido `restaurar-jogo` (o `ExecStopPost` do serviço) desfaz o modo jogo pelo diário, sem daemon.
 
 use std::fmt::Display;
 use std::process::ExitCode;
@@ -9,6 +10,12 @@ use lucernad::{Modules, cli, lucernad};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Fora do `lucerna-cli`: tratado antes dele, e escondido da ajuda.
+    #[cfg(feature = "game")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("restaurar-jogo")) {
+        let code = lucernad_game::compositor::restore_from_journal_cli().await;
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
     let cli = cli();
     let code = match cli.parse_from(std::env::args_os()) {
         // Sem TUI: `lucernad` e `lucernad tui …` mostram a ajuda.
@@ -27,7 +34,16 @@ async fn main() -> ExitCode {
             let _power_task = d.power_task;
             #[cfg(feature = "web")]
             let _web_task = d.web_task;
-            report(d.service.run().await)
+            #[cfg(feature = "hyprland")]
+            let _hyprland_task = d.hyprland_task;
+            #[cfg(feature = "game")]
+            let _game_task = d.game_task;
+            let r = d.service.run().await;
+            // Antes de sair, o modo jogo desfaz tudo (o ExecStopPost cobre
+            // a queda).
+            #[cfg(feature = "game")]
+            d.game_handle.shutdown().await;
+            report(r)
         }
         Ok(Invocation::Cli(run)) => cli.run_from_env(run).await,
         Err(e) => usage_exit(&e),

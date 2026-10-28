@@ -27,6 +27,8 @@ pub fn machine_config() -> SystemConfig {
         statfs: Arc::new(FixedStatfs::machine()),
         statfs_timeout: Duration::from_millis(200),
         nvidia: Box::new(NoNvidia),
+        game: lucernad_core::GameSignal::never(),
+        light_interval: crate::LIGHT_INTERVAL,
     }
 }
 

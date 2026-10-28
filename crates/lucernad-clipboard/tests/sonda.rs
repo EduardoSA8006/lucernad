@@ -190,6 +190,7 @@ async fn module_keeps_real_copies() {
         display_env: Some("wayland-1".to_string()),
         configure_wait: Duration::from_secs(2),
         retry: Duration::from_millis(200),
+        game: lucernad_core::GameSignal::never(),
     };
     let mut builder = ServerBuilder::new("lucernad", "0.1.0");
     let clipboard = register(&mut builder, cfg, work.clone());

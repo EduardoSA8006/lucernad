@@ -27,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lucerna_paths::{AppPaths, Env};
 use lucerna_service::{RpcError, ServerBuilder, Topic, WorkGuard, WorkTracker};
-use lucernad_core::{Detached, ModuleTask, detached, publish_changed};
+use lucernad_core::{Detached, GameSignal, ModuleTask, detached, publish_changed};
 use rustix::fs::OFlags;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -79,6 +79,9 @@ const NO_DATA_DIR: &str = "Sem XDG_DATA_HOME nem HOME: não sei onde guardar o h
 const NO_RUNTIME_DIR: &str =
     "Sem XDG_RUNTIME_DIR: não sei onde guardar o histórico sem persistência.";
 
+/// No modo jogo, quantas cópias esperam na memória (a mais velha cai).
+pub const DEFERRED_MAX: usize = 50;
+
 /// O item pedido não existe.
 const ITEM_GONE: i32 = 1001;
 /// A imagem do `copyImage` não pôde ser lida.
@@ -100,6 +103,9 @@ pub struct ClipboardConfig {
     pub configure_wait: Duration,
     /// Quanto esperar para tentar de novo depois de uma falha do compositor.
     pub retry: Duration,
+    /// O sinal do modo jogo: ligado, as cópias lidas esperam na memória
+    /// (até [`DEFERRED_MAX`]), sem miniatura, sem banco e sem publicar.
+    pub game: GameSignal,
 }
 
 impl ClipboardConfig {
@@ -117,6 +123,7 @@ impl ClipboardConfig {
                 .filter(|d| !d.is_empty()),
             configure_wait: CONFIGURE_WAIT,
             retry: RETRY,
+            game: GameSignal::never(),
         }
     }
 }
@@ -213,6 +220,10 @@ struct Shared {
     copies: mpsc::UnboundedSender<CopyRequest>,
     /// A vez de preparar uma imagem (uma por vez).
     images: Mutex<()>,
+    /// O modo jogo.
+    game: GameSignal,
+    /// As cópias lidas durante o modo jogo, da mais velha para a mais nova.
+    deferred: Mutex<VecDeque<NewClip>>,
 }
 
 impl Shared {
@@ -478,6 +489,40 @@ impl Ctx {
         let (id, _) = store.insert_ref(p, now)?;
         self.shared.publish_history(store);
         Ok(Some(id))
+    }
+
+    /// Grava as cópias preparadas na ordem, como se chegassem agora, e
+    /// publica o histórico uma vez (bloqueia).
+    fn insert_all(&self, ps: &[Prepared], now: i64) -> Result<(), String> {
+        let Some(db) = self.db.upgrade() else {
+            return Ok(());
+        };
+        let mut slot = lock(&db);
+        let Some(store) = slot.as_mut() else {
+            return Ok(());
+        };
+        for (i, p) in ps.iter().enumerate() {
+            store.insert_ref(p, now + i as i64)?;
+        }
+        if !ps.is_empty() {
+            self.shared.publish_history(store);
+        }
+        Ok(())
+    }
+
+    /// Guarda uma cópia do modo jogo na fila (a mais velha cai além de
+    /// [`DEFERRED_MAX`]).
+    fn defer(&self, clip: NewClip) {
+        let mut q = self
+            .shared
+            .deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if q.len() == DEFERRED_MAX {
+            q.pop_front();
+            eprintln!("lucernad: o modo jogo descartou uma cópia antiga da fila");
+        }
+        q.push_back(clip);
     }
 
     /// Pede ao laço para virar dono da seleção com `source`.
@@ -750,6 +795,8 @@ pub fn register(server: &mut ServerBuilder, cfg: ClipboardConfig, work: WorkTrac
         status: Mutex::new(Status::default()),
         copies: copies_tx,
         images: Mutex::new(()),
+        game: cfg.game.clone(),
+        deferred: Mutex::new(VecDeque::new()),
     });
     let db = Arc::new(Mutex::new(None));
     let ctx = Ctx {
@@ -782,6 +829,7 @@ impl Clipboard {
     /// o histórico sem persistência leva os arquivos junto.
     pub fn spawn(self) -> ModuleTask {
         let status = self.topics.status.clone();
+        let game = self.ctx.shared.game.clone();
         let module = Module {
             settings: self.ctx.shared.settings.subscribe(),
             ctx: self.ctx,
@@ -790,6 +838,7 @@ impl Clipboard {
             retry: self.retry,
             work: self.work,
             copies: self.copies,
+            game,
             parked: None,
             owned: None,
             defaulting: false,
@@ -830,6 +879,8 @@ struct Module {
     work: WorkTracker,
     copies: mpsc::UnboundedReceiver<CopyRequest>,
     settings: watch::Receiver<Option<Settings>>,
+    /// O modo jogo (para processar a fila ao sair).
+    game: GameSignal,
     /// Um pedido de cópia recebido fora da sessão, para a próxima.
     parked: Option<CopyRequest>,
     owned: Option<Owned>,
@@ -892,6 +943,7 @@ impl Module {
                 _ = history.wait_subscribed(), if !subscribed => {}
                 _ = self.settings.changed() => {}
                 request = self.copies.recv() => self.parked = request,
+                () = self.game.changed() => self.game_changed(),
             }
         }
     }
@@ -922,6 +974,7 @@ impl Module {
             _ = sleep => {}
             _ = self.settings.changed() => {}
             request = self.copies.recv() => self.parked = request,
+            () = self.game.changed() => self.game_changed(),
         }
     }
 
@@ -984,12 +1037,32 @@ impl Module {
                     }
                 }
                 _ = history.wait_unsubscribed(), if self.owned.is_none() => return Exit::Idle,
+                () = self.game.changed() => self.game_changed(),
                 // Um assinante chegou numa sessão aberta só pela seleção nossa.
                 _ = history.wait_subscribed(), if !self.defaulting && self.settings.borrow().is_none() => {
                     self.start_default();
                 }
             }
         }
+    }
+
+    /// O modo jogo mudou: ao sair, as cópias da fila vão ao histórico, na
+    /// ordem e depois das leituras em voo.
+    fn game_changed(&mut self) {
+        if self.game.is_on() {
+            return;
+        }
+        let previous = self.last_read.take();
+        let (done, last) = oneshot::channel::<()>();
+        self.last_read = Some(last);
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            flush_deferred(ctx).await;
+            drop(done);
+        });
     }
 
     /// A seleção deixou de ser nossa: o trabalho e os ecos esperados saem.
@@ -1073,10 +1146,12 @@ impl Module {
         tokio::spawn(async move {
             let job_ctx = ctx.clone();
             let job_mime = mime.clone();
-            let prepared = tokio::task::spawn_blocking(move || {
+            let got = tokio::task::spawn_blocking(move || {
                 let bytes = read_pipe(reader, kind.max_size(), deadline).map_err(read_error)?;
                 match clip_of(kind, job_mime, bytes) {
-                    Some(clip) => job_ctx.prepare_clip(clip),
+                    // O modo jogo: sem o trabalho pesado agora.
+                    Some(clip) if job_ctx.shared.game.is_on() => Ok(Some(Got::Deferred(clip))),
+                    Some(clip) => job_ctx.prepare_clip(clip).map(|p| p.map(Got::Ready)),
                     None => Ok(None),
                 }
             })
@@ -1085,12 +1160,21 @@ impl Module {
             if let Some(previous) = previous {
                 let _ = previous.await;
             }
-            let inserted = match prepared {
-                Ok(Ok(Some(p))) => {
+            let inserted = match got {
+                Ok(Ok(Some(Got::Ready(p)))) => {
+                    let ctx = ctx.clone();
                     tokio::task::spawn_blocking(move || ctx.insert_prepared(&p, now))
                         .await
                         .unwrap_or_else(|e| Err(format!("pânico: {e}")))
                         .map(drop)
+                }
+                Ok(Ok(Some(Got::Deferred(clip)))) => {
+                    ctx.defer(clip);
+                    // O modo jogo acabou no meio: a fila vai já.
+                    if !ctx.shared.game.is_on() {
+                        flush_deferred(ctx.clone()).await;
+                    }
+                    Ok(())
                 }
                 Ok(Ok(None)) => Ok(()),
                 Ok(Err(e)) => Err(e),
@@ -1101,6 +1185,45 @@ impl Module {
             }
             drop(done);
         });
+    }
+}
+
+/// Uma cópia lida: pronta para o banco, ou guardada para depois do jogo.
+enum Got {
+    Ready(Prepared),
+    Deferred(NewClip),
+}
+
+/// Processa a fila do modo jogo: prepara cada cópia, grava todas na ordem e
+/// publica uma vez.
+async fn flush_deferred(ctx: Ctx) {
+    let clips: Vec<NewClip> = ctx
+        .shared
+        .deferred
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect();
+    if clips.is_empty() {
+        return;
+    }
+    let now = now_ms();
+    let job = tokio::task::spawn_blocking(move || {
+        let mut ready = Vec::new();
+        for clip in clips {
+            match ctx.prepare_clip(clip) {
+                Ok(Some(p)) => ready.push(p),
+                Ok(None) => {}
+                Err(e) => eprintln!("lucernad: cópia do modo jogo descartada: {e}"),
+            }
+        }
+        ctx.insert_all(&ready, now)
+    })
+    .await;
+    match job {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("lucernad: as cópias do modo jogo não foram gravadas: {e}"),
+        Err(e) => eprintln!("lucernad: as cópias do modo jogo não foram gravadas: pânico: {e}"),
     }
 }
 

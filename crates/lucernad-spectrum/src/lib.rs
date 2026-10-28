@@ -10,7 +10,8 @@
 //! O módulo se registra num servidor com [`register`] e roda com
 //! [`Spectrum::spawn`]. A sessão com o PipeWire só existe enquanto houver
 //! assinante de `spectrum.bands` **e** um player configurado pelo
-//! `spectrum.configure`.
+//! `spectrum.configure`, e fora do modo jogo (o [`GameSignal`] ligado fecha a
+//! sessão e publica `paused: true`).
 
 use std::panic::resume_unwind;
 use std::path::PathBuf;
@@ -18,7 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lucerna_service::{RpcError, ServerBuilder, Topic};
-use lucernad_core::{Detached, ModuleTask, detached, detached_task, publish_changed, spawn_thread};
+use lucernad_core::{
+    Detached, GameSignal, ModuleTask, detached, detached_task, publish_changed, spawn_thread,
+};
 use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
@@ -63,6 +66,8 @@ pub struct SpectrumConfig {
     pub dbus_timeout: Duration,
     /// Quanto esperar para tentar de novo depois de uma falha do PipeWire.
     pub retry: Duration,
+    /// O sinal do modo jogo: ligado, a captura pausa.
+    pub game: GameSignal,
 }
 
 impl SpectrumConfig {
@@ -74,6 +79,7 @@ impl SpectrumConfig {
             procfs: PathBuf::from("/proc"),
             dbus_timeout: DBUS_TIMEOUT,
             retry: RETRY,
+            game: GameSignal::never(),
         }
     }
 }
@@ -158,6 +164,7 @@ impl Spectrum {
             json!({
                 "available": false,
                 "capturing": false,
+                "paused": false,
                 "player": null,
                 "error": PANIC_ERROR,
             }),
@@ -172,6 +179,8 @@ struct Status {
     available: bool,
     /// Sessão aberta com pelo menos um nó casado.
     capturing: bool,
+    /// O modo jogo pausou a captura.
+    paused: bool,
     /// O player configurado.
     player: Option<String>,
     /// O último erro; `None` depois de uma conexão boa.
@@ -183,6 +192,7 @@ impl Status {
         json!({
             "available": self.available,
             "capturing": self.capturing,
+            "paused": self.paused,
             "player": self.player,
             "error": self.error,
         })
@@ -213,6 +223,7 @@ struct Module {
     t: SpectrumTopics,
     player: watch::Receiver<Option<String>>,
     status: Status,
+    game: GameSignal,
 }
 
 impl Module {
@@ -237,20 +248,29 @@ impl Module {
         self.publish_status();
     }
 
-    /// Espera haver assinante de `spectrum.bands` e um player; devolve o
-    /// player.
+    /// Espera haver assinante de `spectrum.bands` e um player, fora do
+    /// modo jogo; devolve o player.
     async fn wait_for_work(&mut self) -> String {
         loop {
+            let paused = self.game.is_on();
+            if self.status.paused != paused {
+                self.status.paused = paused;
+                if paused {
+                    self.status.capturing = false;
+                }
+            }
             let player = self.current_player();
             let subscribed = self.t.bands.subscribers() > 0;
             if let Some(name) = player
                 && subscribed
+                && !paused
             {
                 return name;
             }
             tokio::select! {
                 _ = self.t.bands.wait_subscribed(), if !subscribed => {}
                 _ = self.player.changed() => {}
+                () = self.game.changed() => {}
             }
         }
     }
@@ -261,6 +281,7 @@ impl Module {
             _ = tokio::time::sleep(self.cfg.retry) => {}
             _ = self.player.changed() => {}
             _ = self.t.bands.wait_unsubscribed() => {}
+            () = self.game.changed() => {}
         }
     }
 
@@ -388,6 +409,12 @@ impl Module {
                     self.request_rematch(&mut capture);
                 }
                 _ = self.t.bands.wait_unsubscribed() => return Exit::Idle,
+                // O modo jogo: a sessão fecha (o wait_for_work publica a pausa).
+                () = self.game.changed() => {
+                    if self.game.is_on() {
+                        return Exit::Idle;
+                    }
+                }
             }
         }
     }
@@ -490,11 +517,13 @@ impl Capture {
 /// O laço do módulo: a sonda e, enquanto houver assinante e player, uma
 /// sessão com o PipeWire.
 async fn run(cfg: SpectrumConfig, t: SpectrumTopics, player: Arc<watch::Sender<Option<String>>>) {
+    let game = cfg.game.clone();
     let mut m = Module {
         cfg,
         t,
         player: player.subscribe(),
         status: Status::default(),
+        game,
     };
     m.probe().await;
     loop {

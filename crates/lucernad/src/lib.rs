@@ -1,11 +1,11 @@
 //! O `lucernad`: o daemon do Lucerna, um binário com um módulo por área.
 //!
 //! Cada módulo é um crate ligado por uma feature (`system`, `spectrum`,
-//! `clipboard`, `power` e `web`, as cinco padrão) e se registra no mesmo serviço. [`lucernad`] monta o serviço
+//! `clipboard`, `power`, `web`, `hyprland` e `game`, todas padrão) e se registra no mesmo serviço. [`lucernad`] monta o serviço
 //! com os módulos ligados; [`cli`] é a linha de comando: os subcomandos comuns
 //! do SDK (`status` e `watch`) e, com o `spectrum`, o `player`; com o
 //! `clipboard`, o `historico` e o `copiar`; com o `power`, o `brilho`; com o
-//! `web`, o `faixa`, a `cidade` e a `rede`.
+//! `web`, o `faixa`, a `cidade` e a `rede`; com o `game`, o `jogo`.
 
 use lucerna_cli::CliApp;
 use lucerna_service::ServiceBuilder;
@@ -30,6 +30,13 @@ pub struct Modules {
     /// O módulo `web`.
     #[cfg(feature = "web")]
     pub web: lucernad_web::WebConfig,
+    /// O módulo `hyprland`.
+    #[cfg(feature = "hyprland")]
+    pub hyprland: lucernad_hyprland::HyprlandConfig,
+    /// O módulo `game`. Sem `hypr`, usa o do módulo `hyprland`; o sinal do
+    /// modo leve é sempre o do [`lucernad`].
+    #[cfg(feature = "game")]
+    pub game: lucernad_game::GameConfig,
 }
 
 impl Modules {
@@ -46,6 +53,10 @@ impl Modules {
             power: lucernad_power::PowerConfig::system(),
             #[cfg(feature = "web")]
             web: lucernad_web::WebConfig::system(),
+            #[cfg(feature = "hyprland")]
+            hyprland: lucernad_hyprland::HyprlandConfig::system(),
+            #[cfg(feature = "game")]
+            game: lucernad_game::GameConfig::system(None, None),
         }
     }
 }
@@ -88,6 +99,26 @@ pub struct Lucernad {
     /// O laço do módulo `web`; soltá-lo encerra as buscas em voo.
     #[cfg(feature = "web")]
     pub web_task: lucernad_core::ModuleTask,
+    /// Os tópicos do módulo `hyprland`.
+    #[cfg(feature = "hyprland")]
+    pub hyprland: lucernad_hyprland::HyprlandTopics,
+    /// O laço do módulo `hyprland`; soltá-lo encerra a leitura dos eventos.
+    #[cfg(feature = "hyprland")]
+    pub hyprland_task: lucernad_core::ModuleTask,
+    /// Os tópicos do módulo `game`.
+    #[cfg(feature = "game")]
+    pub game: lucernad_game::GameTopics,
+    /// O laço do módulo `game`; soltá-lo para o laço sem desfazer nada
+    /// (chame o `game_handle.shutdown()` antes).
+    #[cfg(feature = "game")]
+    pub game_task: lucernad_core::ModuleTask,
+    /// Desfaz o modo jogo antes de o processo sair.
+    #[cfg(feature = "game")]
+    pub game_handle: lucernad_game::GameHandle,
+    /// O sinal do modo leve (ligado pelo `game`; sempre desligado sem ele),
+    /// já passado ao `system`, ao `spectrum` e ao `clipboard`.
+    #[cfg(any(feature = "system", feature = "spectrum", feature = "clipboard"))]
+    pub game_signal: lucernad_core::GameSignal,
 }
 
 /// Monta o serviço com os módulos ligados. Chame dentro do runtime: começa as
@@ -100,29 +131,73 @@ pub fn lucernad(modules: Modules) -> Lucernad {
             feature = "spectrum",
             feature = "clipboard",
             feature = "power",
-            feature = "web"
+            feature = "web",
+            feature = "hyprland"
         )),
         allow(unused_mut)
     )]
     let mut service = ServiceBuilder::new(APP, env!("CARGO_PKG_VERSION"));
-    #[cfg(feature = "system")]
-    let system = lucernad_system::register(service.server(), modules.system);
-    #[cfg(feature = "spectrum")]
-    let spectrum = lucernad_spectrum::register(service.server(), modules.spectrum);
-    #[cfg(any(feature = "clipboard", feature = "power"))]
+
+    // O sinal do modo leve: o `game` liga, os outros módulos seguem.
+    #[cfg(feature = "game")]
+    let (light, game_signal) = lucernad_core::GameSignal::channel();
+    #[cfg(all(
+        any(feature = "system", feature = "spectrum", feature = "clipboard"),
+        not(feature = "game")
+    ))]
+    let game_signal = lucernad_core::GameSignal::never();
+    #[cfg(all(
+        feature = "game",
+        not(any(feature = "system", feature = "spectrum", feature = "clipboard"))
+    ))]
+    drop(game_signal);
+    #[cfg(any(feature = "clipboard", feature = "power", feature = "game"))]
     let work = service.work();
+    // Os módulos que ficam mais leves no modo jogo seguem o sinal.
+    #[cfg(any(feature = "system", feature = "spectrum", feature = "clipboard"))]
+    let mut modules = modules;
+    #[cfg(feature = "system")]
+    let system = {
+        modules.system.game = game_signal.clone();
+        lucernad_system::register(service.server(), modules.system)
+    };
+    #[cfg(feature = "spectrum")]
+    let spectrum = {
+        modules.spectrum.game = game_signal.clone();
+        lucernad_spectrum::register(service.server(), modules.spectrum)
+    };
+    #[cfg(feature = "clipboard")]
+    {
+        modules.clipboard.game = game_signal.clone();
+    }
     #[cfg(feature = "clipboard")]
     let clipboard = lucernad_clipboard::register(service.server(), modules.clipboard, work.clone());
     #[cfg(feature = "power")]
-    let power = lucernad_power::register(service.server(), modules.power, work);
+    let power = lucernad_power::register(service.server(), modules.power, work.clone());
     #[cfg(feature = "web")]
     let web = lucernad_web::register(service.server(), modules.web);
+    #[cfg(feature = "hyprland")]
+    let hyprland = lucernad_hyprland::register(service.server(), modules.hyprland);
+    #[cfg(feature = "game")]
+    let (game, game_task, game_handle) = {
+        let mut cfg = modules.game;
+        if cfg.hypr.is_none() {
+            cfg.hypr = Some(hyprland.hypr());
+        }
+        cfg.light = Some(light);
+        let game = lucernad_game::register(service.server(), cfg, work);
+        let topics = game.topics.clone();
+        let (task, handle) = game.spawn();
+        (topics, task, handle)
+    };
     #[cfg(not(any(
         feature = "system",
         feature = "spectrum",
         feature = "clipboard",
         feature = "power",
-        feature = "web"
+        feature = "web",
+        feature = "hyprland",
+        feature = "game"
     )))]
     let Modules {} = modules;
     Lucernad {
@@ -147,6 +222,18 @@ pub fn lucernad(modules: Modules) -> Lucernad {
         web: web.topics.clone(),
         #[cfg(feature = "web")]
         web_task: web.spawn(),
+        #[cfg(feature = "hyprland")]
+        hyprland: hyprland.topics.clone(),
+        #[cfg(feature = "hyprland")]
+        hyprland_task: hyprland.spawn(),
+        #[cfg(feature = "game")]
+        game,
+        #[cfg(feature = "game")]
+        game_task,
+        #[cfg(feature = "game")]
+        game_handle,
+        #[cfg(any(feature = "system", feature = "spectrum", feature = "clipboard"))]
+        game_signal,
     }
 }
 
@@ -156,7 +243,7 @@ pub fn cli() -> CliApp {
         APP,
         "lucernad",
         env!("CARGO_PKG_VERSION"),
-        "O daemon do Lucerna: os dados do sistema, o espectro do som, o histórico da área de transferência, o brilho das telas e a letra e o clima para o shell.",
+        "O daemon do Lucerna: os dados do sistema, o espectro do som, o histórico da área de transferência, o brilho das telas, a letra e o clima, o estado do compositor (Hyprland) e o modo jogo para o shell.",
     );
     #[cfg(feature = "spectrum")]
     let app = app.command(player_command());
@@ -169,7 +256,91 @@ pub fn cli() -> CliApp {
         .command(track_command())
         .command(city_command())
         .command(network_command());
+    #[cfg(feature = "game")]
+    let app = app.command(game_command());
     app
+}
+
+/// `lucernad jogo [ligar|desligar|alternar]`: o `game.get`, o `game.set` ou o
+/// `game.toggle`.
+#[cfg(feature = "game")]
+fn game_command() -> lucerna_cli::CliCommand {
+    use lucerna_cli::clap::{Arg, Command, builder::PossibleValuesParser};
+    use lucerna_cli::{Call, CliCommand};
+
+    CliCommand {
+        command: Command::new("jogo")
+            .about("Mostra o modo jogo; com ligar, desligar ou alternar, muda na mão (o que entrou na mão só sai na mão).")
+            .arg(
+                Arg::new("acao")
+                    .value_name("AÇÃO")
+                    .value_parser(PossibleValuesParser::new(["ligar", "desligar", "alternar"]))
+                    .help("ligar, desligar ou alternar."),
+            ),
+        to_call: |m| {
+            let (method, params) = match m.get_one::<String>("acao").map(String::as_str) {
+                None => ("game.get", serde_json::json!({})),
+                Some("ligar") => ("game.set", serde_json::json!({ "on": true })),
+                Some("desligar") => ("game.set", serde_json::json!({ "on": false })),
+                _ => ("game.toggle", serde_json::json!({})),
+            };
+            Ok(Call {
+                method: method.into(),
+                params: Some(params),
+            })
+        },
+        render: Some(render_game),
+    }
+}
+
+/// `ligado (tela cheia, jogo) há 12 min` ou `desligado` (o `game.get`);
+/// `ligado`/`desligado` (o `game.toggle`); nada (o `{}` do `game.set`).
+#[cfg(feature = "game")]
+fn render_game(v: &serde_json::Value) -> String {
+    render_game_at(v, std::time::SystemTime::now())
+}
+
+#[cfg(feature = "game")]
+fn render_game_at(v: &serde_json::Value, now: std::time::SystemTime) -> String {
+    let Some(active) = v["active"].as_bool() else {
+        return String::new();
+    };
+    if !active {
+        return "desligado".to_string();
+    }
+    let Some(reasons) = v["reasons"].as_array() else {
+        return "ligado".to_string();
+    };
+    let names: Vec<String> = reasons
+        .iter()
+        .map(|r| match r.as_str().unwrap_or_default() {
+            "manual" => "manual".to_string(),
+            "fullscreen" => "tela cheia".to_string(),
+            "game" => "jogo".to_string(),
+            "always" => "lista sempre".to_string(),
+            other => plain(other),
+        })
+        .collect();
+    let mut out = "ligado".to_string();
+    if !names.is_empty() {
+        out.push_str(&format!(" ({})", names.join(", ")));
+    }
+    if let Some(since) = v["since"].as_u64() {
+        let now_ms = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        let s = now_ms.saturating_sub(since) / 1000;
+        let ago = if s < 60 {
+            format!("{s} s")
+        } else if s < 3600 {
+            format!("{} min", s / 60)
+        } else {
+            format!("{} h {} min", s / 3600, (s % 3600) / 60)
+        };
+        out.push_str(&format!(" há {ago}"));
+    }
+    out
 }
 
 /// `lucernad player [NOME]`: o `spectrum.configure` (sem nome, `null`).
@@ -229,7 +400,12 @@ fn history_command() -> lucerna_cli::CliCommand {
 /// (U+200E/F, U+202A–202E, U+2066–2069) por U+FFFD: um texto copiado com
 /// escapes ANSI ou com a direção invertida não mexe no terminal de quem lê o
 /// histórico.
-#[cfg(any(feature = "clipboard", feature = "power", feature = "web"))]
+#[cfg(any(
+    feature = "clipboard",
+    feature = "power",
+    feature = "web",
+    feature = "game"
+))]
 fn plain(s: &str) -> String {
     let direction = |c: char| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
     s.chars()
@@ -700,6 +876,43 @@ mod web_tests {
         assert_eq!(
             render_cities(&json!({"results": []})),
             "Nenhuma cidade encontrada."
+        );
+    }
+}
+
+#[cfg(all(test, feature = "game"))]
+mod game_tests {
+    use super::render_game_at;
+    use serde_json::json;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn jogo_lines() {
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        let since = (10_000 - 125) * 1000;
+        assert_eq!(
+            render_game_at(
+                &json!({"active": true, "reasons": ["fullscreen", "game"], "since": since}),
+                now
+            ),
+            "ligado (tela cheia, jogo) há 2 min"
+        );
+        assert_eq!(
+            render_game_at(
+                &json!({"active": true, "reasons": ["manual"], "since": 9_990_000}),
+                now
+            ),
+            "ligado (manual) há 10 s"
+        );
+        assert_eq!(
+            render_game_at(&json!({"active": false, "reasons": []}), now),
+            "desligado"
+        );
+        assert_eq!(render_game_at(&json!({"active": true}), now), "ligado");
+        assert_eq!(render_game_at(&json!({}), now), "");
+        assert_eq!(
+            render_game_at(&json!({"active": true, "reasons": ["x\u{1b}[2J"]}), now),
+            "ligado (x\u{FFFD}[2J)"
         );
     }
 }

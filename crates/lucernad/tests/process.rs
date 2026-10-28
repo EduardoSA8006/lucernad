@@ -12,13 +12,15 @@
 //! sobre uma árvore falsa (`LUCERNAD_POWER_ROOT`) e sem o D-Bus do sistema:
 //! o brilho, o logind e o i2c da máquina nunca são tocados. O `web` roda
 //! contra um servidor local (`LUCERNAD_WEB_BASE`): nenhum processo daqui vai à
-//! internet.
+//! internet. O `hyprland` e o `game` falam com um Hyprland falso numa pasta
+//! temporária (ou com nenhum), e os perfis e o GameMode ficam sem D-Bus.
 #![cfg(any(
     feature = "system",
     feature = "spectrum",
     feature = "clipboard",
     feature = "power",
-    feature = "web"
+    feature = "web",
+    feature = "hyprland"
 ))]
 
 use std::io::{BufRead, BufReader};
@@ -96,7 +98,8 @@ fn web_base() -> String {
     WEB.with(WebServer::base)
 }
 
-/// O binário com um ambiente limpo: `HOME`, `XDG_RUNTIME_DIR`, `PATH` e, para
+/// O binário com um ambiente limpo (sem `HYPRLAND_INSTANCE_SIGNATURE` e sem
+/// Hyprland no `XDG_RUNTIME_DIR`): `HOME`, `XDG_RUNTIME_DIR`, `PATH` e, para
 /// o `power`, a árvore falsa em `dir/power` e um D-Bus do sistema que não
 /// existe; para o `web`, o `LUCERNAD_WEB_BASE` do servidor local do teste.
 fn lucernad(dir: &Path) -> Command {
@@ -111,6 +114,13 @@ fn lucernad(dir: &Path) -> Command {
             "DBUS_SYSTEM_BUS_ADDRESS",
             format!("unix:path={}", dir.join("sem-barramento").display()),
         )
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", dir.join("sem-barramento").display()),
+        )
+        // O Hyprland, só o falso do teste (em `run/hypr/sig_teste`, quando
+        // o teste o sobe): sem ele, o módulo fica indisponível.
+        .env("HYPRLAND_INSTANCE_SIGNATURE", "sig_teste")
         .env("PATH", std::env::var_os("PATH").unwrap_or_default());
     // Sem isto o binário iria às fontes de verdade (LRCLIB, Open-Meteo).
     #[cfg(feature = "web")]
@@ -425,6 +435,19 @@ fn cli_help_status_and_exit_codes() {
         );
         assert_eq!(std::fs::read_to_string(&brightness).unwrap(), "lixo\n");
     }
+    #[cfg(feature = "hyprland")]
+    {
+        // Sem Hyprland no XDG_RUNTIME_DIR temporário: indisponível, com o motivo.
+        let (_w, rx, mut v) = watch_json(t.path(), "hyprland.status");
+        while !v["data"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("não está rodando")
+        {
+            v = line(&rx);
+        }
+        assert_eq!(v["data"]["available"], false, "{v}");
+    }
 }
 
 /// O `web`: a busca de cidade, o `rede` e o `faixa` pela linha de comando, o
@@ -609,5 +632,179 @@ fn second_serve_is_refused() {
     assert!(
         srv.child().try_wait().unwrap().is_none(),
         "o primeiro continua"
+    );
+}
+
+/// Um Hyprland falso (os dois sockets) em `dir/run/hypr/sig_teste`, num
+/// runtime próprio que vive enquanto o teste o guardar.
+#[cfg(feature = "game")]
+struct FakeHyprland {
+    fake: Option<lucernad_hyprland::testing::FakeSockets>,
+    rt: Option<tokio::runtime::Runtime>,
+}
+
+#[cfg(feature = "game")]
+impl FakeHyprland {
+    fn start(dir: &Path) -> FakeHyprland {
+        let inst = dir.join("run/hypr/sig_teste");
+        std::fs::create_dir_all(&inst).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let fake = rt.block_on(async { lucernad_hyprland::testing::FakeSockets::start(&inst) });
+        FakeHyprland {
+            fake: Some(fake),
+            rt: Some(rt),
+        }
+    }
+
+    fn fake(&self) -> &lucernad_hyprland::testing::FakeSockets {
+        self.fake.as_ref().unwrap()
+    }
+
+    fn options(
+        &self,
+    ) -> std::collections::BTreeMap<String, lucernad_hyprland::options::OptionValue> {
+        self.fake().with_model(|m| m.options.clone())
+    }
+}
+
+#[cfg(feature = "game")]
+impl Drop for FakeHyprland {
+    fn drop(&mut self) {
+        drop(self.fake.take());
+        drop(self.rt.take());
+    }
+}
+
+#[cfg(feature = "game")]
+fn run_ok(dir: &Path, args: &[&str]) -> String {
+    let out = lucernad(dir).args(args).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{args:?}: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[cfg(feature = "game")]
+#[test]
+fn jogo_cli_round_trip() {
+    use lucernad_hyprland::options::OptionValue::Bool;
+    let t = tempfile::tempdir().unwrap();
+    let hypr = FakeHyprland::start(t.path());
+    let before = hypr.options();
+    let _srv = serve(t.path(), 60_000);
+    assert_eq!(run_ok(t.path(), &["jogo"]).trim(), "desligado");
+    run_ok(t.path(), &["jogo", "ligar"]);
+    let evals: Vec<String> = hypr
+        .fake()
+        .requests()
+        .into_iter()
+        .filter(|r| r.starts_with("eval"))
+        .collect();
+    assert_eq!(
+        evals,
+        vec![
+            "eval hl.config({ decoration = { blur = { enabled = false }, shadow = { enabled = false } }, animations = { enabled = false }, misc = { vrr = 2 } })"
+        ]
+    );
+    assert_eq!(hypr.options()["animations:enabled"], Bool(false));
+    let journal = t.path().join("run/lucerna/game/restore.json");
+    assert!(journal.exists(), "o diário gravado");
+    let shown = run_ok(t.path(), &["jogo"]);
+    assert!(shown.starts_with("ligado (manual) há "), "{shown}");
+    assert_eq!(run_ok(t.path(), &["jogo", "alternar"]).trim(), "desligado");
+    assert_eq!(hypr.options(), before, "restaurado");
+    assert!(!journal.exists());
+    let out = lucernad(t.path())
+        .args(["jogo", "talvez"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(64), "uso errado");
+}
+
+#[cfg(feature = "game")]
+#[test]
+fn restaurar_jogo_without_journal_exits_zero() {
+    let t = tempfile::tempdir().unwrap();
+    let out = lucernad(t.path()).arg("restaurar-jogo").output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    // Escondido da ajuda.
+    let help = run_ok(t.path(), &["--help"]);
+    assert!(!help.contains("restaurar-jogo"), "{help}");
+    assert!(help.contains("jogo"), "{help}");
+}
+
+/// O daemon morto com `kill -9` no meio do jogo: o `restaurar-jogo` (o
+/// `ExecStopPost`) desfaz pelo diário, sem daemon; e um daemon novo também
+/// desfaz ao subir.
+#[cfg(feature = "game")]
+#[test]
+fn killed_daemon_is_undone_by_the_journal() {
+    let t = tempfile::tempdir().unwrap();
+    let hypr = FakeHyprland::start(t.path());
+    let before = hypr.options();
+    let journal = t.path().join("run/lucerna/game/restore.json");
+    {
+        let mut srv = serve(t.path(), 60_000);
+        run_ok(t.path(), &["jogo", "ligar"]);
+        assert_ne!(hypr.options(), before);
+        srv.child().kill().unwrap(); // SIGKILL
+        srv.child().wait().unwrap();
+    }
+    // O socket à mão sobra com o SIGKILL (o do systemd não).
+    std::fs::remove_file(socket(t.path())).unwrap();
+    assert!(journal.exists(), "o diário fica com o daemon morto");
+    assert_eq!(run_ok(t.path(), &["restaurar-jogo"]), "");
+    assert_eq!(hypr.options(), before);
+    assert!(!journal.exists());
+    // De novo, agora sem o restaurar-jogo: o daemon que sobe desfaz.
+    {
+        let mut srv = serve(t.path(), 60_000);
+        run_ok(t.path(), &["jogo", "ligar"]);
+        srv.child().kill().unwrap();
+        srv.child().wait().unwrap();
+    }
+    std::fs::remove_file(socket(t.path())).unwrap();
+    assert_ne!(hypr.options(), before);
+    let _srv = serve(t.path(), 60_000);
+    let start = Instant::now();
+    while hypr.options() != before {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "não restaurou ao subir"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!journal.exists());
+}
+
+/// O `SIGTERM` (o serviço parando) desfaz o modo jogo antes de sair.
+#[cfg(feature = "game")]
+#[test]
+fn sigterm_undoes_game_mode() {
+    let t = tempfile::tempdir().unwrap();
+    let hypr = FakeHyprland::start(t.path());
+    let before = hypr.options();
+    let mut srv = serve(t.path(), 60_000);
+    run_ok(t.path(), &["jogo", "ligar"]);
+    assert_ne!(hypr.options(), before);
+    sigterm(srv.child());
+    assert!(
+        wait_exit(srv.child(), Duration::from_secs(5))
+            .expect("não saiu")
+            .success()
+    );
+    assert_eq!(
+        hypr.options(),
+        before,
+        "{}",
+        std::fs::read_to_string(t.path().join("serve.log")).unwrap_or_default()
     );
 }

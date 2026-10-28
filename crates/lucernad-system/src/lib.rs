@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lucerna_service::{RpcError, ServerBuilder, Topic};
-use lucernad_core::publish_changed;
+use lucernad_core::{GameSignal, publish_changed};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -69,6 +69,17 @@ pub const MIN_INTERVAL_MS: u64 = 500;
 pub const MAX_INTERVAL_MS: u64 = 10_000;
 /// O prazo de cada `statvfs`.
 pub const STATFS_TIMEOUT: Duration = Duration::from_secs(1);
+/// No modo jogo (o modo leve), o menor intervalo de amostragem.
+pub const LIGHT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// O intervalo valendo: o configurado e, no modo leve, no mínimo `light`.
+pub fn effective_interval(configured: Duration, light_on: bool, light: Duration) -> Duration {
+    if light_on {
+        configured.max(light)
+    } else {
+        configured
+    }
+}
 
 /// O texto do estado quando o laço do módulo entra em pânico.
 const PANIC_ERROR: &str = "O módulo de sistema parou por um erro interno.";
@@ -82,6 +93,10 @@ pub struct SystemConfig {
     /// O prazo de cada `statvfs`.
     pub statfs_timeout: Duration,
     pub nvidia: Box<dyn Nvidia>,
+    /// O sinal do modo jogo: ligado, amostra no máximo a cada
+    /// `light_interval`.
+    pub game: GameSignal,
+    pub light_interval: Duration,
 }
 
 impl SystemConfig {
@@ -93,6 +108,8 @@ impl SystemConfig {
             statfs: Arc::new(RealStatfs),
             statfs_timeout: STATFS_TIMEOUT,
             nvidia: Box::new(Nvml),
+            game: GameSignal::never(),
+            light_interval: LIGHT_INTERVAL,
         }
     }
 }
@@ -113,6 +130,8 @@ pub struct System {
     /// `None` quando o módulo está indisponível (o laço não roda).
     sampler: Option<Sampler>,
     interval: watch::Receiver<Duration>,
+    game: GameSignal,
+    light_interval: Duration,
 }
 
 /// O `interval_ms` dos parâmetros, se for um inteiro na faixa aceita.
@@ -173,6 +192,8 @@ pub fn register(server: &mut ServerBuilder, cfg: SystemConfig) -> System {
         topics,
         sampler,
         interval,
+        game: cfg.game,
+        light_interval: cfg.light_interval,
     }
 }
 
@@ -184,7 +205,13 @@ impl System {
         let Some(sampler) = self.sampler else {
             return ModuleTask::new(Vec::new());
         };
-        let run: JoinHandle<()> = tokio::spawn(run(sampler, self.topics.clone(), self.interval));
+        let run: JoinHandle<()> = tokio::spawn(run(
+            sampler,
+            self.topics.clone(),
+            self.interval,
+            self.game,
+            self.light_interval,
+        ));
         lucernad_core::supervise(
             run,
             self.topics.status.clone(),
@@ -202,29 +229,38 @@ fn ticker(start: Instant, period: Duration) -> tokio::time::Interval {
 }
 
 /// O laço: espera um assinante, amostra no intervalo os grupos assinados e
-/// volta a esperar quando todos saem.
-async fn run(mut sampler: Sampler, t: SystemTopics, mut interval: watch::Receiver<Duration>) {
+/// volta a esperar quando todos saem. No modo jogo, o intervalo é no mínimo
+/// `light`.
+async fn run(
+    mut sampler: Sampler,
+    t: SystemTopics,
+    mut interval: watch::Receiver<Duration>,
+    mut game: GameSignal,
+    light: Duration,
+) {
     loop {
         tokio::select! {
             _ = t.stats.wait_subscribed() => {}
             _ = t.disks.wait_subscribed() => {}
             _ = t.gpus.wait_subscribed() => {}
         }
-        let period = *interval.borrow_and_update();
+        let period = effective_interval(*interval.borrow_and_update(), game.is_on(), light);
         sampler.set_interval(period);
         // O primeiro tick do ciclo é já.
         let mut tick = ticker(Instant::now(), period);
         loop {
-            tokio::select! {
-                _ = tick.tick() => {}
-                Ok(()) = interval.changed() => {
-                    let period = *interval.borrow_and_update();
-                    sampler.set_interval(period);
-                    // Sem amostra fora do ritmo: a próxima vem um
-                    // intervalo novo depois.
-                    tick = ticker(Instant::now() + period, period);
-                    continue;
-                }
+            let changed = tokio::select! {
+                _ = tick.tick() => false,
+                Ok(()) = interval.changed() => true,
+                () = game.changed() => true,
+            };
+            if changed {
+                let period = effective_interval(*interval.borrow_and_update(), game.is_on(), light);
+                sampler.set_interval(period);
+                // Sem amostra fora do ritmo: a próxima vem um intervalo
+                // novo depois.
+                tick = ticker(Instant::now() + period, period);
+                continue;
             }
             let want = Groups {
                 stats: t.stats.subscribers() > 0,
